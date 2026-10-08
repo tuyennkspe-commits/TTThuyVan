@@ -25,7 +25,7 @@ def _payload(app):
     footing = 'name cdtn y1 v1 ys_pier y2 h2 h1 yf v2 ks vf apc y2_af frf d50 vc2 ratiof kw_lb k1_foot k2_pc k3 footing'.split()
     single = 'name cdtn y1 v1 fr1 a shape k1 theta L k2 bed k3 d50 vc ratio kw single z_single note'.split()
     lc, lb = table('XCB-lo coc'), table('XCB-lo be')
-    pile_rows = [{**r, 'shape': 'Mũi tròn', 'k1': 1.0} for r in lc]
+    pile_rows = [{**r, 'shape': 'Mũi tròn', 'k1': 1.0} for r in lc if r.get('has_piles',True) and r.get('h3',0)>0]
     out = dict(lc_stem=values(lc, stem), lc_cap=values(lc, cap), lc_pile=values(pile_rows, pile),
         lc_sum=values(lc, 'stt name cdtn ys_pier ys_pc ys_pg ys_total'.split()),
         lb_stem=values(lb, stem[:-1] + ['kw', 'ys_pier']), lb_cap=values(lb, footing),

@@ -193,9 +193,49 @@ class HEC18Calculations:
         return (3.5 if material == 'gravel' else 1.0) * d84_m
 
     @staticmethod
+    def foundation_exposure(z_bed, z_cap_bottom, thickness, z_water, has_cap=True, has_piles=True):
+        """Geometric exposure at one bed stage; pile flow starts below the cap soffit."""
+        if not all(math.isfinite(v) for v in (z_bed, z_cap_bottom, thickness, z_water)):
+            raise ValueError('Cao độ móng và đáy sông phải hữu hạn.')
+        if has_cap and thickness <= 0:
+            raise ValueError('Chiều dày bệ phải dương.')
+        z_top = z_cap_bottom + thickness
+        cap_wet = max(0.0, min(z_top, z_water)-max(z_cap_bottom, z_bed)) if has_cap else 0.0
+        pile_wet = max(0.0, min(z_cap_bottom, z_water)-z_bed) if has_cap and has_piles else 0.0
+        if z_water <= z_bed: state = 'Không ngập'
+        elif not has_cap: state = 'Trụ không có bệ'
+        elif pile_wet > 1e-9: state = 'Lộ bệ & cọc' if cap_wet > 1e-9 else 'Lộ cọc (bệ ngoài nước)'
+        elif cap_wet > 1e-9: state = 'Lộ bệ'
+        elif z_top <= z_bed+1e-9: state = 'Bệ và cọc còn chôn'
+        else: state = 'Bệ ngoài nước'
+        return dict(state=state, z_bed=z_bed, z_cap_top=z_top, cap_wet=cap_wet, pile_wet=pile_wet)
+
+    @staticmethod
+    def blocked_flow_from_segments(depths, widths, alpha, x_start, x_end):
+        """Integrate only the selected obstructed interval of the existing 1D PPLL."""
+        if len(depths)!=len(widths) or len(depths)<2 or not math.isfinite(alpha) or alpha<=0:
+            raise ValueError('Chưa có bảng phân phối lưu lượng hợp lệ.')
+        extent=sum(widths[1:])
+        if not all(math.isfinite(v) for v in (x_start,x_end)) or not 0 <= x_start < x_end <= extent+1e-8:
+            raise ValueError(f'Đoạn chắn phải có 0 ≤ X đầu < X cuối ≤ {extent:.2f} m.')
+        pos=area=discharge=wet_width=0.0
+        for i in range(1,len(depths)):
+            length=widths[i]
+            left,right=max(pos,x_start),min(pos+length,x_end)
+            if length>0 and right>left:
+                slope=(depths[i]-depths[i-1])/length
+                d1=depths[i-1]+slope*(left-pos);d2=depths[i-1]+slope*(right-pos)
+                w,a,integral=HEC18Calculations.wet_segment(d1,d2,right-left)
+                wet_width+=w;area+=a;discharge+=alpha*integral
+            pos+=length
+        if area<=0 or wet_width<=0:
+            raise ValueError('Đoạn chọn không có dòng chảy ngập; không suy ra thủy lực mố từ đoạn này.')
+        return dict(Qe=discharge,Ae=area,L_prime=wet_width,ya=area/wet_width,Ve=discharge/area)
+
+    @staticmethod
     def complex_pier(y1, v1, a, k1, k2, k3, kw, capped, ho, T, f, apc, ap, S, m, n, aproj,
                      pile_exposed=True, d50_m=0.00032, d84_m=0.0073, Lpc=None,
-                     theta_deg=0.0, bed_material='sand', staggered=False, cap_k1=1.1):
+                     theta_deg=0.0, bed_material='sand', staggered=False, cap_k1=1.1, has_cap=True):
         """HEC-18 §§7.5.3–7.5.5; select Case 1/2 by adjusted cap-bottom elevation."""
         r = dict(fr1=0.0, ys_full=0.0, h1=ho+T, kh=1.0, ys_pier=0.0, y2=y1, h2=ho,
                  v2=v1, fr2=0.0, t_eff=0.0, apc_star=0.0, ys_pc=0.0, h3=ho, y3=y1,
@@ -207,6 +247,12 @@ class HEC18Calculations:
         ys_full, fr1 = HEC18Calculations.pier_scour_csu(y1,v1,a,k1,k2,k3,kw,False)
         h1=ho+T
         r.update(fr1=fr1,ys_full=ys_full)
+        ys_single=min(ys_full,(2.4 if fr1<=0.8 else 3)*a) if capped else ys_full
+        if not has_cap or h1+ys_single/2 <= 1e-9:
+            r.update(ys_pier=ys_single,ys_total=ys_single,case='BURIED' if has_cap else 'SINGLE',
+                     y2=y1+ys_single/2,h2=ho+ys_single/2,
+                     note='Chỉ xói thân trụ; bệ chưa tiếp xúc dòng chảy ở đáy điều chỉnh' if has_cap else 'Trụ không có bệ')
+            return r
         if min(a, apc, T) <= 0: raise ValueError('Kích thước thân trụ và bệ phải dương.')
         # Only the submerged stem above the cap is relevant.
         kh=HEC18Calculations.kh_pier_stem(h1,a,f) if h1 < y1 else 0.0
@@ -219,7 +265,7 @@ class HEC18Calculations:
         if h2 <= 0:
             # Case 2, Eq. 7.25/7.26: flow below the footing top, no pile-group term.
             yf=min(y2,max(0.0,h1+ys_pier/2))
-            ks=HEC18Calculations.grain_roughness(d84_m,bed_material) if yf > 0 else 0.0
+            ks=HEC18Calculations.grain_roughness(d84_m,bed_material) if yf > 1e-9 else 0.0
             vf=v2*math.log1p(10.93*yf/ks)/math.log1p(10.93*y2/ks) if yf > 0 else 0.0
             frf=vf/math.sqrt(G*yf) if yf>0 else 0.0
             vc2=HEC18Calculations.critical_velocity_vc(y2,d50_m)
@@ -237,7 +283,7 @@ class HEC18Calculations:
         ys_pc,_=HEC18Calculations.pier_scour_csu(y2,v2,apc_star,k1_pc,k2_pc,k3,kw_pc,False)
         y3=y1+(ys_pier+ys_pc)/2;h3=ho+(ys_pier+ys_pc)/2;v3=v1*y1/y3
         r.update(ys_pc=ys_pc,ys_total=ys_pier+ys_pc,cap_case=1,case='CASE1',
-                 apc_star=apc_star,t_eff=t_eff,kw_pc=kw_pc,y3=y3,h3=h3,v3=v3,
+                 apc_star=apc_star,t_eff=t_eff,kw_pc=kw_pc,y3=y3,y3_effective=y3,h3=h3,v3=v3,
                  note='HEC-18 Case 1: đáy bệ lộ trong dòng chảy')
         if not pile_exposed or h3<=0 or ap<=0 or aproj<=0: return r
         ksp,km,apg,khpg=HEC18Calculations.pile_group_factors(ap,S,m,n,aproj,h3,y3,
@@ -443,8 +489,9 @@ class MainScourApplication(tk.Tk):
         self._report_piers.clear()
         self._report_context.clear()
         self.calc_warnings = []
+        self._ppll_context = {}
         for name in ('tree_ppll', 'tree_vcau', 'tree_denh', 'tree_xoi_chung', 'tree_summary',
-                     'tree_single_pier', 'tree_lobe_1', 'tree_lobe_2', 'tree_lobe_3', 'tree_lc_4', 'tree_abutment'):
+                     'tree_single_pier', 'tree_lobe_1', 'tree_lobe_2', 'tree_lobe_3', 'tree_lc_4', 'tree_abutment', 'tree_exposure'):
             tree = getattr(self, name, None)
             if tree is not None: tree.delete(*tree.get_children())
         if hasattr(self, 'ax_prism'):
@@ -463,7 +510,7 @@ class MainScourApplication(tk.Tk):
         for button in self.export_buttons: button.config(state="normal")
         self.status_text.set(f"Đã tính • {len(self.calc_warnings)} lưu ý điều kiện áp dụng" if self.calc_warnings else "Đã tính • Kết quả sẵn sàng xuất báo cáo")
 
-    def _validate_calculation_inputs(self):
+    def _validate_calculation_inputs(self, hydraulics_only=False):
         vals = {k: float(e.get()) for k, e in self.t1_entries.items()}
         if any(not math.isfinite(v) for v in vals.values()):
             raise ValueError('Các thông số phải là số hữu hạn.')
@@ -486,11 +533,15 @@ class MainScourApplication(tk.Tk):
                 raise ValueError(f'{row[1]}: bề rộng và chiều dài trụ phải dương.')
             if any(not math.isfinite(float(row[i])) for i in (2,3,5,6)) or float(row[3]) < 0:
                 raise ValueError('Cao độ, khoảng cách và kích thước mặt cắt không hợp lệ.')
+        if hydraulics_only: return
         for d in self.project['piers_detail']:
-            for key in ('apier','Lpier','apc','Lpc','T','ap','S','m','n'):
+            keys=['apier','Lpier']
+            if d.get('has_cap',True): keys += ['apc','Lpc','T']
+            if d.get('has_cap',True) and d.get('has_piles',True): keys += ['ap','S','m','n']
+            for key in keys:
                 value = float(d[key])
                 if not math.isfinite(value) or value <= 0: raise ValueError(f"{d['name']}: {key} phải dương và hữu hạn.")
-            if float(d['S']) < float(d['ap']) or any(float(d[k]) != int(float(d[k])) for k in ('m','n')):
+            if d.get('has_cap',True) and d.get('has_piles',True) and (float(d['S']) < float(d['ap']) or any(float(d[k]) != int(float(d[k])) for k in ('m','n'))):
                 raise ValueError(f"{d['name']}: S ≥ ap; m, n phải là số nguyên dương.")
             if not all(math.isfinite(float(d[k])) for k in ('f','z_day_be')) or float(d['f']) < 0:
                 raise ValueError(f"{d['name']}: kiểm tra cao độ bệ và khoảng cách f.")
@@ -817,7 +868,7 @@ class MainScourApplication(tk.Tk):
 
         dlg = tk.Toplevel(self)
         dlg.title("Cấu Hình Thông Số Thủy Lực Mố Cầu (Froehlich / HIRE - HEC-18 Chapter 8)")
-        dlg.geometry("1180x680")
+        dlg.geometry(f"1180x{min(800,self.winfo_screenheight()-80)}")
         dlg.minsize(1050, 600)
         dlg.grab_set()
 
@@ -826,6 +877,8 @@ class MainScourApplication(tk.Tk):
 
         f_left = ttk.Frame(pane)
         pane.add(f_left, weight=3)
+        f_act = ttk.Frame(f_left)
+        f_act.pack(side=tk.BOTTOM,fill=tk.X,padx=4,pady=6)
 
         lbl_guide = tk.Label(
             f_left,
@@ -945,6 +998,10 @@ class MainScourApplication(tk.Tk):
         for k in ["ya", "Qe", "Ae", "L_prime", "theta", "k1_type"]:
             ab_vars[k].trace_add("write", recompute_preview)
 
+        range_start_var=tk.StringVar()
+        range_end_var=tk.StringVar()
+        pending_ppll={}
+
         def on_select_ab(event):
             sel = tree_ab.selection()
             if not sel:
@@ -961,6 +1018,8 @@ class MainScourApplication(tk.Tk):
                 ab_vars["L_prime"].set(str(ab_obj.get("L_prime", 1.70)))
                 ab_vars["k1_type"].set(ab_obj.get("k1_type", HEC18Tables.DEFAULT_ABUT_K1))
                 ab_vars["theta"].set(str(ab_obj.get("theta", 90.0)))
+                interval=ab_obj.get('ppll_range', ('',''))
+                range_start_var.set(str(interval[0]));range_end_var.set(str(interval[1]))
                 recompute_preview()
 
         tree_ab.bind("<<TreeviewSelect>>", on_select_ab)
@@ -969,6 +1028,30 @@ class MainScourApplication(tk.Tk):
         if children:
             tree_ab.selection_set(children[0])
             on_select_ab(None)
+
+        range_box = ttk.LabelFrame(f_left,text='Ước tính từ PPLL — chọn đúng đoạn dòng chảy bị nền đường chắn')
+        range_box.pack(fill=tk.X,padx=5,pady=5)
+        ttk.Label(range_box,text='X đầu (m):').grid(row=0,column=0,padx=3)
+        x_start=ttk.Entry(range_box,width=10,textvariable=range_start_var);x_start.grid(row=0,column=1,padx=3)
+        ttk.Label(range_box,text='X cuối (m):').grid(row=0,column=2,padx=3)
+        x_end=ttk.Entry(range_box,width=10,textvariable=range_end_var);x_end.grid(row=0,column=3,padx=3)
+        ttk.Label(range_box,text='X ngang cộng dồn, gốc tại điểm đầu mặt cắt. Không tự lấy đoạn M1–M2.\nPPLL 1D trên mặt cắt nhập là ước tính; cần kiểm tra tính đại diện cho thượng lưu.',wraplength=620).grid(row=1,column=0,columnspan=5,sticky=tk.W,padx=3,pady=4)
+        def take_ppll():
+            try:
+                if not ab_vars['name'].get(): raise ValueError('Chọn mố trước khi lấy thông số.')
+                self.run_full_system(hydraulics_only=True)
+                c=getattr(self,'_ppll_context',{})
+                if not c: return
+                start,end=float(x_start.get()),float(x_end.get())
+                values=HEC18Calculations.blocked_flow_from_segments(c['depths'],c['widths'],c['alpha'],start,end)
+                for key in ('Qe','Ae','ya','L_prime'): ab_vars[key].set(format(values[key],'.9g'))
+                pending_ppll.clear()
+                pending_ppll.update(name=ab_vars['name'].get(),interval=[start,end],values=values)
+                recompute_preview()
+                messagebox.showinfo('Đã lấy thông số',f"Đoạn X={start:.2f}–{end:.2f} m.\nQe={values['Qe']:.3f} m³/s; Ae={values['Ae']:.3f} m²; ya={values['ya']:.3f} m; L′={values['L_prime']:.3f} m.\nKiểm tra đoạn chắn và bấm Lưu mố đang chọn.")
+            except Exception as exc:
+                messagebox.showerror('Không lấy được thủy lực mố',str(exc))
+        ttk.Button(range_box,text='Tính PPLL & lấy thông số',command=take_ppll).grid(row=0,column=4,padx=5)
 
         def save_current_ab():
             name = ab_vars["name"].get()
@@ -985,6 +1068,12 @@ class MainScourApplication(tk.Tk):
                         d["theta"] = float(ab_vars["theta"].get())
                         d["k1_type"] = ab_vars["k1_type"].get()
                         d["hydraulics_confirmed"] = True
+                        if pending_ppll.get('name')==name and all(math.isclose(d[k],pending_ppll['values'][k],rel_tol=1e-8) for k in ('Qe','Ae','ya','L_prime')):
+                            d['ppll_range']=pending_ppll['interval']
+                            d['hydraulic_source']='PPLL 1D — ước tính theo đoạn chắn đã chọn'
+                        else:
+                            d.pop('ppll_range',None)
+                            d['hydraulic_source']='Nhập thủ công'
                         self._invalidate_results()
                         refresh_table()
                         messagebox.showinfo("Thành công", f"Đã lưu thành công thông số thủy lực cho {name}!")
@@ -992,8 +1081,6 @@ class MainScourApplication(tk.Tk):
                         messagebox.showerror("Lỗi", f"Vui lòng nhập đúng định dạng số! Chi tiết: {e}")
                     break
 
-        f_act = ttk.Frame(f_left)
-        f_act.pack(fill=tk.X, padx=4, pady=6)
         ttk.Button(f_act, text="💾 LƯU THÔNG SỐ MỐ ĐANG CHỌN", command=save_current_ab).pack(side=tk.LEFT, padx=4)
         ttk.Button(f_act, text="Đóng Cửa Sổ", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
 
@@ -1076,7 +1163,7 @@ class MainScourApplication(tk.Tk):
             tree_p.delete(*tree_p.get_children())
             for d in self.project.get("piers_detail", []):
                 z_cur = d.get("z_day_be", d.get("z_be", d["cdtn"] + d["ho"]))
-                loai = d.get("loai_tru", "Lộ bệ & cọc" if d.get("ho", 0) > 0 else "Lộ bệ")
+                loai = HEC18Calculations.foundation_exposure(d["cdtn"],z_cur,d["T"],float(self.t1_entries["htk"].get()),d.get("has_cap",True),d.get("has_piles",True))["state"]
                 tree_p.insert("", tk.END, values=(
                     d["name"], f"{d['cdtn']:.2f}", loai, f"{d['apier']:.2f}", f"{d['Lpier']:.2f}",
                     f"{d['apc']:.2f}", f"{d['Lpc']:.2f}", f"{d['T']:.2f}", f"{z_cur:.2f}",
@@ -1097,6 +1184,9 @@ class MainScourApplication(tk.Tk):
         f_sub3 = ttk.LabelFrame(f_form, text="3. Nhóm Cọc (Pile Group)")
         f_sub3.grid(row=0, column=2, padx=4, pady=3, sticky=tk.NSEW)
 
+        has_cap_var = tk.BooleanVar(value=True)
+        has_piles_var = tk.BooleanVar(value=True)
+        z_top_display=tk.StringVar(value="—")
         cap_shape = tk.StringVar(value="Mũi vuông (Square nose)")
         manual_aproj = tk.BooleanVar(value=False)
         ent_vars = {
@@ -1113,9 +1203,10 @@ class MainScourApplication(tk.Tk):
         ttk.Label(f_sub1, text="Cao độ CĐTN:").grid(row=1, column=0, sticky=tk.W, padx=3, pady=2)
         ttk.Label(f_sub1, textvariable=ent_vars["cdtn"]).grid(row=1, column=1, sticky=tk.W, padx=3, pady=2)
 
-        ttk.Label(f_sub1, text="Phân loại xói móng:", font=(UI_FONT, 8, "bold"), foreground="#C62828").grid(row=2, column=0, sticky=tk.W, padx=3, pady=2)
-        cb_loai = ttk.Combobox(f_sub1, textvariable=ent_vars["loai_tru"], values=["Lộ bệ", "Lộ bệ & cọc", "Trụ đơn đặc"], state="readonly", width=12)
-        cb_loai.grid(row=2, column=1, padx=3, pady=2)
+        ttk.Label(f_sub1, text="Trạng thái ban đầu:", font=(UI_FONT, 8, "bold"), foreground="#C62828").grid(row=2, column=0, sticky=tk.W, padx=3, pady=2)
+        ttk.Label(f_sub1,textvariable=ent_vars['loai_tru'],wraplength=160).grid(row=2,column=1,padx=3,pady=2)
+        ttk.Checkbutton(f_sub1,text='Có bệ móng',variable=has_cap_var).grid(row=5,column=0,columnspan=2,sticky=tk.W)
+        ttk.Checkbutton(f_sub1,text='Có nhóm cọc dưới bệ',variable=has_piles_var).grid(row=6,column=0,columnspan=2,sticky=tk.W)
 
         ttk.Label(f_sub1, text="Bề rộng thân a (m):").grid(row=3, column=0, sticky=tk.W, padx=3, pady=2)
         ttk.Entry(f_sub1, textvariable=ent_vars["apier"], width=8).grid(row=3, column=1, padx=3, pady=2)
@@ -1147,15 +1238,19 @@ class MainScourApplication(tk.Tk):
                 z_d = float(ent_vars["z_day_be"].get())
                 z_tn = float(ent_vars["cdtn"].get())
                 ho_calc = z_d - z_tn
+                z_top_display.set(f"{z_d+float(ent_vars['T'].get()):.2f} m")
                 ent_vars["ho_display"].set(f"{ho_calc:.2f} m")
-                if ho_calc <= 0:
-                    ent_vars["loai_tru"].set("Lộ bệ")
-                else:
-                    ent_vars["loai_tru"].set("Lộ bệ & cọc")
+                exposure=HEC18Calculations.foundation_exposure(z_tn,z_d,float(ent_vars['T'].get()),float(self.t1_entries['htk'].get()),has_cap_var.get(),has_piles_var.get())
+                ent_vars['loai_tru'].set(exposure['state'])
             except Exception:
                 ent_vars["ho_display"].set("...")
+                ent_vars["loai_tru"].set("Chưa đủ cao độ")
+                z_top_display.set("—")
 
-        ent_vars["z_day_be"].trace_add("write", on_z_day_change)
+        for key in ('z_day_be','T','cdtn'):
+            ent_vars[key].trace_add('write',on_z_day_change)
+        has_cap_var.trace_add('write',on_z_day_change)
+        has_piles_var.trace_add('write',on_z_day_change)
 
         ttk.Label(f_sub3, text="Bề rộng cọc ap (m):").grid(row=0, column=0, sticky=tk.W, padx=3, pady=2)
         ttk.Entry(f_sub3, textvariable=ent_vars["ap"], width=8).grid(row=0, column=1, padx=3, pady=2)
@@ -1197,6 +1292,8 @@ class MainScourApplication(tk.Tk):
                 ent_vars["aproj"].set(str(detail.get("aproj", 3.60)))
                 manual_aproj.set(detail.get("manual_aproj", False))
                 cap_shape.set(detail.get("cap_shape", "Mũi vuông (Square nose)"))
+                has_cap_var.set(detail.get("has_cap",True))
+                has_piles_var.set(detail.get("has_piles",True))
 
         tree_p.bind("<<TreeviewSelect>>", on_select_pier)
 
@@ -1209,6 +1306,9 @@ class MainScourApplication(tk.Tk):
 
         ttk.Label(f_sub2, text="Dạng mũi bệ K1:").grid(row=6, column=0, sticky=tk.W)
         ttk.Combobox(f_sub2, textvariable=cap_shape, values=list(HEC18Tables.PIER_K1), state="readonly", width=18).grid(row=6, column=1)
+
+        ttk.Label(f_sub2,text="CĐ đỉnh bệ (đáy + T):").grid(row=7,column=0,sticky=tk.W)
+        ttk.Label(f_sub2,textvariable=z_top_display).grid(row=7,column=1,sticky=tk.W)
 
         def save_current_pier():
             name = ent_vars["name"].get()
@@ -1231,7 +1331,9 @@ class MainScourApplication(tk.Tk):
                         d["z_be"] = z_d
                         d["z_day_be"] = z_d
                         d["ho"] = round(z_d - z_tn, 3)
-                        d["loai_tru"] = ent_vars["loai_tru"].get()
+                        d["has_cap"] = has_cap_var.get()
+                        d["has_piles"] = has_piles_var.get()
+                        d['loai_tru']=HEC18Calculations.foundation_exposure(z_tn,z_d,d['T'],float(self.t1_entries['htk'].get()),d['has_cap'],d['has_piles'])['state']
 
                         d["f"] = float(ent_vars["f"].get())
                         d["ap"] = float(ent_vars["ap"].get())
@@ -1251,7 +1353,7 @@ class MainScourApplication(tk.Tk):
 
                         refresh_dlg_table()
                         self._refresh_tab1_table()
-                        messagebox.showinfo("Thành công", f"Đã lưu trụ {name}:\n- Phân loại: {d['loai_tru']}\n- CĐ đáy bệ = {z_d:.2f} m\n- ho = {d['ho']:.2f} m")
+                        messagebox.showinfo("Thành công", f"Đã lưu trụ {name}:\n- Trạng thái ban đầu: {d['loai_tru']}\n- CĐ đáy bệ = {z_d:.2f} m\n- ho = {d['ho']:.2f} m")
                     except Exception as e:
                         messagebox.showerror("Lỗi", f"Vui lòng nhập đúng định dạng số! Chi tiết: {e}")
                     break
@@ -1259,7 +1361,6 @@ class MainScourApplication(tk.Tk):
         def apply_all_piers():
             if not messagebox.askyesno("Xác nhận", "Áp dụng kích thước Bệ và Cọc này cho TẤT CẢ các TRỤ?"):
                 return
-            loai_selected = ent_vars["loai_tru"].get()
             for d in self.project["piers_detail"]:
                 try:
                     ap_val = float(ent_vars["apier"].get())
@@ -1274,11 +1375,10 @@ class MainScourApplication(tk.Tk):
                     d["z_day_be"] = z_d
                     d["ho"] = round(z_d - float(d["cdtn"]), 3)
                     
-                    if loai_selected == "Trụ đơn đặc":
-                        d["loai_tru"] = "Trụ đơn đặc"
-                    else:
-                        d["loai_tru"] = "Lộ bệ & cọc" if d["ho"] > 0 else "Lộ bệ"
-                    
+                    d['has_cap']=has_cap_var.get()
+                    d['has_piles']=has_piles_var.get()
+                    d['loai_tru']=HEC18Calculations.foundation_exposure(float(d['cdtn']),z_d,d['T'],float(self.t1_entries['htk'].get()),d['has_cap'],d['has_piles'])['state']
+
                     d["f"] = float(ent_vars["f"].get())
                     d["ap"] = float(ent_vars["ap"].get())
                     d["S"] = float(ent_vars["S"].get())
@@ -1312,6 +1412,12 @@ class MainScourApplication(tk.Tk):
         txt_p_guide.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         p_guide_text = """PHÂN LOẠI BỆ TRỤ — HEC-18 §7.5
 
+BAN ĐẦU (so với CĐTN):
+• Đỉnh bệ ≤ CĐTN: bệ/cọc còn chôn.
+• Đáy bệ ≤ CĐTN < đỉnh bệ: lộ bệ.
+• CĐTN < đáy bệ: cọc dưới bệ có thể lộ.
+Chỉ xét phần nằm dưới mực nước và bộ phận thực tế có trong móng.
+
 Phần mềm chọn Case theo cao độ đáy bệ sau hạ thấp dài hạn, xói thu hẹp và một nửa xói thân trụ:
   h2 = h0 + yspier / 2
 
@@ -1334,7 +1440,7 @@ Nhóm cọc:
 Ks: D84 đối với cát, 3,5 D84 đối với sỏi/cuội.
 D84 phải lấy từ cấp phối, không tự suy từ D50.
 
-Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích các thành phần bệ và cọc.
+Chỉ bỏ chọn Có bệ móng nếu cấu tạo thực tế không có bệ. Không dùng lựa chọn này để bỏ qua bệ/cọc còn chôn có thể lộ khi xói.
 """
         txt_p_guide.insert(tk.END, p_guide_text)
         txt_p_guide.config(state=tk.DISABLED)
@@ -1642,7 +1748,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
 
         # 7.1: TRỤ ĐƠN ĐẶC
         self.subtab_single_pier = ttk.Frame(self.nb_scour)
-        self.nb_scour.add(self.subtab_single_pier, text=" 7.1 Trụ Đơn Đặc (xoi cuc tru) ")
+        self.nb_scour.add(self.subtab_single_pier, text="7.1 Chỉ xói thân trụ")
 
         cols_single = (
             "No. Trụ", "CĐTN (m)", "y1 (m)", "V1 (m/s)", "Fr1", "a (m)", "H.D. trụ", "K1", "θ (°)", "L (m)",
@@ -1660,7 +1766,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
 
         # 7.2: TRỤ LỘ BỆ
         self.subtab_lobe = ttk.Frame(self.nb_scour)
-        self.nb_scour.add(self.subtab_lobe, text=" 7.2 Trụ Lộ Bệ (XCB-Lo Be) ")
+        self.nb_scour.add(self.subtab_lobe, text="7.2 Case 2: bệ trên/dưới đáy")
 
         f_lobe_1 = ttk.LabelFrame(self.subtab_lobe, text="1, Xói cục bộ do thân trụ gây ra (yspier)")
         f_lobe_1.pack(fill=tk.X, padx=6, pady=2)
@@ -1706,9 +1812,9 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
 
         # 7.3: TRỤ LỘ BỆ & CỌC
         self.subtab_lococ = ttk.Frame(self.nb_scour)
-        self.nb_scour.add(self.subtab_lococ, text=" 7.3 Trụ Lộ Bệ & Cọc (XBC-lo coc) ")
+        self.nb_scour.add(self.subtab_lococ, text="7.3 Case 1: bệ trên đáy")
 
-        f_lc_4 = ttk.LabelFrame(self.subtab_lococ, text="Bảng Tổng Hợp Xói Cục Bộ Trụ Lộ Bệ & Cọc")
+        f_lc_4 = ttk.LabelFrame(self.subtab_lococ, text="Xói bệ trên đáy sông (Case 1); nhóm cọc nếu có")
         f_lc_4.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
         cols_lc_4 = ("STT", "Tên Trụ", "CĐTN (m)", "CĐ đáy bệ (m)", "ho (m)", "yspier (m)", "yspc (m)", "yspg (m)", "Tổng xói ys (m)", "Cao độ sau xói (m)", "Ghi chú phân loại")
         self.tree_lc_4 = ttk.Treeview(f_lc_4, columns=cols_lc_4, show="headings", height=12)
@@ -1719,7 +1825,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
 
         # 7.4: XÓI CỤC BỘ MỐ CẦU
         self.subtab_abutment = ttk.Frame(self.nb_scour)
-        self.nb_scour.add(self.subtab_abutment, text=" 7.4 Xói Cục Bộ Mố (Froehlich / HIRE) ")
+        self.nb_scour.add(self.subtab_abutment, text="7.4 Mố cầu")
 
         f_fml_74 = ttk.LabelFrame(self.subtab_abutment, text="Công Thức Dự Báo Xói Cục Bộ Mố Cầu Theo Froehlich (HEC-18)")
         f_fml_74.pack(fill=tk.X, padx=6, pady=3)
@@ -1744,6 +1850,21 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
         self.tree_abutment.configure(xscrollcommand=s_abut_x.set)
         self.tree_abutment.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=2)
         s_abut_x.pack(side=tk.BOTTOM, fill=tk.X, padx=4)
+
+        self.subtab_exposure = ttk.Frame(self.nb_scour)
+        self.nb_scour.add(self.subtab_exposure,text="7.5 Cao độ & lộ móng")
+        ttk.Label(self.subtab_exposure,text="Ban đầu so với CĐTN; trước xói cục bộ xét hạ thấp dài hạn + xói thu hẹp.\nHEC dùng đáy bình quân hạ ½ xói thành phần để chọn Case; không dùng cao độ mũi cọc để xác định lộ cọc.",padding=10).pack(anchor='w')
+        cols=('Trụ','CĐTN','Đáy bệ','Đỉnh bệ','Ban đầu','Đáy trước cục bộ','Trước cục bộ','Đáy sau ½ xói thân','Đáy sau ½ thân+bệ','Trạng thái điều chỉnh','Thành phần tính','HEC')
+        self.tree_exposure=ttk.Treeview(self.subtab_exposure,columns=cols,show='headings',height=12)
+        for c in cols:
+            self.tree_exposure.heading(c,text=c)
+            self.tree_exposure.column(c,width=175 if c in ('Ban đầu','Trước cục bộ','Trạng thái điều chỉnh','Thành phần tính') else 135,anchor=tk.CENTER)
+        sx=ttk.Scrollbar(self.subtab_exposure,orient=tk.HORIZONTAL,command=self.tree_exposure.xview)
+        sx.pack(side=tk.BOTTOM,fill=tk.X)
+        sy=ttk.Scrollbar(self.subtab_exposure,orient=tk.VERTICAL,command=self.tree_exposure.yview)
+        sy.pack(side=tk.RIGHT,fill=tk.Y)
+        self.tree_exposure.configure(xscrollcommand=sx.set,yscrollcommand=sy.set)
+        self.tree_exposure.pack(fill=tk.BOTH,expand=True,padx=6,pady=6)
 
     # =========================================================================
     # TAB 8: TỔNG HỢP & SCOUR PRISM
@@ -1809,7 +1930,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
     # =========================================================================
     # THỰC THI TÍNH TOÁN TOÀN BỘ (RUN FULL SYSTEM - ĐÃ SỬA CHUẨN XÁC VCAU)
     # =========================================================================
-    def run_full_system(self):
+    def run_full_system(self, hydraulics_only=False):
         cs = self.project["cross_section"]
         if not cs:
             messagebox.showwarning("Thiếu dữ liệu", "Vui lòng nhập dữ liệu mặt cắt sông!")
@@ -1820,7 +1941,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
             warnings = ['Thủy lực đến trụ dùng phân phối mặt cắt 1D và bảo toàn lưu lượng; cần đối chiếu mô hình thủy lực công trình.',
                         'Nước dềnh là ước tính theo công thức trong mẫu, không thuộc phần công thức xói HEC-18 đã kiểm chứng.']
             if self.project.get('is_demo'): warnings.append('Đang dùng bộ dữ liệu minh họa; thay bằng số liệu công trình trước khi thiết kế.')
-            self._validate_calculation_inputs()
+            self._validate_calculation_inputs(hydraulics_only=hydraulics_only)
             self.sync_all_details()
 
             htk = float(self.t1_entries["htk"].get())
@@ -1918,6 +2039,13 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
             self.lbl_ppll_wsum.config(text=f"Tổng diện tích ướt Σω: {sum_w:.2f} m2")
             self.lbl_ppll_vbq.config(text=f"Vận tốc bình quân Vbq: {V_mean:.2f} m/s")
 
+            self._ppll_context = dict(depths=depth, widths=dl_vals, alpha=alpha_v,
+                                       htk=htk,qtk=qtk,extent=sum(dl_vals[1:]))
+            if hydraulics_only:
+                self.nb.select(self.tab3)
+                self.status_text.set('Đã tính PPLL • Chưa tính xói / chưa có báo cáo kết quả')
+                return
+
             # ---------------- Tab 4: Choán dòng (ĐÃ FIX TÍNH CHÍNH XÁC BỀ RỘNG VÀ PHÂN TẦNG) ----------------
             self.tree_vcau.delete(*self.tree_vcau.get_children())
             sum_b_choan = 0.0
@@ -1956,8 +2084,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
                 # Hình chiếu mặt bằng B|cosθ| + L|sinθ|; nhóm cọc dùng hợp các hình chiếu.
                 b_proj_than = a_tru * abs(cos_sk) + L_tru * abs(sin_sk)
                 b_proj_be = apc * abs(cos_sk) + Lpc * abs(sin_sk)
-                b_proj_coc = (aproj if detail and detail.get('manual_aproj', False) else
-                              HEC18Calculations.projected_pile_width(ap_coc,S_coc,m_hang,n_cot,skew))
+                b_proj_coc = (aproj if detail and detail.get('manual_aproj',False) else HEC18Calculations.projected_pile_width(ap_coc,S_coc,m_hang,n_cot,skew)) if not detail or (detail.get('has_cap',True) and detail.get('has_piles',True)) else 0.0
 
                 z_water = cdtn + hi
 
@@ -1983,9 +2110,10 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
                     h_than = z_water - z_bot_than
                     w_than = b_proj_than * h_than
 
-                if detail and detail.get('loai_tru') == 'Trụ đơn đặc':
+                if detail and not detail.get('has_cap',True):
                     w_coc = w_be = 0.0
                     w_than = b_proj_than * hi
+                if detail and not detail.get("has_piles",True): w_coc=0.0
                 w_choan = w_coc + w_be + w_than
                 b_proj = w_choan / hi if hi > 0 else 0.0
 
@@ -2167,30 +2295,47 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
                     note_single = "θ>5°: K1=1.0" if theta_attack > 5.0 else ("giới hạn 2.4a/3.0a" if capped else "")
                     cd_single = cdtn - (gen_lower + ys_pier_single)
                     k1_short = k1_pier_name.split(" (")[0]
-                    self.tree_single_pier.insert("", tk.END, values=(
-                        f"{stt_p}. {p_name}", f"{cdtn:.2f}", f"{y1:.2f}", f"{v1:.2f}", f"{fr1:.3f}",
-                        f"{a:.2f}", k1_short, f"{k1_eff:.2f}", f"{skew:.1f}", f"{L:.2f}",
-                        f"{k2:.3f}", k3_name.split(" (")[0], f"{k3_val:.2f}", f"{d50_mm:.3f}", f"{vc_tru:.2f}",
-                        f"{ratio_v_vc:.2f}", f"{kw_single:.3f}", f"{ys_pier_single:.2f}", f"{cd_single:.2f}", note_single
-                    ))
-
-                    if not detail or not detail.get('manual_aproj', False):
+                    if detail and (not detail.get('has_cap',True) or not detail.get('has_piles',True)):
+                        aproj=0.0
+                    elif not detail or not detail.get('manual_aproj', False):
                         aproj = HEC18Calculations.projected_pile_width(ap,S_coc,m_hang,n_cot,skew)
-                    cp = HEC18Calculations.complex_pier(y1,0.0 if loai_tru == 'Trụ đơn đặc' else v1,a,k1_eff,k2,k3_val,kw_single,capped,
+                    cp = HEC18Calculations.complex_pier(y1,v1,a,k1_eff,k2,k3_val,kw_single,capped,
                         ho,T_be,f_dist,apc,ap,S_coc,m_hang,n_cot,aproj,
-                        pile_exposed=True,d50_m=d50_m,d84_m=d84_m,
+                        pile_exposed=detail.get("has_piles",True) if detail else True,d50_m=d50_m,d84_m=d84_m,
                         Lpc=detail.get('Lpc',13.32) if detail else 13.32,
                         theta_deg=skew,bed_material=self.project.get('bed_material','sand'),
-                        cap_k1=HEC18Tables.PIER_K1.get(detail.get('cap_shape', 'Mũi vuông (Square nose)') if detail else 'Mũi vuông (Square nose)', (1.1,))[0])
-                    if loai_tru != 'Trụ đơn đặc':
-                        actual_kind = 'Lộ bệ & cọc' if cp['cap_case']==1 else 'Lộ bệ'
-                        if actual_kind != loai_tru:
-                            warnings.append(f'{p_name}: chọn {actual_kind} theo cao độ đáy bệ sau xói (Case {cp["cap_case"]}).')
-                        loai_tru = actual_kind
+                        cap_k1=HEC18Tables.PIER_K1.get(detail.get('cap_shape', 'Mũi vuông (Square nose)') if detail else 'Mũi vuông (Square nose)', (1.1,))[0],
+                        has_cap=detail.get('has_cap',True) if detail else True)
+                    has_cap = detail.get('has_cap',True) if detail else True
+                    has_piles = detail.get('has_piles',True) if detail else True
+                    if not has_cap: z_be_disp=ho_disp='-'
+                    initial = HEC18Calculations.foundation_exposure(cdtn,z_be,T_be,htk,has_cap,has_piles)
+                    pre_local = HEC18Calculations.foundation_exposure(cdtn-gen_lower,z_be,T_be,htk,has_cap,has_piles)
+                    after_stem = HEC18Calculations.foundation_exposure(cdtn-gen_lower-cp['ys_pier']/2,z_be,T_be,htk,has_cap,has_piles)
+                    after_cap = HEC18Calculations.foundation_exposure(cdtn-gen_lower-(cp['ys_pier']+cp['ys_pc'])/2,z_be,T_be,htk,has_cap,has_piles)
+                    loai_tru = ('Trụ đơn đặc' if cp['cap_case']==0 else
+                                'Lộ bệ & cọc' if cp['cap_case']==1 else 'Lộ bệ')
+                    components = 'Không có dòng chảy' if y1<=0 or v1<=0 else 'Thân trụ' if cp['cap_case']==0 else 'Thân + bệ + cọc' if cp['cap_case']==1 and has_piles and after_cap['pile_wet']>1e-9 else 'Thân + bệ'
+                    self.tree_exposure.insert('',tk.END,values=(p_name,f'{cdtn:.2f}',f'{z_be:.2f}' if has_cap else '—',f'{z_be+T_be:.2f}' if has_cap else '—',
+                        initial['state'],f'{pre_local["z_bed"]:.2f}',pre_local['state'],
+                        f'{after_stem["z_bed"]:.2f}',f'{after_cap["z_bed"]:.2f}',
+                        after_cap['state'],components,'—' if cp['cap_case']==0 else f'Case {cp["cap_case"]}'))
+                    if initial['state'] != after_cap['state']:
+                        warnings.append(f'{p_name}: ban đầu {initial["state"]}; sau hạ thấp đáy: {after_cap["state"]}.')
+                    if cp['cap_case']==0 and has_cap and cp['ys_pier'] > max(0.0,-cp['h1']):
+                        warnings.append(f'{p_name}: hố xói cực đại có thể chạm đỉnh bệ dù đáy bình quân chưa lộ; cần xét diễn biến lộ móng.')
                     if cp['cap_case']==2 and cp['ys_pc'] > -cp['h2']:
                         warnings.append(f'{p_name}: Case 2 giả thiết móng không bị khoét dưới đáy bệ; cần kiểm tra chiều sâu móng (§7.5.4).')
                     if cp['cap_case'] and (f_dist/a > 1.5 or cp['h1']/a > 2):
                         warnings.append(f'{p_name}: tỷ số hình học vượt phạm vi đồ thị K_hpier Hình 7.6; cần đánh giá riêng.')
+                    if loai_tru == 'Trụ đơn đặc':
+                        self.tree_single_pier.insert("", tk.END, values=(
+                            f"{stt_p}. {p_name}", f"{cdtn:.2f}", f"{y1:.2f}", f"{v1:.2f}", f"{fr1:.3f}",
+                            f"{a:.2f}", k1_short, f"{k1_eff:.2f}", f"{skew:.1f}", f"{L:.2f}",
+                            f"{k2:.3f}", k3_name.split(" (")[0], f"{k3_val:.2f}", f"{d50_mm:.3f}", f"{vc_tru:.2f}",
+                            f"{ratio_v_vc:.2f}", f"{kw_single:.3f}", f"{ys_pier_single:.2f}", f"{cd_single:.2f}", note_single
+                        ))
+
                     ks_val = cp['ks']
                     yspier_lobe, h1 = cp['ys_pier'], cp['h1']
                     yf_lb, y2_lb, h2_lb, v2_lb = cp['yf'],cp['y2'],cp['h2'],cp['v2']
@@ -2198,7 +2343,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
 
                     # Lưu các giá trị chưa làm tròn cho báo cáo, không tính lại khi xuất.
                     self._report_piers.append(dict(
-                        name=p_name, stt=stt_p, cdtn=cdtn, kind=loai_tru,
+                        name=p_name, stt=stt_p, cdtn=cdtn, kind=loai_tru,has_cap=has_cap,has_piles=has_piles,
                         y1=y1, v1=v1, fr1=fr1, a=a, shape=k1_short,
                         k1=k1_eff, theta=skew, L=L, k2=k2, bed=k3_name.split(" (")[0],
                         k3=k3_val, d50=d50_mm, vc=vc_tru, ratio=ratio_v_vc,
@@ -2206,6 +2351,7 @@ Trụ đơn đặc: chọn riêng nếu công trình không cần phân tích c�
                         f=f_dist, ho=ho, ho0=ho0, T=T_be, apc=apc, z_be=z_be,
                         Lpc=(detail.get('Lpc', 13.32) if detail else 13.32),
                         ap=ap, S=S_coc, m=m_hang, n=n_cot, aproj=aproj,
+                        initial_exposure=initial,pre_local_exposure=pre_local,after_stem_exposure=after_stem,after_cap_exposure=after_cap,
                         cp=copy.deepcopy(cp), cap_shape=(detail.get('cap_shape', 'Mũi vuông (Square nose)') if detail else 'Mũi vuông (Square nose)').split(" (")[0], yf=yf_lb, ks=ks_val, vf=vf_lb,
                         frf=(vf_lb / math.sqrt(G * yf_lb) if yf_lb > 0 else 0.0),
                         kw_lb=kw_lb, footing=ysfooting_lb, note=note_single))

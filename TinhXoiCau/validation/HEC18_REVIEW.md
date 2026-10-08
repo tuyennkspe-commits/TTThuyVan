@@ -22,7 +22,7 @@ Chạy từ thư mục kho:
 python TinhXoiCau/validation/test_hec18.py
 ```
 
-16 kiểm tra gồm bảy ví dụ dưới đây cùng các trường hợp biên, không cần mở giao diện.
+22 kiểm tra gồm bảy ví dụ dưới đây cùng các trường hợp biên, không cần mở giao diện.
 
 | Ví dụ | Trang | Kết quả tài liệu / đối chiếu |
 |---|---|---|
@@ -45,3 +45,19 @@ Sai số kiểm tra cho phép do hệ số đọc đồ thị và làm tròn tro
 - Cần đánh giá riêng dòng có áp/ngập dầm, đất dính, đá, rác bám, vật liệu phân tầng, dịch chuyển lòng sông; ứng dụng chưa triển khai các phương pháp HEC cho những trường hợp đó. Không coi kết quả hiện tại là chứng nhận thiết kế cho mọi tình huống.
 - Kw có giới hạn thực nghiệm và cần phán đoán kỹ thuật (§7.4); tỷ số vượt đồ thị Kh, bệ tại h2 = 0 và giả thiết Case 2 cần người thiết kế xét. Hình chiếu tự động giả thiết lưới cọc đều, không mô tả được toàn bộ bố trí cọc lệch hàng.
 - Dữ liệu khởi động là **minh họa**. Phải nhập số liệu thủy lực, cấp phối và hình học thực tế của công trình trước khi dùng kết quả.
+
+## Bổ sung kiểm tra cao độ và lấy thủy lực từ PPLL
+
+Trạng thái ban đầu được xác định bằng **CĐTN, cao độ đáy bệ, cao độ đỉnh bệ = đáy bệ + T, mực nước** và việc móng thực tế có bệ/cọc hay không:
+
+| Quan hệ ban đầu | Trạng thái hình học |
+|---|---|
+| Đỉnh bệ ≤ CĐTN | Bệ/cọc còn chôn, chưa tiếp xúc dòng chảy |
+| Đáy bệ ≤ CĐTN < đỉnh bệ | Có thể lộ bệ; chưa lộ đoạn cọc dưới đáy bệ |
+| CĐTN < đáy bệ | Có thể lộ cọc dưới bệ; chỉ phần nằm dưới mực nước chịu dòng chảy |
+
+Trạng thái ban đầu **không đồng nhất** với trường hợp tính sau hạ thấp đáy. Tab **7.5 Cao độ & lộ móng** ghi riêng ban đầu, trước xói cục bộ, sau ½ xói thân và sau ½ xói thân+bệ. Phân loại cũ do người dùng chọn không còn được dùng để bỏ qua móng thực tế. Hai lựa chọn **Có bệ móng / Có nhóm cọc dưới bệ** mô tả cấu tạo, không phải lựa chọn kết quả mong muốn. Móng chôn sâu chưa lộ tại đáy điều chỉnh chỉ tính thân trụ với CSU đầy đủ; không áp dụng hệ số che chắn của bệ lộ hoặc đòi D84 khi bệ không tham gia dòng chảy. Nếu hố xói cực đại có thể chạm đỉnh bệ dù đáy bình quân chưa lộ, có lưu ý cần đánh giá diễn biến lộ móng. Bệ nằm trên đáy nhưng không có cọc vẫn dùng Case 1 cho bệ, không sinh thêm thành phần cọc. Cao độ mũi cọc là dữ liệu đánh giá an toàn móng, không phải cao độ xác định phần cọc tiếp xúc dòng chảy; mô hình này lấy mặt dưới bệ làm giới hạn trên đoạn cọc ngoài bệ.
+
+Trong hộp thoại mố, có công cụ **Tính PPLL & lấy thông số** theo đoạn X đầu–X cuối do người dùng xác định là dòng chảy bị chắn. Tích phân chỉ phần đoạn được chọn, kể cả cắt giữa hai điểm hoặc qua mép nước: Qe = tổng lưu lượng đoạn; Ae = diện tích ướt đoạn; L′ = tổng bề rộng dòng chảy hoạt động; ya = Ae/L′. Có thể tính PPLL trước khi nhập xong thủy lực mố, tránh việc bắt buộc có Qe/Ae mới được tạo bảng dùng để suy Qe/Ae. Lấy giá trị vào biểu mẫu rồi bấm Lưu; không tự chọn phạm vi M1–M2 hoặc dùng Q toàn sông. Đoạn PPLL này là ước tính 1D theo mặt cắt đã nhập; người dùng phải xác định phạm vi nền đường chắn dòng và tính đại diện cho mặt cắt thượng lưu.
+
+Bộ kiểm tra được mở rộng thành **22 kiểm tra**, bổ sung các quan hệ cao độ, móng không có bệ/cọc, bệ còn chôn sâu, đổi trạng thái khi đáy hạ thấp và tích phân PPLL trên đoạn chắn. Đã thử trực tiếp nút lấy/sửa/lưu thủy lực mố, lựa chọn theo cao độ dù nhãn cũ là trụ đơn, và xuất báo cáo khi mọi bệ còn chôn sâu.
