@@ -20,12 +20,13 @@ def _payload(app):
     def values(rows, keys):
         return [[r.get(k, '') for k in keys] for r in rows]
     stem = 'name cdtn y1 v1 fr1 a shape k1 theta L k2 bed k3 f ho T h1 kh d50 vc ratio ys_pier'.split()
-    cap = 'name cdtn y1 v1 ys_pier y2 h2 T apc v2 apc_star fr2 d50 vc2 ratio2 kw_pc shape k1 theta L k2 k3 ys_pc'.split()
+    cap = 'name cdtn y1 v1 ys_pier y2 h2 T apc v2 apc_star fr2 d50 vc2 ratio2 kw_pc cap_shape k1_pc theta Lpc k2_pc k3 ys_pc'.split()
     pile = 'name cdtn y1 v1 ys_pier y3 h3 ap S m n aproj km ksp apg y3max khpg v3 shape k1 k3 ys_pg note'.split()
-    footing = 'name cdtn y1 v1 ys_pier y2 h2 h1 yf v2 ks vf apc y2_af frf d50 vc2 ratiof kw_lb k1_foot k2 k3 footing'.split()
+    footing = 'name cdtn y1 v1 ys_pier y2 h2 h1 yf v2 ks vf apc y2_af frf d50 vc2 ratiof kw_lb k1_foot k2_pc k3 footing'.split()
     single = 'name cdtn y1 v1 fr1 a shape k1 theta L k2 bed k3 d50 vc ratio kw single z_single note'.split()
     lc, lb = table('XCB-lo coc'), table('XCB-lo be')
-    out = dict(lc_stem=values(lc, stem), lc_cap=values(lc, cap), lc_pile=values(lc, pile),
+    pile_rows = [{**r, 'shape': 'Mũi tròn', 'k1': 1.0} for r in lc]
+    out = dict(lc_stem=values(lc, stem), lc_cap=values(lc, cap), lc_pile=values(pile_rows, pile),
         lc_sum=values(lc, 'stt name cdtn ys_pier ys_pc ys_pg ys_total'.split()),
         lb_stem=values(lb, stem[:-1] + ['kw', 'ys_pier']), lb_cap=values(lb, footing),
         lb_sum=values(lb, 'stt name cdtn ys_pier footing ys_lb'.split()),
