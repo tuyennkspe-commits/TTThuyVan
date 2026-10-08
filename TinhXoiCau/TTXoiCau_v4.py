@@ -2806,6 +2806,70 @@ class MainScourApplication(tk.Tk):
             by_sheet[sheet]['tables'].append(make_table('Thông số trung gian kiểm tra hệ số và cao độ', fields, checks))
         return sections
 
+    def _template_report_sections(self):
+        """Bảng chính theo mẫu; căn cứ bổ sung đặt ở phụ lục riêng.
+
+        Không dùng số liệu hay công thức lưu sẵn trong tệp mẫu của công trình khác.
+        Hai định dạng dùng cùng thứ tự bảng và cùng kết quả tính hiện hành.
+        """
+        import copy
+        sections = copy.deepcopy(self._report_sections())
+        context = self._report_context
+        # Trang "hinh thai" trong mẫu Excel: xuất lại hình học phần mặt cắt
+        # thực sự ngập nước, sử dụng dữ liệu đã chụp tại lần tính gần nhất.
+        vh = context.get('vh_data', [])
+        wet = context.get('wet_w', [])
+        cos_sk = math.cos(math.radians(context.get('skew', 0)))
+        geometry_rows = []
+        for i, point in enumerate(vh):
+            width = wet[i] if i < len(wet) else 0.0
+            area = point['wi']
+            dz = point['hi'] - vh[i - 1]['hi'] if i else 0.0
+            perimeter = math.hypot(width, dz) if width > 0 else 0.0
+            geometry_rows.append(dict(name=point['name'] or f'ĐIỂM {i+1}',
+                z=point['z'], h=point['hi'], havg=area / width if width > 0 else 0.0,
+                lcheo=point['dl'] / cos_sk if cos_sk > 1e-9 else '',
+                skew=context.get('skew', 0), lngang=point['dl'],
+                area=area, perimeter=perimeter, note=''))
+        geometry_rows.append(dict(name='Tổng', lngang=sum(p['dl'] for p in vh),
+            area=sum(p['wi'] for p in vh),
+            perimeter=sum(r['perimeter'] for r in geometry_rows)))
+        geometry_columns = [dict(key=k, label=label, unit=unit, digits=2,
+            role='text' if k in ('name', 'note') else 'output') for k, label, unit in [
+            ('name','Bộ phận',''), ('z','CĐTN','m'), ('h','Chiều sâu','m'),
+            ('havg','Chiều sâu bình quân','m'), ('lcheo','L chéo','m'),
+            ('skew','Góc chéo','°'), ('lngang','L ngang','m'),
+            ('area','Diện tích','m²'), ('perimeter','Chu vi ướt','m'), ('note','Ghi chú','')]]
+        sections.insert(2, dict(sheet='Hinh thai',
+            title='TÍNH DIỆN TÍCH THOÁT NƯỚC VÀ CHU VI ƯỚT TẠI TIM CẦU (ĐIỀU KIỆN TỰ NHIÊN)',
+            formulas=[], definitions=['Diện tích và chiều rộng ngập lấy từ các đoạn mặt cắt của lần tính hiện tại; đoạn khô không tính vào chu vi ướt.'],
+            tables=[dict(title='', columns=geometry_columns, rows=geometry_rows, groups=())]))
+        appendices = []
+        main_counts = {'Vcau': 1, 'Xói chung': 1, 'XCB-lo coc': 4,
+                       'XCB-lo be': 3, 'Xoi cuc tru': 1}
+        for section in sections:
+            tables = section['tables']
+            if section['sheet'] == 'Vcau':
+                primary, extra = tables[2:], tables[:2]
+            else:
+                count = main_counts.get(section['sheet'], len(tables))
+                primary, extra = tables[:count], tables[count:]
+            section['tables'] = primary
+            if section['sheet'] == 'Xoi cuc tru':
+                section['formulas'].append(r'$Fr_1=V_1/\sqrt{g y_1}$')
+            detail = section.pop('detail', None)
+            if detail or extra:
+                appendix = dict(sheet='PL-' + section['sheet'],
+                                title='PHỤ LỤC — ' + section['title'],
+                                formulas=detail['formulas'] if detail else [],
+                                formula_labels=detail.get('formula_labels', []) if detail else [],
+                                definitions=detail['definitions'] if detail else [],
+                                tables=extra, appendix=True)
+                appendices.append(appendix)
+            # Nước dềnh và hình học: mẫu đặt giải thích sau bảng kết quả.
+            section['explain_after'] = section['sheet'] in ('Vcau', 'Nuoc denh', 'Hinh thai', 'Xói chung', 'Tong hop')
+        return sections + appendices
+
     @staticmethod
     def _report_value(value, column):
         """Giữ tên trụ và ghi chú dạng chữ; chỉ đổi cột số, kể cả ký hiệu khoa học."""
@@ -2849,7 +2913,7 @@ class MainScourApplication(tk.Tk):
         from openpyxl.utils import get_column_letter
         from openpyxl.drawing.image import Image
 
-        sections = self._report_sections()
+        sections = self._template_report_sections()
         context = self._report_context or self.project
         wb = Workbook()
         wb.remove(wb.active)
@@ -2908,12 +2972,12 @@ class MainScourApplication(tk.Tk):
         try:
             for section in sections:
                 ws = wb.create_sheet(section['sheet'])
-                count = max(len(t['columns']) for t in section['tables'])
+                count = max((len(t['columns']) for t in section['tables']), default=16)
                 line(ws, 1, section['title'], count, 13, True)
                 line(ws, 2, '(Theo Hướng dẫn thủy lực công trình HEC No.18, 2012)', count, 11, True, True)
                 line(ws, 3, f"{context.get('bridge_name', '')} — Htt = {context.get('htk', '')} m; Qtk = {context.get('qtk', '')} m³/s", count, 11, True)
                 row = 5
-                if section['sheet'] != 'Xói chung':
+                if not section.get('explain_after'):
                     row = explanations(ws, row, section, count)
                 for data in section['tables']:
                     cols = data['columns']
@@ -2991,23 +3055,27 @@ class MainScourApplication(tk.Tk):
                         line(ws, row, 'Không có mố/trụ thuộc trường hợp này trong kết quả tính toán.', count, 10, italic=True)
                         row += 1
                     row += 2
-                if section['sheet'] == 'Xói chung':
+                if section.get('explain_after'):
                     row = explanations(ws, row, section, count)
                 if section.get('detail'):
                     from openpyxl.worksheet.pagebreak import Break
                     ws.row_breaks.append(Break(id=row - 1))
                     line(ws, row, 'CÔNG THỨC XÁC ĐỊNH THÔNG SỐ, HỆ SỐ VÀ ĐIỀU KIỆN ÁP DỤNG', count, 11, True)
                     row = explanations(ws, row + 1, section['detail'], count)
-                widest = max(section['tables'], key=lambda t: len(t['columns']))
-                for c, weight in enumerate(self._report_column_weights(widest['columns']), 1):
-                    ws.column_dimensions[get_column_letter(c)].width = 9 * weight
+                widest = max(section['tables'], key=lambda t: len(t['columns']), default=None)
+                weights = self._report_column_weights(widest['columns']) if widest else [1] * count
+                for c, weight in enumerate(weights, 1):
+                    # Tỷ lệ cột số/chữ theo mẫu .xls, tránh thu nhỏ quá mức
+                    # bảng rộng khi in vừa một trang ngang.
+                    ws.column_dimensions[get_column_letter(c)].width = (9 * weight if section.get('appendix')
+                                                                       else 6 * weight)
                 ws.freeze_panes = 'C4'
                 ws.print_title_rows = '1:3'
                 ws.sheet_properties.pageSetUpPr.fitToPage = True
-                ws.page_setup.orientation = ('portrait' if section['sheet'] in ('XCB-lo coc', 'XCB-lo be')
-                                             else 'landscape')
+                ws.page_setup.orientation = 'landscape'
                 ws.page_setup.paperSize = ws.PAPERSIZE_A3 if count > 18 else ws.PAPERSIZE_A4
-                small_report = not section.get('detail') and max(len(t['rows']) for t in section['tables']) <= 10
+                small_report = (not section.get('appendix') and
+                                max((len(t['rows']) for t in section['tables']), default=0) <= 10)
                 ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, (1 if small_report else 0)
                 ws.page_margins.left = ws.page_margins.right = 0.25
                 ws.print_options.horizontalCentered = True
@@ -3108,12 +3176,13 @@ class MainScourApplication(tk.Tk):
                 doc.add_paragraph()
 
         try:
-            for index, section_data in enumerate(self._report_sections()):
+            for index, section_data in enumerate(self._template_report_sections()):
                 section = doc.sections[0] if index == 0 else doc.add_section(WD_SECTION_START.NEW_PAGE)
-                count = max(len(t['columns']) for t in section_data['tables'])
+                count = max((len(t['columns']) for t in section_data['tables']), default=16)
                 section.orientation = WD_ORIENT.LANDSCAPE
-                section.page_width = Cm(42 if count > 18 else 29.7)
-                section.page_height = Cm(29.7 if count > 18 else 21)
+                # Mẫu Word dùng A4 ngang, kể cả bảng thân trụ/bệ/nhóm cọc.
+                section.page_width = Cm(29.7)
+                section.page_height = Cm(21)
                 section.left_margin = section.right_margin = Cm(1.2)
                 section.top_margin = section.bottom_margin = Cm(1.2)
                 usable_cm = section.page_width.cm - section.left_margin.cm - section.right_margin.cm
@@ -3121,7 +3190,7 @@ class MainScourApplication(tk.Tk):
                 p = paragraph('(Theo Hướng dẫn thủy lực công trình HEC No.18, 2012)', True, 10, True)
                 p.runs[0].italic = True
                 paragraph(f"{context.get('bridge_name', '')} — Htt = {context.get('htk', '')} m; Qtk = {context.get('qtk', '')} m³/s", True, 10, True)
-                if section_data['sheet'] != 'Xói chung':
+                if not section_data.get('explain_after'):
                     explanations(section_data, usable_cm)
                 for table_index, data in enumerate(section_data['tables']):
                     if data['title']:
@@ -3172,7 +3241,7 @@ class MainScourApplication(tk.Tk):
                         paragraph('Không có mố/trụ thuộc trường hợp này trong kết quả tính toán.')
                     if table_index + 1 < len(section_data['tables']):
                         doc.add_paragraph()
-                if section_data['sheet'] == 'Xói chung':
+                if section_data.get('explain_after'):
                     explanations(section_data, usable_cm)
                 if section_data.get('detail'):
                     doc.add_page_break()
