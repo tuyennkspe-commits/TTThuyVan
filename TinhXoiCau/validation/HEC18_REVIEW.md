@@ -5,10 +5,10 @@ Nguồn: PDF **HEC No.18, 2012.pdf** người dùng cung cấp (340 trang). Số
 ## Các điểm đã sửa
 
 - **§6.2–6.4, (6.1)–(6.4):** vận tốc tới hạn dùng D50 thực; giới hạn D50 = 0,2 mm chỉ áp dụng thành phần xói nước trong, có thông báo. Cho nhập riêng Q1 lòng chủ, y1 thượng lưu và y0 tại cầu. Vận tốc phân loại lấy Q1/(W1·y1). Chọn lớp bọc đáy rõ ràng thay cho tự suy từ D50 ≥ 20 mm.
-- **§7.5.3–7.5.4, Hình 7.6–7.7, (7.24)–(7.27):** chọn Case theo h2 sau xói thân, không dựa tên T25–T30 hoặc cao độ ban đầu. Hệ số K1 theo hình dạng bệ, K2 theo Lpc/apc gốc, Kw theo điều kiện của từng Case. Ks = D84 cho cát hoặc 3,5D84 cho sỏi/cuội; không tự suy D84 = 2D50. Case 2 không cộng thêm xói nhóm cọc và có lưu ý giả thiết móng không bị khoét dưới đáy bệ.
+- **§7.5.3–7.5.4, Hình 7.6–7.7, (7.24)–(7.27):** bộ công thức chuẩn chọn Case theo h2; giao diện dùng chế độ cố định theo cao độ ban đầu theo yêu cầu người dùng, không tự chuyển trường hợp sau xói. Hệ số K1 theo hình dạng bệ, K2 theo Lpc/apc gốc, Kw theo điều kiện của từng Case. Ks = D84 cho cát hoặc 3,5D84 cho sỏi/cuội; không tự suy D84 = 2D50. Case 2 không cộng thêm xói nhóm cọc và có lưu ý giả thiết móng không bị khoét dưới đáy bệ.
 - **§7.5.5, Hình 7.10–7.13, (7.28)–(7.31):** hình chiếu cọc đều tính hợp các khoảng chiếu của hai hàng đầu và một cột. Có tùy chọn aproj nhập riêng cho bố trí đặc biệt. Km giới hạn sáu hàng, bằng 1 khi xiên dòng. Giới hạn y3 = 3,5apg* cho hệ số chiều cao và bước tính nhóm cọc theo ví dụ §7.10.4. Cọc tròn dùng K1 = 1; (7.31) không nhân K2.
 - **§8.3–8.4:** không phát sinh xói mố khi vận tốc bằng 0. Mố mới cần nhập thủy lực Qe, Ae, ya, L′ thay vì tự dùng số liệu minh họa. L′ là chiều dài dòng chảy hoạt động bị chắn, có thể khác chiều dài hình học nền đường (ví dụ §8.7.1).
-- **Thủy lực và tính nhất quán:** tích phân h^(5/3) liên tục cho đoạn mặt cắt tuyến tính tại mép nước. Hình chiếu thân/bệ dùng B|cosθ| + L|sinθ|. Trụ đơn đặc không bị cộng choán dòng bệ/cọc. Độ sâu tiếp cận trụ xét hạ thấp dài hạn và xói thu hẹp; vận tốc điều chỉnh theo bảo toàn lưu lượng của dòng 1D. Kiểm tra số hữu hạn, kích thước, góc, số hàng/cột, tên trùng và diện tích thoát nước. Khi đầu vào đổi, xóa kết quả cũ và khóa xuất báo cáo đến khi tính lại.
+- **Thủy lực và tính nhất quán:** tích phân h^(5/3) liên tục cho đoạn mặt cắt tuyến tính tại mép nước. Hình chiếu thân/bệ dùng B|cosθ| + L|sinθ|. Trụ đơn đặc không bị cộng choán dòng bệ/cọc. Độ sâu và vận tốc tiếp cận trụ lấy tại thời điểm ban đầu từ PPLL. Kiểm tra số hữu hạn, kích thước, góc, số hàng/cột, tên trùng và diện tích thoát nước. Khi đầu vào đổi, xóa kết quả cũ và khóa xuất báo cáo đến khi tính lại.
 
 ## Công thức đúng cần giữ
 
@@ -22,7 +22,7 @@ Chạy từ thư mục kho:
 python TinhXoiCau/validation/test_hec18.py
 ```
 
-22 kiểm tra gồm bảy ví dụ dưới đây cùng các trường hợp biên, không cần mở giao diện.
+29 kiểm tra gồm bảy ví dụ dưới đây cùng các trường hợp biên, không cần mở giao diện.
 
 | Ví dụ | Trang | Kết quả tài liệu / đối chiếu |
 |---|---|---|
@@ -56,8 +56,10 @@ Trạng thái ban đầu được xác định bằng **CĐTN, cao độ đáy b
 | Đáy bệ ≤ CĐTN < đỉnh bệ | Có thể lộ bệ; chưa lộ đoạn cọc dưới đáy bệ |
 | CĐTN < đáy bệ | Có thể lộ cọc dưới bệ; chỉ phần nằm dưới mực nước chịu dòng chảy |
 
-Trạng thái ban đầu **không đồng nhất** với trường hợp tính sau hạ thấp đáy. Tab **7.5 Cao độ & lộ móng** ghi riêng ban đầu, trước xói cục bộ, sau ½ xói thân và sau ½ xói thân+bệ. Phân loại cũ do người dùng chọn không còn được dùng để bỏ qua móng thực tế. Hai lựa chọn **Có bệ móng / Có nhóm cọc dưới bệ** mô tả cấu tạo, không phải lựa chọn kết quả mong muốn. Móng chôn sâu chưa lộ tại đáy điều chỉnh chỉ tính thân trụ với CSU đầy đủ; không áp dụng hệ số che chắn của bệ lộ hoặc đòi D84 khi bệ không tham gia dòng chảy. Nếu hố xói cực đại có thể chạm đỉnh bệ dù đáy bình quân chưa lộ, có lưu ý cần đánh giá diễn biến lộ móng. Bệ nằm trên đáy nhưng không có cọc vẫn dùng Case 1 cho bệ, không sinh thêm thành phần cọc. Cao độ mũi cọc là dữ liệu đánh giá an toàn móng, không phải cao độ xác định phần cọc tiếp xúc dòng chảy; mô hình này lấy mặt dưới bệ làm giới hạn trên đoạn cọc ngoài bệ.
+Theo yêu cầu người dùng, tab **7.5 Cao độ ban đầu** chỉ thể hiện trạng thái tại CĐTN. Bệ còn chôn chỉ tính thân; bệ lộ nhưng đáy còn chôn tính thân và bệ; đoạn cọc dưới bệ lộ và ngập mới tham gia thành phần cọc. Kiểm tra thêm mực nước và hai lựa chọn cấu tạo Có bệ / Có cọc. Không đổi trường hợp do hạ thấp dài hạn, xói thu hẹp hoặc kết quả xói cục bộ. Các đại lượng hiệu chỉnh trong công thức vẫn được tính, nhưng không dùng để phân loại lại móng. Đây là phạm vi tính ban đầu được yêu cầu, không phải đánh giá đầy đủ diễn biến lộ móng trong HEC-18.
+
+Nhập mố trực tiếp cần **ya, L′ và Ve**, hoặc **ya, L′, Qe, Ae** để suy Ve. Có thể cung cấp hai đại lượng Qe/Ae/Ve để suy đại lượng còn lại. Nếu chỉ biết Ve, Qe và Ae được giữ chưa biết, hiển thị dấu —. Không mặc định Ae = ya × L′: ví dụ §8.7.1 có bề rộng tính diện tích 75 ft trong khi L′ hoạt động khoảng 42 ft. Chỉ suy Ae hoặc ya từ bề rộng tính diện tích B khi người dùng cung cấp B. Đầu vào dư phải nhất quán, thiếu dữ liệu thì báo rõ; hỗ trợ dấu phẩy thập phân.
 
 Trong hộp thoại mố, có công cụ **Tính PPLL & lấy thông số** theo đoạn X đầu–X cuối do người dùng xác định là dòng chảy bị chắn. Tích phân chỉ phần đoạn được chọn, kể cả cắt giữa hai điểm hoặc qua mép nước: Qe = tổng lưu lượng đoạn; Ae = diện tích ướt đoạn; L′ = tổng bề rộng dòng chảy hoạt động; ya = Ae/L′. Có thể tính PPLL trước khi nhập xong thủy lực mố, tránh việc bắt buộc có Qe/Ae mới được tạo bảng dùng để suy Qe/Ae. Lấy giá trị vào biểu mẫu rồi bấm Lưu; không tự chọn phạm vi M1–M2 hoặc dùng Q toàn sông. Đoạn PPLL này là ước tính 1D theo mặt cắt đã nhập; người dùng phải xác định phạm vi nền đường chắn dòng và tính đại diện cho mặt cắt thượng lưu.
 
-Bộ kiểm tra được mở rộng thành **22 kiểm tra**, bổ sung các quan hệ cao độ, móng không có bệ/cọc, bệ còn chôn sâu, đổi trạng thái khi đáy hạ thấp và tích phân PPLL trên đoạn chắn. Đã thử trực tiếp nút lấy/sửa/lưu thủy lực mố, lựa chọn theo cao độ dù nhãn cũ là trụ đơn, và xuất báo cáo khi mọi bệ còn chôn sâu.
+Bộ kiểm tra gồm **29 kiểm tra**, bao gồm ví dụ tài liệu, quan hệ cao độ ban đầu, bệ/cọc không có thực, móng còn chôn dù kết quả xói lớn, các cách nhập mố và tích phân PPLL. Đã thử trực tiếp lấy/sửa/lưu thủy lực mố, vận tốc nhập riêng không cần giả tạo Qe/Ae, tính toàn hệ thống và xuất báo cáo.

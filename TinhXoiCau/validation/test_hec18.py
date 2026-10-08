@@ -121,4 +121,47 @@ class HECDocumentExamples(unittest.TestCase):
   self.assertAlmostEqual(r['Qe'],1.875)
   with self.assertRaises(ValueError): C.blocked_flow_from_segments([-1,1],[0,10],1,0,4)
   with self.assertRaises(ValueError): C.blocked_flow_from_segments([1,1],[0,10],1,0,11)
+ def test_requested_initial_mode_does_not_change_footing_to_piles(self):
+  args=(5,3,1,1,1,1.1,1,False,-.01,1,1,3,1,3,3,4,4)
+  standard=C.complex_pier(*args)
+  initial=C.complex_pier(*args,initial_only=True)
+  self.assertEqual(standard['cap_case'],1)
+  self.assertEqual(initial['cap_case'],2);self.assertEqual(initial['ys_pg'],0)
+ def test_requested_initial_mode_keeps_buried_foundation_buried(self):
+  r=C.complex_pier(5,3,1,1,1,1.1,1,False,-2.1,2,1,3,1,3,3,4,4,initial_only=True,d84_m=0)
+  self.assertEqual(r['cap_case'],0);self.assertEqual(r['ys_pc'],0);self.assertEqual(r['ys_pg'],0)
+ def test_general_abutment_independent_input_combinations(self):
+  combinations=[dict(qe=30,ae=15,ya=3,length=5),dict(qe=30,ve=2,ya=3,length=5),
+   dict(ve=2,ae=15,ya=3,length=5),dict(qe=30,ya=3,length=5,blocked_width=5),
+   dict(qe=30,ae=15,length=5,blocked_width=5),dict(ve=2,ya=3,length=5,blocked_width=5),
+   dict(qe=30,ve=2,length=5,blocked_width=5),dict(qe=30,ae=15,ve=2,ya=3,length=5)]
+  for inputs in combinations:
+   with self.subTest(inputs=inputs):
+    r=C.resolve_abutment_hydraulics(**inputs)
+    for key,val in dict(Qe=30,Ae=15,Ve=2,ya=3,L_prime=5).items():self.assertAlmostEqual(r[key],val)
+ def test_general_abutment_rejects_underdetermined_or_inconsistent(self):
+  for inputs in [dict(ae=15,ya=3,length=5),dict(qe=30),dict(qe=30,ae=15,ve=4,ya=3,length=5),
+    dict(qe=30,ae=15,ya=2,length=5,blocked_width=5),dict(qe=-1,ae=15,ya=3,length=5),dict(qe=30,ae=0,ya=3,length=5)]:
+   with self.subTest(inputs=inputs),self.assertRaises(ValueError):C.resolve_abutment_hydraulics(**inputs)
+ def test_general_abutment_zero_discharge_and_decimal_comma(self):
+  r=C.resolve_abutment_hydraulics(qe=0,ae=15,ya=3,length=5)
+  self.assertEqual(r['Ve'],0);self.assertEqual(r['Ae'],15)
+  self.assertEqual(C.optional_number('1,56'),1.56)
+  self.assertEqual(C.optional_number('1.234,56'),1234.56)
+  self.assertEqual(C.optional_number('1,234.56'),1234.56)
+  self.assertIsNone(C.optional_number(''))
+  with self.assertRaises(ValueError):C.optional_number('NaN')
+ def test_froehlich_example_keeps_area_width_distinct_from_active_length(self):
+  # HEC §8.7.1: Ae=3.5*75 ft² but active L′=960/23≈42 ft, not 75 ft.
+  r=C.resolve_abutment_hydraulics(qe=960*ft**3,ae=262.5*ft**2,ya=3.5*ft,length=960/23*ft)
+  self.assertAlmostEqual(r['ya']/ft,3.5)
+  self.assertAlmostEqual(r['Ve']/ft,960/262.5)
+  self.assertNotAlmostEqual(r['Ae']/r['ya'],r['L_prime'])
+ def test_direct_velocity_without_flow_or_area(self):
+  r=C.resolve_abutment_hydraulics(ve=9.9*ft,ya=6.2*ft,length=742*ft)
+  self.assertIsNone(r['Qe']);self.assertIsNone(r['Ae'])
+  scour=C.abutment_scour(r['ya'],r['Ve'],r['L_prime'],.82,110)
+  self.assertAlmostEqual(scour['ys']/ft,33.9,delta=.3)
+  zero=C.resolve_abutment_hydraulics(ve=0,ya=2,length=3)
+  self.assertEqual(C.abutment_scour(zero['ya'],zero['Ve'],zero['L_prime'],1)['ys'],0)
 if __name__=='__main__': unittest.main(verbosity=2)
