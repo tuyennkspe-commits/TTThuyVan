@@ -2032,7 +2032,8 @@ class MainScourApplication(tk.Tk):
                         k1=k1_eff, theta=skew, L=L, k2=k2, bed=k3_name.split(" (")[0],
                         k3=k3_val, d50=d50_mm, vc=vc_tru, ratio=ratio_v_vc,
                         kw=kw_single, single=ys_pier_single, z_single=cd_single,
-                        f=f_dist, ho=ho, ho0=ho0, T=T_be, apc=apc,
+                        f=f_dist, ho=ho, ho0=ho0, T=T_be, apc=apc, z_be=z_be,
+                        Lpc=(detail.get('Lpc', 13.32) if detail else 13.32),
                         ap=ap, S=S_coc, m=m_hang, n=n_cot, aproj=aproj,
                         cp=copy.deepcopy(cp), yf=yf_lb, ks=ks_val, vf=vf_lb,
                         frf=(vf_lb / math.sqrt(G * yf_lb) if yf_lb > 0 else 0.0),
@@ -2096,6 +2097,13 @@ class MainScourApplication(tk.Tk):
             self._render_scour_prism_plot(all_x, all_z, htk, y_deg, ysc, plot_x, plot_scour_z)
 
             self._report_context = dict(htk=htk, qtk=qtk, y_deg=y_deg,
+                                        skew=skew, s1=s1, d50=d50_mm, d84=d84_mm, omega=omega,
+                                        k1_type=k1_pier_name, k3_type=k3_name,
+                                        W1=W1, W1_up=W1_up, W2=W2, area=sum_w,
+                                        area_bridge=w_eff_bridge, alpha=alpha_v,
+                                        ai_vals=copy.deepcopy(Ai_vals), wet_w=copy.deepcopy(wet_w),
+                                        vh_data=copy.deepcopy(self.vh_data),
+                                        n_manning=self.t1_entries['n_manning'].get(),
                                         project_name=self.project.get("project_name", ""),
                                         bridge_name=self.project.get("bridge_name", ""))
 
@@ -2535,8 +2543,8 @@ class MainScourApplication(tk.Tk):
                                 ('Lưu lượng, bề rộng mặt cắt thượng lưu và thu hẹp', '13', '16')])]),
             dict(sheet='XCB-lo coc', title='TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ, NHÓM CỌC LỘ TRONG DÒNG CHẢY)',
                  formulas=[r'$y_s=y_{spier}+y_{spc}+y_{spg}$', eq_stem,
-                           r'$y_{spc}=2.0 K_1 K_2 K_3 (a_{pc}^{*})^{0.65} y_2^{0.35} Fr_2^{0.43}$',
-                           r'$y_{spg}=K_{hpg}[2.0 K_1 K_3 (a_{pg}^{*})^{0.65} y_3^{0.35} (V_3/\sqrt{gy_3})^{0.43}]$',
+                           r'$y_{spc}=2.0 K_1 K_2 K_3 K_w (a_{pc}^{*})^{0.65} y_2^{0.35} Fr_2^{0.43}$',
+                           r'$y_{spg}=K_{hpg}[2.0 K_1 K_2 K_3 (a_{pg}^{*})^{0.65} y_3^{0.35} (V_3/\sqrt{gy_3})^{0.43}]$',
                            eq_kh,
                            r'$K_{hpg}=[3.08r-5.23r^2+5.25r^3-2.10r^4]^{1/0.65},\quad r=h_3/y_3$'],
                  definitions=lc_defs, tables=[
@@ -2565,6 +2573,237 @@ class MainScourApplication(tk.Tk):
                               'Mố ở vị trí X nhỏ nhất/lớn nhất được xếp bãi trái/phải; các trụ xếp lòng chính.'],
                  tables=[table('', summary_spec, summary_rows,
                                [('Độ sâu xói thu hẹp (m)', 'left', 'right')])])]
+        return self._complete_report_sections(sections)
+
+    def _complete_report_sections(self, sections):
+        """Bổ sung đầy đủ căn cứ tính, bảng tra và số liệu kiểm tra cho hai định dạng."""
+        by_sheet = {s['sheet']: s for s in sections}
+        context = self._report_context
+
+        def make_table(title, fields, rows, groups=()):
+            cols = []
+            for key, label, unit, digits, role in fields:
+                cols.append(dict(key=key, label=label, unit=unit, digits=digits, role=role))
+            return dict(title=title, columns=cols, rows=rows, groups=groups)
+
+        def detail(sheet, equations, definitions):
+            by_sheet[sheet]['detail'] = dict(sheet=sheet + '-detail',
+                formulas=[e[2] for e in equations],
+                formula_labels=[f'{e[0]} — {e[1]}' for e in equations],
+                definitions=definitions)
+
+        # Mã công thức xuất thành chữ bên cạnh ảnh: dễ tìm và kiểm tra nội dung.
+        common = [
+            ('HEC-FR', 'Hệ số Froude', r'$Fr=V/\sqrt{g y}$'),
+            ('HEC-VC', 'Vận tốc tới hạn hạt đáy (D₅₀ dùng m)', r'$V_c=6.19y^{1/6}D_{50}^{1/3}$'),
+            ('HEC-K2', 'Hệ số góc chéo và tỷ số chiều dài/rộng hữu hiệu',
+             r'$\lambda=\min(12,\max(0,L)/a),\quad K_2=\min[5,(\cos|\theta|+\lambda\sin|\theta|)^{0.65}]$'),
+            ('HEC-KW-CW', 'K_w khi V/V_c < 1', r'$K_w=\min[1,2.58(y/a)^{0.34}Fr^{0.65}]$'),
+            ('HEC-KW-LB', 'K_w khi V/V_c ≥ 1', r'$K_w=\min[1,(y/a)^{0.13}Fr^{0.25}]$'),
+            ('HEC-LIMIT', 'Giới hạn xói trụ mũi tròn khi được áp dụng',
+             r'$y_{s,lim}=2.4a\ (Fr\leq0.8),\qquad y_{s,lim}=3a\ (Fr>0.8)$')]
+        common_defs = [
+            'K₁: tra theo hình dạng mũi trụ ở bảng tra cuối phần trụ đơn; nếu |θ| > 5° thì K₁ hữu hiệu = 1,0.',
+            'K₂: hệ số góc chéo; L: chiều dài thân trụ theo dòng chảy (m); a: bề rộng thân trụ (m); θ tính bằng độ.',
+            'K₃: hệ số tình trạng đáy sông, xem bảng tra K₃; g = 9,81 m/s².',
+            'K_w chỉ hiệu chỉnh khi a > 50D₅₀, 0 < Fr < 1 và y/a < 0,8; các trường hợp khác K_w = 1.',
+            'D₅₀ trong công thức là m = D₅₀(mm)/1000; bộ tính vận tốc tới hạn dùng y ≥ 0,01 m và D₅₀ ≥ 0,00001 m.',
+            'Giới hạn 2,4a/3a chỉ áp dụng với mũi tròn và |θ| ≤ 5°; chiều sâu nước ≤ 0,05 m hoặc V ≤ 0 cho xói bằng 0.']
+        complex_relations = [
+            ('CP-H0', 'Đáy bệ so với đáy ban đầu và đáy sau xói chung',
+             r'$h_{0,initial}=z_{be}-z_{tn},\quad h_0=h_{0,initial}+y_{deg}+y_{sc},\quad h_1=h_0+T$'),
+            ('CP-Y2', 'Chiều sâu và cao độ sau xói thân',
+             r'$y_2=y_1+y_{spier}/2,\quad h_2=h_0+y_{spier}/2$'),
+            ('CP-V2', 'Vận tốc và Froude hiệu chỉnh tại bệ',
+             r'$V_2=V_1y_1/y_2,\quad Fr_2=V_2/\sqrt{g y_2}$')]
+        detail('Xoi cuc tru', common, common_defs)
+        detail('XCB-lo be', common + complex_relations + [
+            ('FOOT-YF', 'Chiều sâu dòng chảy dưới đỉnh bệ', r'$y_f=h_1+y_{spier}/2$'),
+            ('FOOT-KS', 'Độ nhám được sử dụng trong bộ tính', r'$K_s=\max(2D_{84},0.0001)$'),
+            ('FOOT-VF', 'Vận tốc dưới đỉnh bệ', r'$V_f=V_2\frac{\ln(10.93y_f/K_s+1)}{\ln(10.93y_2/K_s+1)}$'),
+            ('FOOT-FRF', 'Froude tại đỉnh bệ', r'$Fr_f=V_f/\sqrt{g y_f}$'),
+            ('FOOT-TOTAL', 'Tổng xói trụ lộ bệ', r'$y_s=y_{spier}+y_{sfooting}$')], common_defs + [
+            'z_be: cao độ đáy bệ; z_tn: cao độ đáy sông tự nhiên; h₀,initial tính trước hạ thấp dài hạn và xói thu hẹp (m).',
+            'h₀ dùng trong tính xói phức hợp đã cộng y_deg và y_sc; bảng kiểm tra bên dưới xuất cả h₀,initial và h₀.',
+            'y₂: chiều sâu hiệu chỉnh cho bệ; h₂: cao độ đáy bệ so với đáy sau xói thân; h₁: cao độ đỉnh bệ (m).',
+            'V₂: vận tốc hiệu chỉnh; V_f: vận tốc dưới đỉnh bệ (m/s); Fr₂ và Fr_f là hai hệ số khác nhau.',
+            'D₈₄: đường kính hạt mà 84% hạt nhỏ hơn (mm); D₈₄ hiệu dụng = 2D₅₀ nếu đầu vào D₈₄ ≤ 0.',
+            'Mẫu ghi K_s = D₈₄, nhưng bộ tính hiện tại dùng K_s = max(2D₈₄; 0,0001 m); báo cáo ghi giá trị thực tế.',
+            'K₁ của thành phần bệ hiện được dùng bằng 1,0; K₂/K₃ lấy cùng bộ hệ số của thân trụ.',
+            'Nếu đỉnh bệ h₁ ≤ 0 hoặc trụ khô, thành phần xói bệ bằng 0.',
+            'a_f: bề rộng bệ (m); y₂/a_f: tỷ số chiều sâu/rộng; V_c của phần bệ được tính tại y₂.'])
+        detail('XCB-lo coc', common + complex_relations + [
+            ('CAP-TEFF', 'Chiều cao bệ tham gia dòng chảy', r'$T_{eff}=T+\min(0,h_2)$'),
+            ('CAP-RATIOS', 'Các tỷ số xác định bề rộng bệ tương đương',
+             r'$\bar y_2=\min(y_2,3.5a_{pc}),\quad t=\max(0.001,T_{eff}/\bar y_2),\quad u=\max[0,\min(1,h_2/\bar y_2)]$'),
+            ('CAP-WIDTH', 'Bề rộng bệ tương đương theo bộ tính',
+             r'$a_{pc}^{*}=a_{pc}\exp[-2.705+0.51\ln(t)-2.783u^3+1.751\exp(-u)]$'),
+            ('PILE-Y3', 'Chiều sâu và cao độ sau xói bệ',
+             r'$y_3=y_1+y_{spier}/2+y_{spc}/2,\quad h_3=h_0+y_{spier}/2+y_{spc}/2$'),
+            ('PILE-V3', 'Vận tốc và Froude hiệu chỉnh tại nhóm cọc',
+             r'$V_3=V_1y_1/y_3,\quad Fr_3=V_3/\sqrt{g y_3}$'),
+            ('PILE-RATIOS', 'Tỷ số khoảng cách và bề rộng chiếu',
+             r'$s=\max(1,S/a_p),\qquad A=\max(1,a_{proj}/a_p)$'),
+            ('PILE-KSP', 'Hệ số khoảng cách giữa các cọc',
+             r'$K_{sp}=1-\frac{4}{3}(1-1/A)(1-s^{-0.6})$'),
+            ('PILE-KM', 'Hệ số số hàng cọc',
+             r'$K_m=0.9+0.10m-0.0714(m-1)(2.4-1.1s+0.1s^2)$'),
+            ('PILE-WIDTH', 'Bề rộng nhóm cọc tương đương', r'$a_{pg}^{*}=K_{sp}K_m a_{proj}$'),
+            ('PILE-KHPG', 'Hệ số chiều sâu nhóm cọc và giới hạn áp dụng',
+             r'$r=\max[0,\min(1,h_3/y_3)],\quad K_{hpg}=\min[1,\max(0,3.08r-5.23r^2+5.25r^3-2.10r^4)^{1/0.65}]$'),
+            ('PILE-TOTAL', 'Tổng thành phần xói phức hợp', r'$y_s=y_{spier}+y_{spc}+y_{spg}$')], common_defs + [
+            'a_pc: bề rộng bệ; a_pc*: bề rộng bệ tương đương; T_eff: chiều cao hữu hiệu của bệ (m).',
+            'Bề rộng a_pc* được giới hạn trong [0,01a_pc; a_pc]; nếu h₂ ≤ 0 hoặc T_eff ≤ 0 thì bộ tính trả a_pc* = a_pc.',
+            'y₂ và y₃: chiều sâu hiệu chỉnh sau xói thân và sau xói bệ (m).',
+            'h₁, h₂, h₃: chiều cao đỉnh bệ, đáy bệ và nhóm cọc so với đáy đang xét (m).',
+            'V₂ và V₃: vận tốc hiệu chỉnh ở bệ và nhóm cọc; Fr₂/Fr₃: hệ số Froude tương ứng.',
+            'a_p: đường kính cọc; S: khoảng cách cọc; m: số hàng theo dòng chảy; n: số cột theo tim cầu.',
+            'a_proj: bề rộng chiếu nhóm cọc nhập vào (m), mặc định n a_p nếu không khai báo.',
+            'K_sp giới hạn [0,1; 1]; K_m không nhỏ hơn 1; K_hpg không lớn hơn 1.',
+            'K₂ của thành phần nhóm cọc và K_w của thành phần bệ phức hợp được dùng bằng 1 trong bộ tính.',
+            'K_hpier trong bộ tính có dấu trừ trước 0,0669 f/a_pier, khác dấu cộng trong ảnh mẫu; báo cáo giữ đúng bộ tính.',
+            'Nếu h₃ ≤ 0 hoặc cọc ngàm trong đất thì y_spg = 0; khi h₁ ≤ 0 thì dùng kết quả trụ đơn.',
+            'y₃,max = 3,5a_pg* là giá trị tham khảo trong mẫu, không phải giới hạn y₃ của bộ tính nhóm cọc hiện tại.'])
+        detail('Xói chung', [
+            ('XC-VC', 'Vận tốc tới hạn để phân loại xói', r'$V_c=6.19y_1^{1/6}D_{50}^{1/3}$'),
+            ('XC-VSTAR', 'Vận tốc ma sát', r'$V_* =\sqrt{g y_1 S_1}$'),
+            ('XC-DM', 'Đường kính hạt không bị cuốn đi', r'$D_m=1.25D_{50}$'),
+            ('XC-RATIO', 'Tỷ số xác định số mũ Laursen', r'$R=V_*/\omega$'),
+            ('XC-DEPTH', 'Chiều sâu bình quân và vận tốc tự nhiên', r'$y_1=\Omega/W_1,\quad V=Q/\Omega$'),
+            ('XC-NONNEG', 'Không lấy chiều sâu xói âm', r'$y_{sc}=\max(0,y_2-y_0)$')], [
+            'Bảng tra số mũ Laursen: R < 0,50 → k₁ = 0,59; 0,50 ≤ R ≤ 2 → k₁ = 0,64; R > 2 → k₁ = 0,69.',
+            'Q₁ = Q₂ = Qtk trong mô hình hiện tại, nên tỷ số Q₂/Q₁ bằng 1.',
+            'Nếu D₅₀ ≥ 20 mm và y₂ nước trong nhỏ hơn y₂ nước đục, bộ tính lấy giá trị nhỏ hơn và ghi chú điều kiện.',
+            'Ω: diện tích mặt cắt ướt tự nhiên (m²); y₀ lấy bằng chiều sâu bình quân hiện tại trong mô hình.',
+            'ω là vận tốc lắng nhập vào; bộ tính xói thu hẹp không tự thay ω bằng công thức Rubey.'])
+        detail('Nuoc denh', [
+            ('DENH-X0', 'Khoảng cách nước dềnh xa nhất', r'$x_0=aL_{ngap}\sqrt{Fr/i_0}$'),
+            ('DENH-V', 'Vận tốc trước và sau thu hẹp', r'$V_0=Q/\Omega,\quad V_{cau}=Q/(\Omega-\Omega_{choan})$'),
+            ('DENH-NONNEG', 'Giới hạn độ dềnh', r'$\Delta h_{dmax}=\max[0,K(V_{cau}^2-V_{cau0}^2)/(2g)]$')], [
+            'Δh_dmax: trị số dềnh lớn nhất phía thượng lưu cầu (m); x₀: khoảng cách dềnh xa nhất (m).',
+            'V₀: vận tốc trung bình trên toàn mặt cắt tự nhiên; V_cau0: vận tốc mặt cắt trước thu hẹp (m/s).',
+            'V_cau: vận tốc sau khi trừ diện tích choán dòng; Q_cau0: lưu lượng trước thu hẹp (m³/s).',
+            'L_ngập: bề rộng ngập; i₀ = S₁: độ dốc mặt nước; Fr = V₀²/(g L_ngập), khác Fr của trụ.',
+            'Fr/i₀: thành phần không thứ nguyên; a = 0,73 là hệ số hình thái đang dùng; K: hệ số nước dềnh.',
+            'Mô hình hiện lấy Q_cau0 = Qtk và V_cau0 = V₀; Fr/i₀ được giới hạn không nhỏ hơn 0,0001.'])
+        detail('PPLL', [
+            ('PPLL-H', 'Chiều sâu và khoảng cách chiếu lên mặt cắt', r'$h_i=\max(0,H_{tt}-z_i),\quad \Delta l_i=\Delta l_{input,i}\cos\theta$'),
+            ('PPLL-WET', 'Đoạn ngập cả hai đầu', r'$\omega_i=(h_{i-1}+h_i)\Delta l_i/2,\quad A_{pp,i}=(h_{i-1}^{5/3}+h_i^{5/3})\Delta l_i/2$'),
+            ('PPLL-PART', 'Đoạn chỉ ngập một đầu', r'$b_i=\Delta l_i d_m/(d_m-d_n),\quad \omega_i=d_m b_i/2,\quad A_{pp,i}=3d_m^{5/3}b_i/8$'),
+            ('PPLL-ALPHA', 'Hệ số phân phối vận tốc', r'$\alpha=Q_{tk}/\sum A_{pp,i}$'),
+            ('PPLL-Q', 'Lưu lượng đoạn và lưu lượng đơn vị', r'$Q_i=\alpha A_{pp,i},\quad q_i=Q_i/\Delta l_i$'),
+            ('PPLL-V', 'Vận tốc bình quân đoạn và vận tốc đến trụ', r'$V_i=Q_i/\omega_i,\quad V_{loc,i}=\alpha h_i^{2/3}$'),
+            ('PPLL-NODE', 'Giá trị A_i tại nút trong bảng mẫu', r'$A_{node,i}=h_i^{5/3}\Delta l_i$'),
+            ('PPLL-CHECK', 'Kiểm tra bảo toàn lưu lượng', r'$\sum Q_i=Q_{tk}$')], [
+            'z_i: cao độ đáy sông (m); Δl_input,i: khoảng cách gốc; Δl_i: khoảng cách đã chiếu theo góc chéo θ (m).',
+            'ω_i: diện tích ướt của đoạn (m²); Σω_i cũng có đơn vị m², không phải m.',
+            'A_pp,i: hệ số diện tích tích phân dùng để phân phối Q; A_node,i: giá trị tại nút hiển thị trong mẫu.',
+            'Bảng xuất có cả A_node,i và A_pp,i để giải thích đúng Q_i, không dùng A_node thay A_pp.',
+            'V_loc,i: vận tốc tại nút được dùng cho tính xói trụ; V_i: vận tốc bình quân đoạn.',
+            'd_m và d_n: độ sâu có dấu lớn nhất/nhỏ nhất khi chỉ một đầu đoạn ngập; đoạn khô cho ω_i = A_pp,i = 0.',
+            'Hệ số Manning được dùng ở tính đường H–Q; phân phối lưu lượng hiện dùng α = Qtk/ΣA_pp,i.'])
+        detail('Vcau', [
+            ('VCAU-B', 'Bề rộng chiếu thân, bệ và nhóm cọc', r'$b_{than}=a\cos\theta,\quad b_{be}=a_{pc}\cos\theta,\quad b_{coc}=a_{proj}\cos\theta$'),
+            ('VCAU-AREA', 'Diện tích choán dòng theo từng tầng ngập', r'$\omega_{choan}=b_{than}h_{than}+b_{be}h_{be}+b_{coc}h_{coc}$'),
+            ('VCAU-WIDTH', 'Bề rộng choán dòng bình quân', r'$b_{choan}=\omega_{choan}/h$'),
+            ('VCAU-W2', 'Bề rộng và diện tích thoát nước hữu hiệu', r'$W_2=\max(1,W_1-\sum b_{choan}),\quad \Omega_{eff}=\max(0.1,\Omega-\sum\omega_{choan})$'),
+            ('VCAU-V', 'Vận tốc dòng chảy dưới cầu', r'$V_{cau}=Q_{tk}/\Omega_{eff}$')], [
+            'h_than = max(0, z_water − max(z_tn, z_be + T)); h_be = max(0, min(z_be + T, z_water) − max(z_tn, z_be)).',
+            'h_coc = max(0, min(z_be, z_water) − z_tn) khi z_be > z_tn; z_water = z_tn + h.',
+            'a, L: bề rộng và chiều dài thân; a_pc, L_pc: bề rộng và chiều dài bệ; T: chiều cao bệ (m).',
+            'a_p: đường kính cọc; S: khoảng cách cọc; m/n: số hàng/cột; a_proj: bề rộng chiếu nhóm cọc (m).',
+            'z_be: cao độ đáy bệ; h₀,initial = z_be − z_tn; chỉ các tầng thực sự ngập mới tham gia choán dòng.'])
+        detail('Xoi mo', [
+            ('ABUT-VE', 'Vận tốc và Froude khu vực bị mố chặn', r'$V_e=Q_e/A_e,\quad Fr=V_e/\sqrt{g y_a}$'),
+            ('ABUT-K2', 'Hệ số góc mố', r'$K_2=(\theta/90)^{0.13}$'),
+            ('ABUT-FROEHLICH', 'Công thức Froehlich khi L′/y_a ≤ 25', r'$y_s=2.27K_1K_2(L^{\prime})^{0.43}y_a^{0.57}Fr^{0.61}+y_a$'),
+            ('ABUT-HIRE', 'Công thức HIRE khi L′/y_a > 25', r'$y_s=4y_a Fr^{0.33}(K_1/0.55)K_2$')], [
+            'y_a: chiều sâu bình quân khu vực mố cản dòng (m); L′: chiều dài mố cản dòng (m).',
+            'Q_e: lưu lượng bị chặn (m³/s); A_e: diện tích bị chặn (m²); V_e: vận tốc (m/s).',
+            'K₁ = 1,00 cho tường đứng; 0,82 cho tường đứng có cánh; 0,55 cho mố taluy xiên.',
+            'θ: góc dòng chảy với mố; bộ tính giới hạn θ trong [10°; 170°]; K₂ = (θ/90)^0,13.',
+            'Cột Ghi chú chỉ rõ Froehlich hay HIRE; nếu y_a ≤ 0,05 m hoặc L′ ≤ 0 thì xói bằng 0.'])
+        detail('Tong hop', [
+            ('SUM-Y', 'Tổng chiều sâu xói', r'$Y_{total}=y_{deg}+y_{sc}+y_{s,local}$'),
+            ('SUM-Z', 'Cao độ đáy sau xói', r'$z_{scour}=z_{tn}-Y_{total}$')], [
+            'y_deg: hạ thấp đáy dài hạn; y_sc: xói thu hẹp; y_s,local: xói cục bộ theo loại mố/trụ được chọn (m).',
+            'Trụ đơn dùng y_spier; trụ lộ bệ dùng y_spier + y_sfooting; trụ lộ cọc dùng y_spier + y_spc + y_spg.',
+            'Xói chung của mô hình hiện tại dùng một giá trị bình quân; ba cột bãi trái/lòng chính/bãi phải là vị trí trình bày.',
+            'Giá trị tổng hợp lấy trước làm tròn, nên có thể lệch 0,01 m so với cộng các số đã làm tròn trên bảng.'])
+
+        input_rows = []
+        for key, label, unit, note in [
+            ('htk', 'Htt — mực nước tính toán', 'm', ''), ('qtk', 'Qtk — lưu lượng thiết kế', 'm³/s', ''),
+            ('skew', 'θ — góc chéo dòng chảy', '°', ''), ('s1', 'S₁ — độ dốc', 'm/m', ''),
+            ('d50', 'D₅₀ — đường kính hạt', 'mm', ''), ('d84', 'D₈₄ — đường kính hạt hiệu dụng', 'mm', 'Đã xét mặc định 2D₅₀ nếu đầu vào ≤ 0'),
+            ('omega', 'ω — vận tốc lắng', 'm/s', 'Giá trị nhập, không tự tính lại'),
+            ('n_manning', 'n — hệ số Manning', '', 'Dùng cho đường H–Q'),
+            ('y_deg', 'y_deg — hạ thấp dài hạn', 'm', ''), ('W1_up', 'W₁ — bề rộng thượng lưu hiệu dụng', 'm', ''),
+            ('W2', 'W₂ — bề rộng thu hẹp', 'm', ''), ('area', 'Ω — diện tích ướt tự nhiên', 'm²', ''),
+            ('area_bridge', 'Ω_eff — diện tích thoát nước qua cầu', 'm²', ''),
+            ('k1_type', 'Hình dạng mũi trụ', '', ''), ('k3_type', 'Tình trạng đáy sông', '', '')]:
+            input_rows.append(dict(parameter=label, value=context.get(key, ''), unit=unit, note=note))
+        by_sheet['Vcau']['tables'].insert(0, make_table('Thông số đầu vào và thủy lực dùng trong lần tính', [
+            ('parameter','Thông số','',0,'text'), ('value','Giá trị','',6,'input'),
+            ('unit','Đơn vị','',0,'text'), ('note','Ghi chú','',0,'text')], input_rows))
+        geometry = [dict(p, kind=p['kind']) for p in self._report_piers]
+        by_sheet['Vcau']['tables'].insert(1, make_table('Kích thước thân trụ, bệ và móng cọc', [
+            ('name','Tên trụ','',0,'text'), ('cdtn','∇tn','m',2,'input'),
+            ('a','a_pier','m',2,'input'), ('L','L_pier','m',2,'input'),
+            ('apc','a_pc','m',2,'input'), ('Lpc','L_pc','m',2,'input'), ('T','T','m',2,'input'),
+            ('z_be','Cao độ đáy bệ','m',2,'input'), ('ho0','h₀,initial','m',2,'output'),
+            ('ap','a_p','m',2,'input'), ('S','S','m',2,'input'), ('m','m','',0,'input'),
+            ('n','n','',0,'input'), ('aproj','a_proj','m',2,'input'), ('f','f','m',2,'input'),
+            ('theta','θ','°',1,'input'), ('kind','Loại trụ','',0,'text')], geometry,
+            [('Thân trụ','a','L'), ('Bệ trụ','apc','ho0'), ('Móng cọc','ap','aproj')]))
+
+        # Không để bảng PPLL mô tả sai Ai tích phân và đơn vị Σωi.
+        ppll = by_sheet['PPLL']['tables'][0]
+        ppll['columns'][6]['label'], ppll['columns'][6]['unit'] = 'Σω_i', 'm²'
+        ppll['columns'][8]['label'], ppll['columns'][8]['unit'] = 'A_node,i', 'm⁸/³'
+        ppll['columns'] += [dict(key='ai_actual',label='A_pp,i',unit='m⁸/³',digits=6,role='output'),
+                            dict(key='vloc',label='V_loc đến trụ',unit='m/s',digits=3,role='output')]
+        for i, row in enumerate(ppll['rows']):
+            row['ai_actual'] = context.get('ai_vals', [])[i] if i < len(context.get('ai_vals', [])) else ''
+            vh = context.get('vh_data', [])
+            row['vloc'] = vh[i]['Vloc'] if i < len(vh) else ''
+        lookups = [('Hình dạng mũi trụ — K₁', HEC18Tables.PIER_K1),
+                   ('Tình trạng đáy sông — K₃', HEC18Tables.PIER_K3)]
+        for title, mapping in lookups:
+            by_sheet['Xoi cuc tru']['tables'].append(make_table(title, [
+                ('condition','Trường hợp','',0,'text'), ('factor','Hệ số','',2,'output'),
+                ('note','Căn cứ / ghi chú','',0,'text')],
+                [dict(condition=k,factor=v[0],note=v[1]) for k,v in mapping.items()]))
+        by_sheet['Xói chung']['tables'].append(make_table('Bảng tra số mũ Laursen k₁', [
+            ('condition','V*/ω','',0,'text'), ('factor','k₁','',2,'output'), ('note','Dạng vận chuyển','',0,'text')],
+            [dict(condition='R < 0,50',factor=0.59,note='Vận chuyển sát đáy'),
+             dict(condition='0,50 ≤ R ≤ 2,00',factor=0.64,note='Lơ lửng một phần'),
+             dict(condition='R > 2,00',factor=0.69,note='Chủ yếu lơ lửng')]))
+        # Xuất cả cao độ gốc và các tỷ số trung gian, tránh bỏ những yếu tố tra hệ số.
+        for sheet, kind in [('XCB-lo coc','Lộ bệ & cọc'), ('XCB-lo be','Lộ bệ')]:
+            checks = []
+            for p in self._report_piers:
+                if p['kind'] != kind:
+                    continue
+                cp = p['cp']
+                checks.append(dict(p, h1=cp['h1'], y2=cp['y2'], h2=cp['h2'],
+                    f_a=p['f']/p['a'] if p['a']>0 else 0,
+                    h1_a=cp['h1']/p['a'] if p['a']>0 else 0,
+                    h2_y2=cp['h2']/cp['y2'] if cp['y2']>0 else 0,
+                    T_y2=cp['t_eff']/cp['y2'] if cp['y2']>0 else 0,
+                    fr2=cp['fr2'], fr3=cp['fr3'], teff=cp['t_eff'],
+                    s_ap=p['S']/p['ap'] if p['ap']>0 else 0,
+                    A_ap=p['aproj']/p['ap'] if p['ap']>0 else 0,
+                    h3_y3=cp['h3']/cp['y3'] if cp['y3']>0 else 0))
+            fields = [('name','Tên trụ','',0,'text'), ('z_be','Cao độ đáy bệ','m',2,'input'),
+                ('ho0','h₀,initial','m',2,'output'), ('ho','h₀ sau xói chung','m',2,'output'),
+                ('f_a','f/a_pier','',3,'output'), ('h1_a','h₁/a_pier','',3,'output'),
+                ('h2_y2','h₂/y₂','',3,'output'), ('T_y2','T_eff/y₂','',3,'output'),
+                ('teff','T_eff','m',2,'output'), ('fr2','Fr₂','',3,'output')]
+            if sheet == 'XCB-lo coc':
+                fields += [('s_ap','S/a_p','',3,'output'), ('A_ap','a_proj/a_p','',3,'output'),
+                           ('h3_y3','h₃/y₃','',3,'output'), ('fr3','Fr₃','',3,'output')]
+            by_sheet[sheet]['tables'].append(make_table('Thông số trung gian kiểm tra hệ số và cao độ', fields, checks))
         return sections
 
     @staticmethod
@@ -2586,7 +2825,13 @@ class MainScourApplication(tk.Tk):
     def _report_column_weights(columns):
         weights = []
         for c in columns:
-            if c['key'] == 'note' or c['label'] == 'Ghi chú':
+            if c['key'] in ('parameter', 'condition'):
+                weights.append(3.5)
+            elif c['key'] == 'value':
+                weights.append(2.5)
+            elif c['key'] in ('unit', 'factor'):
+                weights.append(0.7)
+            elif c['key'] in ('note', 'case_note') or c['label'] == 'Ghi chú':
                 weights.append(2.2)
             elif c['key'] in ('shape', 'bed') or 'Thuộc loại' in c['label']:
                 weights.append(1.8)
@@ -2623,7 +2868,11 @@ class MainScourApplication(tk.Tk):
             ws.row_dimensions[row].height = max(20, 16 * math.ceil(len(text) / max(40, end * 9)))
 
         def explanations(ws, row, section, count):
-            for equation in section['formulas']:
+            for equation_index, equation in enumerate(section['formulas']):
+                labels = section.get('formula_labels', [])
+                if equation_index < len(labels):
+                    line(ws, row, labels[equation_index], count, 10, True)
+                    row += 1
                 path, width, height = self._create_equation_img(equation, fontsize=11)
                 if not path:
                     raise ValueError(f'Không tạo được ảnh công thức: {equation}')
@@ -2669,13 +2918,26 @@ class MainScourApplication(tk.Tk):
                 for data in section['tables']:
                     cols = data['columns']
                     n = len(cols)
+                    # Bảng ngắn vẫn dùng đủ bề rộng trang, không ép bảng đầu vào
+                    # vào bốn cột hẹp của bảng trụ ở cùng worksheet.
+                    weights = self._report_column_weights(cols)
+                    extra = count - n
+                    shares = [extra * w / sum(weights) for w in weights]
+                    spans = [1 + int(v) for v in shares]
+                    remaining = count - sum(spans)
+                    for i in sorted(range(n), key=lambda i: shares[i] - int(shares[i]), reverse=True)[:remaining]:
+                        spans[i] += 1
+                    positions, next_col = [], 1
+                    for span in spans:
+                        positions.append((next_col, next_col + span - 1))
+                        next_col += span
                     if data['title']:
                         line(ws, row, data['title'], count, 11, True, True)
                         row += 1
                     header = row
                     for r in range(header, header + 3):
                         ws.row_dimensions[r].height = 26
-                        for c in range(1, n + 1):
+                        for c in range(1, count + 1):
                             cell = ws.cell(r, c)
                             cell.border = border
                             cell.font = font(10, True)
@@ -2683,26 +2945,34 @@ class MainScourApplication(tk.Tk):
                     keys = [c['key'] for c in cols]
                     grouped = set()
                     for title, start, end in data['groups']:
-                        a, b = keys.index(start) + 1, keys.index(end) + 1
+                        first, last = keys.index(start), keys.index(end)
+                        a, b = positions[first][0], positions[last][1]
                         ws.merge_cells(start_row=header, start_column=a, end_row=header, end_column=b)
                         ws.cell(header, a, title)
-                        grouped.update(range(a, b + 1))
+                        grouped.update(range(first, last + 1))
                     for c, column in enumerate(cols, 1):
-                        if c in grouped:
-                            ws.cell(header + 1, c, column['label'])
+                        a, b = positions[c - 1]
+                        if c - 1 in grouped:
+                            ws.merge_cells(start_row=header + 1, start_column=a, end_row=header + 1, end_column=b)
+                            ws.cell(header + 1, a, column['label'])
                         else:
-                            ws.merge_cells(start_row=header, start_column=c, end_row=header + 1, end_column=c)
-                            ws.cell(header, c, column['label'])
-                        ws.cell(header + 2, c, f"({column['unit']})" if column['unit'] else '')
+                            ws.merge_cells(start_row=header, start_column=a, end_row=header + 1, end_column=b)
+                            ws.cell(header, a, column['label'])
+                        ws.merge_cells(start_row=header + 2, start_column=a, end_row=header + 2, end_column=b)
+                        ws.cell(header + 2, a, f"({column['unit']})" if column['unit'] else '')
                         if column['key'] in ('d50', '3', '10') and column['label'] in ('D₅₀', 'ω'):
                             for r in range(header, header + 3):
-                                ws.cell(r, c).fill = PatternFill('solid', fgColor='FFFF99')
+                                ws.cell(r, a).fill = PatternFill('solid', fgColor='FFFF99')
                     row += 3
                     for values in data['rows']:
                         row_height = 25
                         for c, column in enumerate(cols, 1):
                             value = self._report_value(values.get(column['key'], ''), column)
-                            cell = ws.cell(row, c, value)
+                            a, b = positions[c - 1]
+                            for physical in range(a, b + 1):
+                                ws.cell(row, physical).border = border
+                            ws.merge_cells(start_row=row, start_column=a, end_row=row, end_column=b)
+                            cell = ws.cell(row, a, value)
                             if isinstance(value, str):
                                 cell.data_type = 's'  # Ghi chú bắt đầu bằng '=' vẫn là văn bản.
                             color = 'C00000' if column['role'] == 'input' else ('17365D' if column['role'] == 'output' else '000000')
@@ -2713,8 +2983,8 @@ class MainScourApplication(tk.Tk):
                                 cell.number_format = '0' if column['digits'] == 0 else '0.' + '0' * column['digits']
                             if section['sheet'] == 'Xói chung':
                                 cell.fill = PatternFill('solid', fgColor='CCFFFF')
-                            if column['key'] in ('shape', 'bed', 'note'):
-                                row_height = max(row_height, min(90, 14 * math.ceil(len(str(value)) / 16)))
+                            if isinstance(value, str):
+                                row_height = max(row_height, 6 + 14 * math.ceil(len(value) / max(6, 9 * (b - a + 1))))
                         ws.row_dimensions[row].height = row_height
                         row += 1
                     if not data['rows']:
@@ -2723,6 +2993,11 @@ class MainScourApplication(tk.Tk):
                     row += 2
                 if section['sheet'] == 'Xói chung':
                     row = explanations(ws, row, section, count)
+                if section.get('detail'):
+                    from openpyxl.worksheet.pagebreak import Break
+                    ws.row_breaks.append(Break(id=row - 1))
+                    line(ws, row, 'CÔNG THỨC XÁC ĐỊNH THÔNG SỐ, HỆ SỐ VÀ ĐIỀU KIỆN ÁP DỤNG', count, 11, True)
+                    row = explanations(ws, row + 1, section['detail'], count)
                 widest = max(section['tables'], key=lambda t: len(t['columns']))
                 for c, weight in enumerate(self._report_column_weights(widest['columns']), 1):
                     ws.column_dimensions[get_column_letter(c)].width = 9 * weight
@@ -2732,7 +3007,7 @@ class MainScourApplication(tk.Tk):
                 ws.page_setup.orientation = ('portrait' if section['sheet'] in ('XCB-lo coc', 'XCB-lo be')
                                              else 'landscape')
                 ws.page_setup.paperSize = ws.PAPERSIZE_A3 if count > 18 else ws.PAPERSIZE_A4
-                small_report = max(len(t['rows']) for t in section['tables']) <= 10
+                small_report = not section.get('detail') and max(len(t['rows']) for t in section['tables']) <= 10
                 ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, (1 if small_report else 0)
                 ws.page_margins.left = ws.page_margins.right = 0.25
                 ws.print_options.horizontalCentered = True
@@ -2799,16 +3074,20 @@ class MainScourApplication(tk.Tk):
                     formula_table.autofit = False
                     for col in formula_table.columns:
                         col.width = Cm(usable_cm / 2)
-                    targets = [(formula_table.cell(0, j).paragraphs[0], equations[i + j], usable_cm / 2)
+                    targets = [(formula_table.cell(0, j).paragraphs[0], equations[i + j], usable_cm / 2, i + j)
                                for j in range(2)]
                 else:
-                    targets = [(doc.add_paragraph(), equations[i], usable_cm)]
-                for p, equation, available in targets:
+                    targets = [(doc.add_paragraph(), equations[i], usable_cm, i)]
+                for p, equation, available, equation_index in targets:
                     path, width, height = self._create_equation_img(equation, fontsize=11)
                     if not path:
                         raise ValueError(f'Không tạo được ảnh công thức: {equation}')
                     temp_images.append(path)
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    labels = section_data.get('formula_labels', [])
+                    if equation_index < len(labels):
+                        run = p.add_run(labels[equation_index] + '\n')
+                        run.bold, run.font.size = True, Pt(10)
                     p.add_run().add_picture(path, width=Inches(min(width, available / 2.54)))
             if section_data['definitions']:
                 paragraph('Trong đó:', True)
@@ -2895,6 +3174,10 @@ class MainScourApplication(tk.Tk):
                         doc.add_paragraph()
                 if section_data['sheet'] == 'Xói chung':
                     explanations(section_data, usable_cm)
+                if section_data.get('detail'):
+                    doc.add_page_break()
+                    paragraph('CÔNG THỨC XÁC ĐỊNH THÔNG SỐ, HỆ SỐ VÀ ĐIỀU KIỆN ÁP DỤNG', True, 11)
+                    explanations(section_data['detail'], usable_cm)
             doc.save(file_path)
         finally:
             for path in temp_images:
