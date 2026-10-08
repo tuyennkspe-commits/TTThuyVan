@@ -3074,9 +3074,9 @@ class MainScourApplication(tk.Tk):
                 ws.sheet_properties.pageSetUpPr.fitToPage = True
                 ws.page_setup.orientation = 'landscape'
                 ws.page_setup.paperSize = ws.PAPERSIZE_A3 if count > 18 else ws.PAPERSIZE_A4
-                small_report = (not section.get('appendix') and
-                                max((len(t['rows']) for t in section['tables']), default=0) <= 10)
-                ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, (1 if small_report else 0)
+                # Chỉ vừa chiều ngang; nhiều bảng/công thức được phép sang
+                # trang tiếp theo, tránh chữ quá nhỏ vì ép cả báo cáo vào 1 trang.
+                ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
                 ws.page_margins.left = ws.page_margins.right = 0.25
                 ws.print_options.horizontalCentered = True
                 ws.print_area = f'A1:{get_column_letter(count)}{row - 1}'
