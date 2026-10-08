@@ -322,6 +322,8 @@ class MainScourApplication(tk.Tk):
         self.hq_data = []
         self.vh_data = []
         self.scour_results = []
+        self._report_piers = []
+        self._report_context = {}
         self.t1_entries = {}
 
         self._build_menu()
@@ -1622,6 +1624,8 @@ class MainScourApplication(tk.Tk):
         f_bot.pack(fill=tk.X, padx=8, pady=4)
         btn_exp = ttk.Button(f_bot, text="Xuất File Excel Kết Quả Tính Xói (*.xlsx)...", command=self.action_export_report)
         btn_exp.pack(side=tk.RIGHT, padx=5)
+        ttk.Button(f_bot, text="Xuất Báo Cáo Word (*.docx)...",
+                   command=self.action_export_word).pack(side=tk.RIGHT, padx=5)
 
     def _render_scour_prism_plot(self, x_pts, z_pts, htk, y_deg, ysc, piers_x, scour_z):
         self.ax_prism.clear()
@@ -1888,6 +1892,7 @@ class MainScourApplication(tk.Tk):
 
             # ---------------- Tab 7: Xói cục bộ mố & trụ ----------------
             self.scour_results.clear()
+            self._report_piers.clear()
             self.tree_summary.delete(*self.tree_summary.get_children())
             self.tree_single_pier.delete(*self.tree_single_pier.get_children())
             self.tree_lobe_1.delete(*self.tree_lobe_1.get_children())
@@ -2020,6 +2025,19 @@ class MainScourApplication(tk.Tk):
                         kw_lb = HEC18Calculations.kw_wide_pier(y2_lb, apc, frf_lb, vf_lb / max(0.01, vc2), d50_m)
                         ysfooting_lb = 2.0 * 1.0 * k2 * k3_val * kw_lb * (apc ** 0.65) * (yf_lb ** 0.35) * (frf_lb ** 0.43)
 
+                    # Lưu các giá trị chưa làm tròn cho báo cáo, không tính lại khi xuất.
+                    self._report_piers.append(dict(
+                        name=p_name, stt=stt_p, cdtn=cdtn, kind=loai_tru,
+                        y1=y1, v1=v1, fr1=fr1, a=a, shape=k1_short,
+                        k1=k1_eff, theta=skew, L=L, k2=k2, bed=k3_name.split(" (")[0],
+                        k3=k3_val, d50=d50_mm, vc=vc_tru, ratio=ratio_v_vc,
+                        kw=kw_single, single=ys_pier_single, z_single=cd_single,
+                        f=f_dist, ho=ho, ho0=ho0, T=T_be, apc=apc,
+                        ap=ap, S=S_coc, m=m_hang, n=n_cot, aproj=aproj,
+                        cp=copy.deepcopy(cp), yf=yf_lb, ks=ks_val, vf=vf_lb,
+                        frf=(vf_lb / math.sqrt(G * yf_lb) if yf_lb > 0 else 0.0),
+                        kw_lb=kw_lb, footing=ysfooting_lb, note=note_single))
+
                     # Đưa vào đúng Tab phân loại để không bị lẫn lộn giữa Trụ lộ bệ và Trụ lộ cọc
                     if loai_tru == "Lộ bệ":
                         self.tree_lobe_1.insert("", tk.END, values=(
@@ -2076,6 +2094,10 @@ class MainScourApplication(tk.Tk):
             all_x = [pt["L_cum"] for pt in self.vh_data]
             all_z = [pt["z"] for pt in self.vh_data]
             self._render_scour_prism_plot(all_x, all_z, htk, y_deg, ysc, plot_x, plot_scour_z)
+
+            self._report_context = dict(htk=htk, qtk=qtk, y_deg=y_deg,
+                                        project_name=self.project.get("project_name", ""),
+                                        bridge_name=self.project.get("bridge_name", ""))
 
             self.nb.select(self.tab4)
             messagebox.showinfo("Thành công", f"Đã tính toán choán dòng & xói cầu chính xác cho {self.project['bridge_name']}!")
@@ -2317,615 +2339,595 @@ class MainScourApplication(tk.Tk):
             return None, 0, 0
 
     # =========================================================================
-    # 1. XUẤT BÁO CÁO EXCEL CHUẨN ĐẸP (KHÔNG ĐÈ CHỮ, ĐÚNG MẪU HEC-18)
+    # BÁO CÁO WORD / EXCEL: CÙNG DỮ LIỆU, CÙNG CẤU TRÚC BẢNG THEO MẪU
     # =========================================================================
+    def _report_sections(self):
+        """Dữ liệu xuất độc lập định dạng; giữ nguyên kết quả của bộ tính HEC-18."""
+        import re
+
+        def columns(spec):
+            result = []
+            for entry in spec:
+                key, label, unit, digits, role = entry.split('|')
+                result.append(dict(key=key, label=label, unit=unit,
+                                   digits=int(digits), role=role))
+            return result
+
+        def table(title, spec, rows, groups=()):
+            return dict(title=title, columns=columns(spec), rows=rows, groups=groups)
+
+        def tree_table(title, tree):
+            spec = []
+            for i, key in enumerate(tree['columns']):
+                label = tree.heading(key, 'text')
+                match = re.search(r'\s*\(([^()]*)\)\s*$', label)
+                unit = match.group(1) if match else ''
+                label = label[:match.start()] if match else label
+                is_text = any(word in label for word in ('Tên', 'No.', 'STT', 'Ghi chú', 'H.D.', 'Kích Thước'))
+                role = 'text' if is_text else 'output'
+                digits = 6 if label in ('io', 'Fr') else 3
+                spec.append(f'{i}|{label}|{unit}|{digits}|{role}')
+            rows = [dict(zip((str(i) for i in range(len(spec))), tree.item(item, 'values')))
+                    for item in tree.get_children()]
+            return table(title, spec, rows)
+
+        records = []
+        for p in self._report_piers:
+            row = {**p, **p['cp']}
+            row['note'] = p['note']
+            row['case_note'] = p['cp']['note']
+            row['vc2'] = HEC18Calculations.critical_velocity_vc(row['y2'], p['d50'] / 1000.0)
+            row['ratio2'] = row['v2'] / row['vc2'] if row['vc2'] > 0 else 0.0
+            row['ratiof'] = p['vf'] / row['vc2'] if row['vc2'] > 0 else 0.0
+            row['y2_af'] = row['y2'] / p['apc'] if p['apc'] > 0 else 0.0
+            row['kw_pc'] = 1.0  # Thành phần bệ của complex_pier không nhân Kw.
+            row['k2_pg'] = 1.0  # Nhóm cọc dùng K2 = 1 trong bộ tính hiện tại.
+            row['y3max'] = 3.5 * row['apg']
+            row['ys_lb'] = p['cp']['ys_pier'] + p['footing']
+            records.append(row)
+
+        stem_spec = [
+            'name|No. Trụ||0|text', 'cdtn|∇tn|m|2|input', 'y1|y₁|m|2|input',
+            'v1|V₁|m/s|2|input', 'fr1|Fr₁||3|output', 'a|a_pier|m|2|input',
+            'shape|H. D. trụ||0|text', 'k1|K₁||2|output', 'theta|θ|°|1|input',
+            'L|L|m|2|input', 'k2|K₂||2|output', 'bed|Đáy sông là||0|text',
+            'k3|K₃||2|output', 'f|f|m|2|input', 'ho|h₀|m|2|input',
+            'T|T|m|2|input', 'h1|h₁|m|2|output', 'kh|K_hpier||3|output',
+            'd50|D₅₀|mm|3|input', 'vc|V_c|m/s|3|output', 'ratio|V₁/V_c||2|output',
+            'kw|K_w||3|output', 'ys_pier|y_spier|m|2|output', 'note|Ghi chú||0|text']
+        stem_groups = [('Xác định K₁', 'shape', 'k1'), ('Xác định K₂', 'theta', 'k2'),
+                       ('Xác định K₃', 'bed', 'k3'), ('Xác định K_hpier', 'f', 'kh')]
+        cap_spec = [
+            'name|No. Trụ||0|text', 'cdtn|∇tn|m|2|input', 'y1|y₁|m|2|input',
+            'v1|V₁|m/s|2|input', 'ys_pier|y_spier|m|2|output', 'y2|y₂|m|2|output',
+            'h2|h₂|m|2|output', 'T|T|m|2|input', 'apc|a_pc|m|2|input',
+            'v2|V₂|m/s|2|output', 'apc_star|a_pc*|m|3|output', 'fr2|Fr₂||3|output',
+            'd50|D₅₀|mm|3|input', 'vc2|V_c|m/s|3|output', 'ratio2|V₂/V_c||2|output',
+            'kw_pc|K_w||2|output', 'shape|H. D. trụ||0|text', 'k1|K₁||2|output',
+            'theta|θ|°|1|input', 'L|L|m|2|input', 'k2|K₂||2|output',
+            'k3|K₃||2|output', 'ys_pc|y_spc|m|2|output']
+        pile_spec = [
+            'name|No. Trụ||0|text', 'cdtn|∇tn|m|2|input', 'y1|y₁|m|2|input',
+            'v1|V₁|m/s|2|input', 'ys_pier|y_spier|m|2|output', 'y3|y₃|m|2|output',
+            'h3|h₃|m|2|output', 'ap|a_p|m|2|input', 'S|S|m|2|input',
+            'm|m||0|input', 'n|n||0|input', 'aproj|a_proj|m|2|input',
+            'km|K_m||3|output', 'ksp|K_sp||3|output', 'apg|a_pg*|m|3|output',
+            'y3max|y₃,max = 3,5a_pg*|m|2|output', 'khpg|K_hpg||3|output',
+            'v3|V₃|m/s|2|output', 'shape|H. D. trụ||0|text', 'k1|K₁||2|output',
+            'k2_pg|K₂||2|output', 'k3|K₃||2|output', 'ys_pg|y_spg|m|2|output',
+            'note|Ghi chú||0|text']
+        footing_spec = [
+            'name|No. Trụ||0|text', 'cdtn|∇tn|m|2|input', 'y1|y₁|m|2|input',
+            'v1|V₁|m/s|2|input', 'ys_pier|y_spier|m|2|output', 'y2|y₂|m|2|output',
+            'h2|h₂|m|2|output', 'h1|h₁|m|2|output', 'yf|y_f|m|2|output',
+            'v2|V₂|m/s|2|output', 'ks|K_s|m|4|input', 'vf|V_f|m/s|2|output',
+            'apc|a_f|m|2|input', 'y2_af|y₂/a_f||3|output', 'frf|Fr_f||3|output',
+            'd50|D₅₀|mm|3|input', 'vc2|V_c|m/s|3|output', 'ratiof|V_f/V_c||2|output',
+            'kw_lb|K_w||3|output', 'k1_foot|K₁||2|output', 'k2|K₂||2|output',
+            'k3|K₃||2|output', 'footing|y_sfooting|m|2|output', 'note|Ghi chú||0|text']
+        for row in records:
+            row['k1_foot'] = 1.0  # Hệ số thực tế của công thức ysfooting_lb.
+        lc = [r for r in records if r['kind'] == 'Lộ bệ & cọc']
+        lb = [r for r in records if r['kind'] == 'Lộ bệ']
+        single = [r for r in records if r['kind'] == 'Trụ đơn đặc']
+        sum_spec = ['stt|STT||0|text', 'name|Tên trụ||0|text', 'cdtn|∇tn|m|2|input',
+                    'ys_pier|y_spier|m|2|output', 'ys_pc|y_spc|m|2|output',
+                    'ys_pg|y_spg|m|2|output', 'ys_total|y_s|m|2|output', 'case_note|Ghi chú||0|text']
+        lb_sum_spec = ['stt|STT||0|text', 'name|Tên trụ||0|text', 'cdtn|∇tn|m|2|input',
+                       'ys_pier|Xói do thân trụ y_spier|m|2|output',
+                       'footing|Xói do bệ trụ y_sfooting|m|2|output',
+                       'ys_lb|Tổng xói cục bộ y_s|m|2|output', 'note|Ghi chú||0|text']
+        # Bảng trụ đơn chỉ chứa trụ được chọn là Trụ đơn đặc, không lặp trụ phức hợp.
+        single_spec = stem_spec[:13] + stem_spec[18:22] + [
+            'single|y_spier|m|2|output', 'z_single|∇sau xói|m|2|output', 'note|Ghi chú||0|text']
+
+        xc_spec = [
+            '0|No.||0|text', '1|∇tr.b thượng lưu|m|2|input', '2|y₁|m|2|input',
+            '3|D₅₀|mm|3|input', '4|V_c|m/s|3|output', '5|V|m/s|2|output',
+            '6|V_c/V||3|output', '7|Thuộc loại||0|text', '8|S₁|m/m|6|input',
+            '9|V*|m/s|4|output', '10|ω|m/s|3|input', '11|V*/ω||3|output',
+            '12|k₁||2|output', '13|Q₁|m³/s|2|input', '14|W₁|m|2|input',
+            '15|Q₂|m³/s|2|input', '16|W₂|m|2|input', '17|D_m|mm|3|output',
+            '18|y₂|m|2|output', '19|∇tr.b thu hẹp|m|2|input', '20|y₀|m|2|input',
+            '21|Δy_xch|m|3|output', '22|Ghi chú||0|text']
+        xc_rows = [dict(zip(map(str, range(23)), self.tree_xoi_chung.item(i, 'values')))
+                   for i in self.tree_xoi_chung.get_children()]
+        summary_rows = []
+        abutments = sorted([r for r in self.scour_results if is_abut_name(r['name'])],
+                           key=lambda r: r['x'])
+        for r in self.scour_results:
+            out = dict(r, left='', main='', right='', note='')
+            key = 'main'
+            if abutments and r is abutments[0]:
+                key = 'left'
+            elif abutments and r is abutments[-1]:
+                key = 'right'
+            out[key] = r['ysc']
+            summary_rows.append(out)
+        summary_spec = ['name|Tên mố/trụ||0|text', 'cdtn|Cao độ tự nhiên|m|2|input',
+                        'left|Bãi trái|m|2|output', 'main|Lòng chính|m|2|output',
+                        'right|Bãi phải|m|2|output']
+        if any(r['y_deg'] != 0 for r in self.scour_results):
+            summary_spec.append('y_deg|Hạ thấp dài hạn|m|2|output')
+        summary_spec += ['ys_local|Xói cục bộ|m|2|output', 'y_tot|Tổng chiều sâu xói|m|2|output',
+                         'z_scour|Cao độ sau xói|m|2|output']
+
+        eq_stem = r'$y_{spier}=K_{hpier}\,[2.0 K_1 K_2 K_3 K_w a_{pier}^{0.65} y_1^{0.35} Fr_1^{0.43}]$'
+        eq_kh = (r'$K_{hpier}=(0.4075-0.0669 f/a_{pier})'
+                 r'-(0.4271-0.0778 f/a_{pier})(h_1/a_{pier})'
+                 r'+(0.1615-0.0455 f/a_{pier})(h_1/a_{pier})^2'
+                 r'-(0.0269-0.012 f/a_{pier})(h_1/a_{pier})^3$')
+        base_defs = [
+            'y₁: chiều sâu dòng chảy trước khi tính xói (m); V₁: vận tốc dòng chảy đến trụ (m/s).',
+            'K₁: hệ số hình dạng mũi trụ; K₂: hệ số góc chéo θ; K₃: hệ số tình trạng đáy sông.',
+            'K_w: hệ số xét chiều sâu và bề rộng trụ; a_pier: bề rộng thân trụ (m).',
+            'Fr₁ = V₁/√(g y₁); g = 9,81 m/s²; D₅₀: đường kính hạt bùn cát (mm).',
+            'V_c = 6,19 y₁^(1/6) D₅₀^(1/3), trong công thức D₅₀ đổi sang m.',
+            'f: khoảng cách từ mũi bệ đến thân trụ; T: chiều cao bệ (m).',
+            'h₀: cao độ đáy bệ trừ cao độ đáy sau hạ thấp dài hạn và xói thu hẹp (m).',
+            'h₁ = h₀ + T; y₂ = y₁ + y_spier/2; h₂ = h₀ + y_spier/2 (m).',
+            'V₂ = V₁(y₁/y₂); a_pc: bề rộng bệ; a_pc*: bề rộng tương đương của bệ (m).',
+            'K_hpier được giới hạn trong [0; 1]; khi đỉnh bệ dưới đáy, dùng kết quả trụ đơn.']
+        lc_defs = base_defs + [
+            'y_s = y_spier + y_spc + y_spg: tổng chiều sâu xói cục bộ (m).',
+            'y₃ = y₁ + y_spier/2 + y_spc/2; h₃ = h₀ + y_spier/2 + y_spc/2 (m).',
+            'V₃ = V₁(y₁/y₃); a_p: đường kính cọc; S: khoảng cách giữa các cọc (m).',
+            'm: số hàng cọc theo dòng chảy; n: số cột cọc theo tim cầu.',
+            'a_proj: bề rộng chiếu nhóm cọc; a_pg* = K_sp K_m a_proj (m).',
+            'K_sp: hệ số khoảng cách cọc; K_m: hệ số số hàng cọc.',
+            'K_hpg: hệ số chiều sâu xói nhóm cọc; y₃,max = 3,5a_pg* chỉ là giá trị tham khảo.',
+            'Thành phần bệ phức hợp dùng K_w = 1; thành phần nhóm cọc dùng K₂ = 1 theo bộ tính.']
+        lb_defs = base_defs + [
+            'y_s = y_spier + y_sfooting; cọc ngàm trong đất nên không có thành phần y_spg.',
+            'y_f = h₁ + y_spier/2: khoảng cách từ đáy sau xói thân đến đỉnh bệ (m).',
+            'V_f: vận tốc dưới đỉnh bệ; Fr_f = V_f/√(g y_f).',
+            'a_f: bề rộng bệ; K_s: độ nhám dùng trong bộ tính (= max(2D₈₄; 0,0001 m)).',
+            'Thành phần xói bệ dùng K₁ = 1; V_c của bảng bệ được tính theo y₂.']
+        xc_defs = [
+            'Δy_xch = y₂ − y₀: chiều sâu xói thu hẹp; y₀: chiều sâu hiện tại trước xói (m).',
+            'y₁: chiều sâu trung bình thượng lưu; y₂: chiều sâu sau xói tại mặt cắt thu hẹp (m).',
+            'V_c < V: xói nước đục; V_c ≥ V: xói nước trong.',
+            'Q₁, Q₂: lưu lượng thượng lưu và tại mặt cắt thu hẹp (m³/s).',
+            'W₁, W₂: bề rộng thượng lưu và bề rộng thu hẹp sau khi trừ trụ (m).',
+            'k₁ = f(V*/ω): số mũ vận chuyển bùn cát; V* = √(g y₁ S₁).',
+            'S₁: độ dốc đường năng lượng; ω: vận tốc lắng hạt D₅₀ (m/s).',
+            'D_m = 1,25 D₅₀; bảng dùng mm, công thức xói nước trong dùng m.',
+            'V_c: vận tốc tới hạn hạt đáy (m/s); V: vận tốc trung bình dòng chảy (m/s).']
+        sections = [
+            dict(sheet='Vcau', title='TÍNH DIỆN TÍCH TRỤ VÀ CHIỀU RỘNG BÌNH QUÂN TRỤ',
+                 formulas=[], definitions=self.txt_vcau_summary.get('1.0', 'end-1c').splitlines(),
+                 tables=[tree_table('', self.tree_vcau)]),
+            dict(sheet='Nuoc denh', title='TÍNH TOÁN NƯỚC DỀNH VÀ KHOẢNG CÁCH DỀNH LỚN NHẤT PHÍA THƯỢNG LƯU CẦU',
+                 formulas=[r'$\Delta h_{dmax}=K\frac{V_c^2-V_{c0}^2}{2g}$',
+                           r'$K=1+(V_0/V_{c0})^2 a/\sqrt{Fr/i_0},\quad Fr=V_0^2/(gL_{ngap})$'],
+                 definitions=['V₀, V_c0, V_c: vận tốc tự nhiên, trước và sau thu hẹp (m/s).',
+                              'L_ngập: bề rộng ngập; i₀: độ dốc; a: hệ số hình thái; g = 9,81 m/s².'],
+                 tables=[tree_table('', self.tree_denh)]),
+            dict(sheet='PPLL', title='PHÂN PHỐI TỐC ĐỘ DÒNG CHẢY LŨ THIẾT KẾ QUA MẶT CẮT TIM CẦU',
+                 formulas=[], definitions=[], tables=[tree_table('', self.tree_ppll)]),
+            dict(sheet='Xói chung', title='TÍNH XÓI THU HẸP TRUNG BÌNH DƯỚI CẦU',
+                 formulas=[r'$\Delta y_{xch}=y_2-y_0$',
+                           r'$y_2=y_1(Q_2/Q_1)^{6/7}(W_1/W_2)^{k_1}\quad (V_c<V)$',
+                           r'$y_2=[0.025 Q_2^2/(D_m^{2/3} W_2^2)]^{3/7}\quad (V_c\geq V)$'],
+                 definitions=xc_defs,
+                 tables=[table('', xc_spec, xc_rows,
+                               [('Tìm số mũ k₁', '8', '12'),
+                                ('Lưu lượng, bề rộng mặt cắt thượng lưu và thu hẹp', '13', '16')])]),
+            dict(sheet='XCB-lo coc', title='TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ, NHÓM CỌC LỘ TRONG DÒNG CHẢY)',
+                 formulas=[r'$y_s=y_{spier}+y_{spc}+y_{spg}$', eq_stem,
+                           r'$y_{spc}=2.0 K_1 K_2 K_3 (a_{pc}^{*})^{0.65} y_2^{0.35} Fr_2^{0.43}$',
+                           r'$y_{spg}=K_{hpg}[2.0 K_1 K_3 (a_{pg}^{*})^{0.65} y_3^{0.35} (V_3/\sqrt{gy_3})^{0.43}]$',
+                           eq_kh,
+                           r'$K_{hpg}=[3.08r-5.23r^2+5.25r^3-2.10r^4]^{1/0.65},\quad r=h_3/y_3$'],
+                 definitions=lc_defs, tables=[
+                     table('1. Xói cục bộ do thân trụ gây ra', stem_spec, lc, stem_groups),
+                     table('2. Xói cục bộ do bệ trụ', cap_spec, lc,
+                           [('Xác định K₁', 'shape', 'k1'), ('Xác định K₂', 'theta', 'k2')]),
+                     table('3. Xói cục bộ do nhóm cọc', pile_spec, lc,
+                           [('Xác định K₁', 'shape', 'k1')]),
+                     table('4. Kết quả phân tích xói cục bộ tại trụ', sum_spec, lc)]),
+            dict(sheet='XCB-lo be', title='TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ LỘ TRONG DÒNG CHẢY)',
+                 formulas=[r'$y_s=y_{spier}+y_{sfooting}$', eq_stem,
+                           r'$y_{sfooting}=2.0 K_1 K_2 K_3 K_w a_f^{0.65} y_f^{0.35} Fr_f^{0.43}$',
+                           r'$V_f/V_2=\frac{\ln(10.93y_f/K_s+1)}{\ln(10.93y_2/K_s+1)}$', eq_kh],
+                 definitions=lb_defs, tables=[
+                     table('1. Xói cục bộ do thân trụ gây ra', stem_spec, lb, stem_groups),
+                     table('2. Xói cục bộ do bệ trụ', footing_spec, lb),
+                     table('3. Kết quả phân tích xói cục bộ tại trụ', lb_sum_spec, lb)]),
+            dict(sheet='Xoi cuc tru', title='TÍNH XÓI CỤC BỘ TRỤ CẦU',
+                 formulas=[r'$y_{spier}=2.0 K_1 K_2 K_3 K_w a^{0.65} y_1^{0.35} Fr_1^{0.43}$'],
+                 definitions=base_defs[:5], tables=[table('', single_spec, single, stem_groups[:3])]),
+            dict(sheet='Xoi mo', title='TÍNH XÓI CỤC BỘ MỐ CẦU', formulas=[], definitions=[],
+                 tables=[tree_table('', self.tree_abutment)]),
+            dict(sheet='Tong hop', title='TỔNG HỢP XÓI DƯỚI CẦU', formulas=[],
+                 definitions=['Tổng xói = hạ thấp dài hạn + xói thu hẹp + xói cục bộ; cao độ sau xói = cao độ tự nhiên − tổng xói.',
+                              'Xói thu hẹp lấy từ kết quả hiện tại; bộ tính chưa tách riêng thủy lực từng bãi.',
+                              'Mố ở vị trí X nhỏ nhất/lớn nhất được xếp bãi trái/phải; các trụ xếp lòng chính.'],
+                 tables=[table('', summary_spec, summary_rows,
+                               [('Độ sâu xói thu hẹp (m)', 'left', 'right')])])]
+        return sections
+
+    @staticmethod
+    def _report_value(value, column):
+        """Giữ tên trụ và ghi chú dạng chữ; chỉ đổi cột số, kể cả ký hiệu khoa học."""
+        if value is None or value == '':
+            return ''
+        if column['role'] == 'text':
+            return str(value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not math.isfinite(number):
+            raise ValueError(f"Giá trị không hữu hạn ở cột {column['label']}")
+        return number
+
+    @staticmethod
+    def _report_column_weights(columns):
+        weights = []
+        for c in columns:
+            if c['key'] == 'note' or c['label'] == 'Ghi chú':
+                weights.append(2.2)
+            elif c['key'] in ('shape', 'bed') or 'Thuộc loại' in c['label']:
+                weights.append(1.8)
+            elif c['role'] == 'text':
+                weights.append(1.4)
+            else:
+                weights.append(1.0)
+        return weights
+
+    def export_excel_report(self, file_path):
+        """Xuất không mở hộp thoại, dùng được cho kiểm thử và tác vụ tự động."""
+        import os
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.drawing.image import Image
+
+        sections = self._report_sections()
+        context = self._report_context or self.project
+        wb = Workbook()
+        wb.remove(wb.active)
+        side = Side(style='thin', color='000000')
+        border = Border(left=side, right=side, top=side, bottom=side)
+        temp_images = []
+
+        def font(size=10, bold=False, color='000000', italic=False):
+            return Font(name='Times New Roman', size=size, bold=bold, color=color, italic=italic)
+
+        def line(ws, row, text, end, size=10, bold=False, italic=False):
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=end)
+            cell = ws.cell(row, 1, text)
+            cell.font = font(size, bold, italic=italic)
+            cell.alignment = Alignment(vertical='center', wrap_text=True)
+            ws.row_dimensions[row].height = max(20, 16 * math.ceil(len(text) / max(40, end * 9)))
+
+        def explanations(ws, row, section, count):
+            for equation in section['formulas']:
+                path, width, height = self._create_equation_img(equation, fontsize=11)
+                if not path:
+                    raise ValueError(f'Không tạo được ảnh công thức: {equation}')
+                temp_images.append(path)
+                image = Image(path)
+                scale = min(1.0, 1100 / max(1, image.width))
+                image.width *= scale
+                image.height *= scale
+                ws.add_image(image, f'A{row}')
+                # Mỗi công thức có vùng riêng; giữ tỷ lệ, không kéo méo ảnh.
+                slots = max(2, math.ceil(image.height / 24) + 1)
+                for r in range(row, row + slots):
+                    ws.row_dimensions[r].height = 18
+                row += slots
+            if section['definitions']:
+                line(ws, row, 'Trong đó:', count, 10, True, True)
+                row += 1
+                half = max(1, count // 2)
+                definitions = section['definitions']
+                split = math.ceil(len(definitions) / 2)
+                for i in range(split):
+                    texts = [definitions[i], definitions[i + split] if i + split < len(definitions) else '']
+                    for start, end, text in [(1, half, texts[0]), (half + 1, count, texts[1])]:
+                        ws.merge_cells(start_row=row, start_column=start, end_row=row, end_column=end)
+                        cell = ws.cell(row, start, text)
+                        cell.font = font()
+                        cell.alignment = Alignment(vertical='center', wrap_text=True)
+                    ws.row_dimensions[row].height = 32 if max(map(len, texts)) > 80 else 24
+                    row += 1
+                row += 2
+            return row
+
+        try:
+            for section in sections:
+                ws = wb.create_sheet(section['sheet'])
+                count = max(len(t['columns']) for t in section['tables'])
+                line(ws, 1, section['title'], count, 13, True)
+                line(ws, 2, '(Theo Hướng dẫn thủy lực công trình HEC No.18, 2012)', count, 11, True, True)
+                line(ws, 3, f"{context.get('bridge_name', '')} — Htt = {context.get('htk', '')} m; Qtk = {context.get('qtk', '')} m³/s", count, 11, True)
+                row = 5
+                if section['sheet'] != 'Xói chung':
+                    row = explanations(ws, row, section, count)
+                for data in section['tables']:
+                    cols = data['columns']
+                    n = len(cols)
+                    if data['title']:
+                        line(ws, row, data['title'], count, 11, True, True)
+                        row += 1
+                    header = row
+                    for r in range(header, header + 3):
+                        ws.row_dimensions[r].height = 26
+                        for c in range(1, n + 1):
+                            cell = ws.cell(r, c)
+                            cell.border = border
+                            cell.font = font(10, True)
+                            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                    keys = [c['key'] for c in cols]
+                    grouped = set()
+                    for title, start, end in data['groups']:
+                        a, b = keys.index(start) + 1, keys.index(end) + 1
+                        ws.merge_cells(start_row=header, start_column=a, end_row=header, end_column=b)
+                        ws.cell(header, a, title)
+                        grouped.update(range(a, b + 1))
+                    for c, column in enumerate(cols, 1):
+                        if c in grouped:
+                            ws.cell(header + 1, c, column['label'])
+                        else:
+                            ws.merge_cells(start_row=header, start_column=c, end_row=header + 1, end_column=c)
+                            ws.cell(header, c, column['label'])
+                        ws.cell(header + 2, c, f"({column['unit']})" if column['unit'] else '')
+                        if column['key'] in ('d50', '3', '10') and column['label'] in ('D₅₀', 'ω'):
+                            for r in range(header, header + 3):
+                                ws.cell(r, c).fill = PatternFill('solid', fgColor='FFFF99')
+                    row += 3
+                    for values in data['rows']:
+                        row_height = 25
+                        for c, column in enumerate(cols, 1):
+                            value = self._report_value(values.get(column['key'], ''), column)
+                            cell = ws.cell(row, c, value)
+                            if isinstance(value, str):
+                                cell.data_type = 's'  # Ghi chú bắt đầu bằng '=' vẫn là văn bản.
+                            color = 'C00000' if column['role'] == 'input' else ('17365D' if column['role'] == 'output' else '000000')
+                            cell.font = font(10, color=color)
+                            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                            cell.border = border
+                            if isinstance(value, (int, float)):
+                                cell.number_format = '0' if column['digits'] == 0 else '0.' + '0' * column['digits']
+                            if section['sheet'] == 'Xói chung':
+                                cell.fill = PatternFill('solid', fgColor='CCFFFF')
+                            if column['key'] in ('shape', 'bed', 'note'):
+                                row_height = max(row_height, min(90, 14 * math.ceil(len(str(value)) / 16)))
+                        ws.row_dimensions[row].height = row_height
+                        row += 1
+                    if not data['rows']:
+                        line(ws, row, 'Không có mố/trụ thuộc trường hợp này trong kết quả tính toán.', count, 10, italic=True)
+                        row += 1
+                    row += 2
+                if section['sheet'] == 'Xói chung':
+                    row = explanations(ws, row, section, count)
+                widest = max(section['tables'], key=lambda t: len(t['columns']))
+                for c, weight in enumerate(self._report_column_weights(widest['columns']), 1):
+                    ws.column_dimensions[get_column_letter(c)].width = 9 * weight
+                ws.freeze_panes = 'C4'
+                ws.print_title_rows = '1:3'
+                ws.sheet_properties.pageSetUpPr.fitToPage = True
+                ws.page_setup.orientation = ('portrait' if section['sheet'] in ('XCB-lo coc', 'XCB-lo be')
+                                             else 'landscape')
+                ws.page_setup.paperSize = ws.PAPERSIZE_A3 if count > 18 else ws.PAPERSIZE_A4
+                small_report = max(len(t['rows']) for t in section['tables']) <= 10
+                ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, (1 if small_report else 0)
+                ws.page_margins.left = ws.page_margins.right = 0.25
+                ws.print_options.horizontalCentered = True
+                ws.print_area = f'A1:{get_column_letter(count)}{row - 1}'
+                ws.oddFooter.center.text = 'Trang &P / &N'
+            wb.save(file_path)
+        finally:
+            for path in temp_images:
+                if os.path.exists(path):
+                    os.remove(path)
+
+    def export_word_report(self, file_path):
+        import os
+        from docx import Document
+        from docx.shared import Pt, Cm, Inches, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.section import WD_ORIENT, WD_SECTION_START
+        from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        doc = Document()
+        normal = doc.styles['Normal']
+        normal.font.name, normal.font.size = 'Times New Roman', Pt(10)
+        normal.paragraph_format.space_after = Pt(3)
+        context = self._report_context or self.project
+        temp_images = []
+
+        def element(tag, attrs):
+            item = OxmlElement(tag)
+            for key, value in attrs.items():
+                item.set(qn(key), str(value))
+            return item
+
+        def paragraph(text, bold=False, size=10, center=False):
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if center else WD_ALIGN_PARAGRAPH.LEFT
+            run = p.add_run(text)
+            run.bold, run.font.size = bold, Pt(size)
+            run.font.name = 'Times New Roman'
+            if bold:
+                p.paragraph_format.keep_with_next = True
+            return p
+
+        def set_cell(cell, text, bold=False, color='000000', size=8):
+            cell.text = text
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.paragraph_format.space_after = Pt(0)
+                p.paragraph_format.space_before = Pt(0)
+                for run in p.runs:
+                    run.font.name, run.font.size, run.bold = 'Times New Roman', Pt(size), bold
+                    run.font.color.rgb = RGBColor.from_string(color)
+
+        def explanations(section_data, usable_cm):
+            equations = section_data['formulas']
+            paired = 4 if section_data['sheet'] in ('XCB-lo coc', 'XCB-lo be') else 0
+            for i in range(0, len(equations)):
+                if i < paired and i % 2:
+                    continue
+                if i < paired:
+                    formula_table = doc.add_table(rows=1, cols=2)
+                    formula_table.autofit = False
+                    for col in formula_table.columns:
+                        col.width = Cm(usable_cm / 2)
+                    targets = [(formula_table.cell(0, j).paragraphs[0], equations[i + j], usable_cm / 2)
+                               for j in range(2)]
+                else:
+                    targets = [(doc.add_paragraph(), equations[i], usable_cm)]
+                for p, equation, available in targets:
+                    path, width, height = self._create_equation_img(equation, fontsize=11)
+                    if not path:
+                        raise ValueError(f'Không tạo được ảnh công thức: {equation}')
+                    temp_images.append(path)
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    p.add_run().add_picture(path, width=Inches(min(width, available / 2.54)))
+            if section_data['definitions']:
+                paragraph('Trong đó:', True)
+                definitions = section_data['definitions']
+                half = math.ceil(len(definitions) / 2)
+                tbl = doc.add_table(rows=half, cols=2)
+                tbl.autofit = False
+                for c in tbl.columns:
+                    c.width = Cm(usable_cm / 2)
+                for i in range(half):
+                    for j in range(2):
+                        k = i + j * half
+                        cell = tbl.cell(i, j)
+                        cell.width = Cm(usable_cm / 2)
+                        if k < len(definitions):
+                            set_cell(cell, definitions[k], size=9)
+                            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+                doc.add_paragraph()
+
+        try:
+            for index, section_data in enumerate(self._report_sections()):
+                section = doc.sections[0] if index == 0 else doc.add_section(WD_SECTION_START.NEW_PAGE)
+                count = max(len(t['columns']) for t in section_data['tables'])
+                section.orientation = WD_ORIENT.LANDSCAPE
+                section.page_width = Cm(42 if count > 18 else 29.7)
+                section.page_height = Cm(29.7 if count > 18 else 21)
+                section.left_margin = section.right_margin = Cm(1.2)
+                section.top_margin = section.bottom_margin = Cm(1.2)
+                usable_cm = section.page_width.cm - section.left_margin.cm - section.right_margin.cm
+                paragraph(section_data['title'], True, 13, True)
+                p = paragraph('(Theo Hướng dẫn thủy lực công trình HEC No.18, 2012)', True, 10, True)
+                p.runs[0].italic = True
+                paragraph(f"{context.get('bridge_name', '')} — Htt = {context.get('htk', '')} m; Qtk = {context.get('qtk', '')} m³/s", True, 10, True)
+                if section_data['sheet'] != 'Xói chung':
+                    explanations(section_data, usable_cm)
+                for table_index, data in enumerate(section_data['tables']):
+                    if data['title']:
+                        paragraph(data['title'], True, 11)
+                    cols, rows = data['columns'], data['rows']
+                    tbl = doc.add_table(rows=3 + len(rows), cols=len(cols))
+                    tbl.style = 'Table Grid'
+                    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+                    tbl.autofit = False
+                    weights = self._report_column_weights(cols)
+                    widths = [usable_cm * w / sum(weights) for w in weights]
+                    for c, width in zip(tbl.columns, widths):
+                        c.width = Cm(width)
+                    for row in tbl.rows:
+                        row._tr.get_or_add_trPr().append(element('w:cantSplit', {}))
+                        for cell, width in zip(row.cells, widths):
+                            cell.width = Cm(width)
+                            margins = element('w:tcMar', {})
+                            for side in ('top', 'left', 'bottom', 'right'):
+                                margins.append(element(f'w:{side}', {'w:w': 25, 'w:type': 'dxa'}))
+                            cell._tc.get_or_add_tcPr().append(margins)
+                    for row in tbl.rows[:3]:
+                        row._tr.get_or_add_trPr().append(element('w:tblHeader', {}))
+                    keys = [c['key'] for c in cols]
+                    grouped = set()
+                    for title, start, end in data['groups']:
+                        a, b = keys.index(start), keys.index(end)
+                        cell = tbl.cell(0, a).merge(tbl.cell(0, b))
+                        set_cell(cell, title, True)
+                        grouped.update(range(a, b + 1))
+                    for i, column in enumerate(cols):
+                        cell = tbl.cell(1, i) if i in grouped else tbl.cell(0, i).merge(tbl.cell(1, i))
+                        set_cell(cell, column['label'], True)
+                        set_cell(tbl.cell(2, i), f"({column['unit']})" if column['unit'] else '', True)
+                        if column['label'] in ('D₅₀', 'ω'):
+                            for r in range(3):
+                                tbl.cell(r, i)._tc.get_or_add_tcPr().append(element('w:shd', {'w:fill': 'FFFF99'}))
+                    for r, values in enumerate(rows, 3):
+                        for c, column in enumerate(cols):
+                            value = self._report_value(values.get(column['key'], ''), column)
+                            text = f"{value:.{column['digits']}f}" if isinstance(value, (int, float)) else str(value)
+                            color = 'C00000' if column['role'] == 'input' else ('17365D' if column['role'] == 'output' else '000000')
+                            cell = tbl.cell(r, c)
+                            set_cell(cell, text, color=color, size=8)
+                            if section_data['sheet'] == 'Xói chung':
+                                cell._tc.get_or_add_tcPr().append(element('w:shd', {'w:fill': 'CCFFFF'}))
+                    if not rows:
+                        paragraph('Không có mố/trụ thuộc trường hợp này trong kết quả tính toán.')
+                    if table_index + 1 < len(section_data['tables']):
+                        doc.add_paragraph()
+                if section_data['sheet'] == 'Xói chung':
+                    explanations(section_data, usable_cm)
+            doc.save(file_path)
+        finally:
+            for path in temp_images:
+                if os.path.exists(path):
+                    os.remove(path)
+
     def action_export_report(self):
         if not self.scour_results:
-            messagebox.showwarning("Cảnh báo", "Vui lòng chạy tính toán trước khi xuất báo cáo!")
+            messagebox.showwarning('Cảnh báo', 'Vui lòng chạy tính toán trước khi xuất báo cáo!')
             return
-            
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx", 
-            filetypes=[("Excel Workbook", "*.xlsx")],
-            title="Lưu Báo Cáo Kết Quả Tính Xói Cầu (Excel)"
-        )
-        if not file_path:
+        path = filedialog.asksaveasfilename(defaultextension='.xlsx',
+                    filetypes=[('Excel Workbook', '*.xlsx')], title='Lưu báo cáo tính xói cầu')
+        if not path:
             return
-
-        temp_img_files = []
         try:
-            import os
-            import pandas as pd
-            from openpyxl import Workbook
-            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-            from openpyxl.drawing.image import Image as OpenpyxlImage
+            self.export_excel_report(path)
+            messagebox.showinfo('Thành công', f'Đã xuất báo cáo Excel theo mẫu:\n{path}')
+        except Exception as exc:
+            messagebox.showerror('Lỗi', f'Xuất Excel thất bại:\n{exc}')
 
-            wb = Workbook()
-            wb.remove(wb.active)
-
-            f_title = Font(name='Times New Roman', size=13, bold=True)
-            f_sub = Font(name='Times New Roman', size=11, italic=True, bold=True)
-            f_norm = Font(name='Times New Roman', size=10)
-            f_bold = Font(name='Times New Roman', size=10, bold=True)
-            f_red = Font(name='Times New Roman', size=10, bold=True, color="FF0000")
-            
-            al_center = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            al_left = Alignment(horizontal='left', vertical='center', wrap_text=False)
-            bd_thin = Border(left=Side(style='thin'), right=Side(style='thin'), 
-                             top=Side(style='thin'), bottom=Side(style='thin'))
-            fill_head = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-
-            def write_df(ws, tree, start_row, title=None):
-                cols = [tree.heading(c, 'text') for c in tree['columns']]
-                data = [tree.item(item, 'values') for item in tree.get_children()]
-                df = pd.DataFrame(data, columns=cols)
-                r = start_row
-                if title:
-                    ws.cell(row=r, column=1, value=title).font = f_sub
-                    r += 1
-                for c_idx, c_name in enumerate(df.columns, 1):
-                    cell = ws.cell(row=r, column=c_idx, value=c_name)
-                    cell.font, cell.alignment, cell.border, cell.fill = f_bold, al_center, bd_thin, fill_head
-                r += 1
-                for _, row_data in df.iterrows():
-                    for c_idx, val in enumerate(row_data, 1):
-                        cell = ws.cell(row=r, column=c_idx, value=val)
-                        cell.font, cell.alignment, cell.border = f_norm, al_center, bd_thin
-                        try: cell.value = float(val)
-                        except ValueError: pass
-                    r += 1
-                return r
-
-            def add_eq_to_excel(ws, cell_pos, latex_str, w_px, h_px, fontsize=10):
-                img_path, _, _ = self._create_equation_img(latex_str, fontsize=fontsize)
-                if img_path:
-                    temp_img_files.append(img_path)
-                    img = OpenpyxlImage(img_path)
-                    img.width = w_px
-                    img.height = h_px
-                    ws.add_image(img, cell_pos)
-
-            htk = self.project.get('htk', '')
-            qtk = self.project.get('qtk', '')
-
-            # -----------------------------------------------------------------
-            # SHEET 1: XCB-lo coc (TRỤ LỘ BỆ & CỌC)
-            # -----------------------------------------------------------------
-            ws4 = wb.create_sheet('XCB-lo coc')
-            ws4['A1'] = "TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ, NHÓM CỌC LỘ TRONG DÒNG CHẢY)(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)"
-            ws4['A1'].font = f_title
-
-            ws4['A2'] = "ys = yspier + yspc(footing)+ yspg"
-            ws4['E2'] = "yspier = Khpier [2.0 K1 K2 K3 apier^0.65 y1^0.35 Fr1^0.43]"
-            ws4['N2'] = "yspc = 2.0 K1 K2 K3 Kwapc*^0.65 y2^0.35 Fr2^0.43"
-            ws4['E3'] = "yspg = Khpg [2.0 K1 K2 K3 apg*^0.65 y3^0.35 (V3/(gy3)^0.5)^0.43]"
-            for pos in ['A2', 'E2', 'N2', 'E3']:
-                ws4[pos].font, ws4[pos].alignment = f_bold, al_left
-
-            ws4['A5'] = "Trong đó:"
-            ws4['A5'].font = f_bold
-
-            left_lc = [
-                (6, "ys: Tổng chiều sâu xói"),
-                (7, "ys,pier: Thành phần xói do thân trụ (m)"),
-                (8, "ys,pc: Thành phần xói do bệ trụ (m)"),
-                (9, "ys,pg: Thành phần xói do nhóm cọc (m)"),
-                (10, "y1 = chiều sâu dòng chảy gần đúng trước khi tính xói, m"),
-                (11, "K1 = hệ số hiệu chỉnh cho hình dạng mũi trụ."),
-                (12, "K2 = hệ số hiệu chỉnh cho góc chéo θ giữa phương trục dọc trụ và phương dòng chảy."),
-                (13, "K3 = hệ số hiệu chỉnh cho tình trạng đáy sông."),
-                (14, "apier = bề rộng trụ, m"),
-                (15, "g = gia tốc trọng trường (9,81 m/s2)"),
-                (16, "y2 = y1 + yspier /2 = chiều sâu dòng chảy hiệu chỉnh tính cho bệ trụ, m"),
-                (17, "y3 = y1 + yspier /2 + yspc /2 = chiều sâu dòng chảy hiệu chỉnh tính cho nhóm cọc, m"),
-                (18, "T = chiều cao bệ trụ, m"),
-                (19, "ho = Chiều cao của đáy bệ trụ so với đáy sông trước khi có xói, m"),
-                (20, "h1 = ho + T = Chiều cao của đỉnh bệ trụ so với đáy sông trước khi tính xói, m"),
-                (21, "h2 = ho + ys pier/2 = Chiều cao của đáy bệ trụ so với đáy sông sau khi tính xói do thân trụ, m"),
-                (22, "h3 = ho + ys pier/2 + ys pc/2 = Chiều cao của nhóm cọc trên đáy sông sau khi tính xói cho bệ trụ, m"),
-                (23, "Khpier = f(h1/apier; f/apier) = Hệ số hiệu chỉnh thành phần xói do trụ")
-            ]
-            for r_idx, val in left_lc:
-                ws4.cell(row=r_idx, column=1, value=val).font = f_norm
-
-            right_lc = [
-                (6, "V1: Tốc độ dòng chảy đến trụ trước khi tính xói (m/s)"),
-                (7, "V2 = V1(y1/y2): Tốc độ dòng chảy hiệu chỉnh tính cho bệ trụ (m/s)"),
-                (8, "V3 = V1(y1/y3): Tốc độ dòng chảy hiệu chỉnh tính cho nhóm cọc (m/s)"),
-                (9, "Kw = hệ số hiệu chỉnh xét tới chiều sâu và bề rộng trụ (bệ trụ)"),
-                (10, "Fr1 = V1 / (gy1)^0.5        Fr2 = V2 / (gy2)^0.5"),
-                (11, "f = khoảng cách từ mũi bệ (cọc) đến thân trụ, m"),
-                (12, "apc = bề rộng bệ trụ, m"),
-                (13, "ap = bề rộng cọc, m"),
-                (14, "apc* = f(h2/y2, T/y2, apc) = chiều rộng trụ tương đương tính cho bệ trụ, m"),
-                (15, "m = số hàng cọc theo chiều dòng chảy"),
-                (16, "n = số cột cọc theo hướng tim cầu"),
-                (17, "S: khoảng cách giữa các cột cọc"),
-                (18, "Khpg: Hệ số hiệu chỉnh chiều sâu xói do nhóm cọc gây ra")
-            ]
-            for r_idx, val in right_lc:
-                ws4.cell(row=r_idx, column=10, value=val).font = f_norm
-
-            eq_khpg = r"$K_{hpg} = \left[ 3.08 \frac{h_3}{y_3} - 5.23 \left(\frac{h_3}{y_3}\right)^2 + 5.25 \left(\frac{h_3}{y_3}\right)^3 - 2.10 \left(\frac{h_3}{y_3}\right)^4 \right]^{1 / 0.65}$"
-            eq_khpier = r"$K_{hpier} = \left(0.4075 + 0.0669 \frac{f}{a_{pier}}\right) - \left(0.4271 - 0.0778 \frac{f}{a_{pier}}\right)\frac{h_1}{a_{pier}} + \left(0.1615 - 0.0455 \frac{f}{a_{pier}}\right)\left(\frac{h_1}{a_{pier}}\right)^2 - \left(0.0269 - 0.012 \frac{f}{a_{pier}}\right)\left(\frac{h_1}{a_{pier}}\right)^3$"
-            
-            add_eq_to_excel(ws4, 'J19', eq_khpg, w_px=340, h_px=55, fontsize=10)
-            add_eq_to_excel(ws4, 'A24', eq_khpier, w_px=640, h_px=45, fontsize=9.5)
-
-            ws4.row_dimensions[24].height = 36
-            ws4.row_dimensions[25].height = 16
-            ws4.cell(row=26, column=3, value=f"HTT =  {htk} m").font = f_red
-            ws4.cell(row=26, column=6, value=f"QTT =  {qtk} m3/s").font = f_red
-            write_df(ws4, self.tree_lc_4, 28)
-
-            # -----------------------------------------------------------------
-            # SHEET 2: XCB-lo be (TRỤ LỘ BỆ)
-            # -----------------------------------------------------------------
-            ws3 = wb.create_sheet('XCB-lo be')
-            ws3['A1'] = "TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ LỘ TRONG DÒNG CHẢY)"
-            ws3['A2'] = "(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)"
-            ws3['A1'].font, ws3['A2'].font = f_title, f_sub
-
-            ws3['A3'] = "ys = yspier + ysfooting"
-            ws3['E3'] = "yspier = Khpier [2.0 K1 K2 K3 Kw apier^0.65 y1^0.35 Fr1^0.43]"
-            ws3['L3'] = "ysfooting = 2.0 K1 K2 K3 Kw af^0.65 yf^0.35 Frf^0.43"
-            for pos in ['A3', 'E3', 'L3']:
-                ws3[pos].font, ws3[pos].alignment = f_bold, al_left
-
-            ws3['A5'] = "Trong đó:"
-            ws3['A5'].font = f_bold
-
-            left_lb = [
-                (6, "yspier = chiều sâu hố xói cục bộ do thân trụ gây ra, m"),
-                (7, "y1 = chiều sâu dòng chảy gần đúng tại thời điểm bắt đầu tính toán, m"),
-                (8, "K1, K2, K3 = hệ số hiệu chỉnh hình dạng mũi, góc chéo θ, đáy sông."),
-                (9, "apier = bề rộng trụ, m"),
-                (10, "V1 = tốc độ trung bình dòng chảy gần đúng, m/s"),
-                (11, "g = gia tốc trọng trường (9,81 m/s2)"),
-                (12, "Khpier = f(h1/apier; f/apier) = hệ số hiệu chỉnh thành phần xói do trụ"),
-                (13, "y2 = chiều sâu dòng chảy hiệu chỉnh, y2 = y1 + yspier / 2, m"),
-                (14, "T = chiều cao bệ trụ, m"),
-                (15, "ho = chiều cao từ đáy bệ đến đáy sông ở điều kiện ban đầu, m"),
-                (16, "h1 = ho + T, (m)")
-            ]
-            for r_idx, val in left_lb:
-                ws3.cell(row=r_idx, column=1, value=val).font = f_norm
-
-            right_lb = [
-                (6, "yf = khoảng cách từ đáy sau xói đến đỉnh bệ, m (yf = h1 + yspier / 2)"),
-                (7, "V2 = V1(y1/y2): tốc độ trung bình hiệu chỉnh ở thủy trực, m/s"),
-                (8, "Vf = tốc độ trung bình ở khu vực dòng chảy dưới đỉnh bệ trụ, m/s:"),
-                (12, "Ks = độ nhám vật liệu đáy (bằng D84 của vật liệu đáy), m"),
-                (13, "Kw = hệ số hiệu chỉnh xét tới chiều sâu và bề rộng trụ (bệ trụ)"),
-                (14, "Fr1 = V1 / (gy1)^0.5         Frf = Vf / (gyf)^0.5"),
-                (15, "f = khoảng cách từ mũi bệ đến thân trụ, m"),
-                (16, "h2 = ho + yspier / 2 = chiều cao mũ cọc sau xói do thân (m)")
-            ]
-            for r_idx, val in right_lb:
-                ws3.cell(row=r_idx, column=10, value=val).font = f_norm
-
-            eq_vf = r"$\frac{V_f}{V_2} = \frac{\ln\left(10.93 \frac{y_f}{K_s} + 1\right)}{\ln\left(10.93 \frac{y_2}{K_s} + 1\right)}$"
-            add_eq_to_excel(ws3, 'J9', eq_vf, w_px=220, h_px=48, fontsize=10.5)
-
-            ws3.cell(row=18, column=3, value=f"HTT =  {htk} m").font = f_red
-            ws3.cell(row=18, column=6, value=f"QTT =  {qtk} m3/s").font = f_red
-            
-            r_next = write_df(ws3, self.tree_lobe_1, 20, "1, Xói cục bộ do thân trụ gây ra")
-            r_next = write_df(ws3, self.tree_lobe_2, r_next + 2, "2, Xói cục bộ do bệ trụ")
-            write_df(ws3, self.tree_lobe_3, r_next + 2, "3, Kết quả phân tích tổng hợp tại trụ")
-
-            # -----------------------------------------------------------------
-            # SHEET 3: Xoi cuc tru (TRỤ ĐƠN)
-            # -----------------------------------------------------------------
-            ws2 = wb.create_sheet('Xoi cuc tru')
-            ws2['A1'] = "TÍNH XÓI CỤC BỘ TRỤ CẦU"
-            ws2['A2'] = "(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)"
-            ws2['A1'].font, ws2['A2'].font = f_title, f_sub
-            
-            ws2['A4'] = "Xói cục bộ trụ cầu được dự báo theo công thức sau:"
-            ws2['A4'].font = f_bold
-            ws2['A5'] = "yspier = 2.0 K1 K2 K3 Kw a^0.65 y1^0.35 Fr1^0.43"
-            ws2['A5'].font = f_bold
-
-            ws2['A7'] = "Trong đó:"
-            ws2['A7'].font = f_bold
-            txt_td = [
-                (8, "yspier = chiều sâu hố xói cục bộ, m"),
-                (9, "y1 = chiều sâu dòng chảy thượng lưu trực tiếp với trụ, m."),
-                (10, "K1, K2, K3 = hệ số hiệu chỉnh cho hình dạng mũi, góc chéo θ, đáy sông."),
-                (11, "Kw = hệ số hiệu chỉnh xét tới chiều sâu và bề rộng trụ"),
-                (12, "a = bề rộng trụ, m"),
-                (13, "Fr1 = hệ số Froude ở ngay thượng lưu trụ: Fr1 = V1 / (g y1)^0.5"),
-                (14, "V1 = tốc độ trung bình dòng chảy ngay trước trụ, m/s"),
-                (15, "g = gia tốc trọng trường (9.81 m/s2)")
-            ]
-            for r_idx, val in txt_td:
-                ws2.cell(row=r_idx, column=1, value=val).font = f_norm
-                
-            ws2.cell(row=17, column=4, value="TÍNH XÓI CỤC BỘ THEO HEC N0.18, 2012").font = f_bold
-            ws2.cell(row=18, column=6, value=f"HTT =  {htk} m").font = f_red
-            write_df(ws2, self.tree_single_pier, 20)
-
-            # -----------------------------------------------------------------
-            # SHEET 4: Xói chung (XÓI THU HẸP)
-            # -----------------------------------------------------------------
-            ws1 = wb.create_sheet('Xói chung')
-            ws1['A1'] = "TÍNH XÓI THU HẸP TRUNG BÌNH DƯỚI CẦU"
-            ws1['A2'] = "(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)"
-            ws1['A1'].font, ws1['A2'].font = f_title, f_sub
-            ws1['A3'] = f"HTT = {htk} m"
-            ws1['A3'].font = f_bold
-            
-            r_end = write_df(ws1, self.tree_xoi_chung, 5)
-            r = r_end + 1
-            ws1.cell(row=r, column=1, value="Trong đó:").font = f_bold
-
-            texts_xc_table = [
-                (r+1, 1, " - Δyxch- chiều sâu trung bình của xói chung, m: Δyxch = y2 - yo."),
-                (r+2, 1, " - y2- chiều sâu trung bình sau xói chung ở mặt cắt bị thu hẹp, m:"),
-                (r+3, 2, "   y2 = y1[Q2/Q1]^6/7 * [W1/W2]^k1        (khi Vc < V, xói nước đục)"),
-                (r+4, 2, "   y2 = [0.025 * Q2^2 / (Dm^2/3 * W2^2)]^3/7  (khi Vc > V, xói nước trong)"),
-                (r+5, 1, " - y1- chiều sâu trung bình của dòng chảy ở thượng lưu, m;"),
-                (r+6, 1, " - yo- chiều sâu hiện tại ở mặt cắt bị thu hẹp trước xói chung."),
-                (r+7, 1, " - Q1- lưu lượng ở khu vực dòng chảy thượng lưu có vận chuyển bùn cát, m3/s;"),
-                (r+8, 1, " - Q2- lưu lượng ở khu vực dòng chảy bị thu hẹp, m3/s."),
-                (r+9, 1, " - W1- bề rộng đáy ở khu vực dòng chảy thượng lưu, m;"),
-                (r+10, 1, " - W2- bề rộng đáy ở khu vực dòng chảy bị thu hẹp, trừ đi bề rộng trụ, m;"),
-                
-                (r+5, 9, " - k1- số mũ xét đến dạng vận chuyển bùn cát, k1 = f(V* / ω)."),
-                (r+6, 9, " - D50- đường kính trung bình của hạt bùn cát đáy, mà hạt < 50% là nhỏ hơn, mm hoặc m;"),
-                (r+7, 9, " - Vc- Tốc độ tới hạn của hạt bùn cát, Vc = f(y, D50), m/s."),
-                (r+8, 9, " - V- Tốc độ trung bình của dòng chảy, m/s."),
-                (r+9, 9, " - Dm- Đường kính của hạt bùn cát nhỏ nhất không bị cuốn đi, Dm = 1.25D50, mm;"),
-                (r+10, 9, " - V* = (g y1 S1)^1/2 - tốc độ khởi động của hạt bùn cát, m/s;"),
-                (r+11, 9, " - g- gia tốc trọng trường, m/s2;"),
-                (r+12, 9, " - S1- độ dốc đường năng lượng ở đoạn sông;"),
-                (r+13, 9, " - ω- tốc độ lắng chìm của hạt bùn cát có đường kính D50, m/s.")
-            ]
-            for row_i, col_i, txt in texts_xc_table:
-                c = ws1.cell(row=row_i, column=col_i, value=txt)
-                c.font, c.alignment = f_norm, al_left
-
-            # -----------------------------------------------------------------
-            # SHEET 5: Tong hop (BẢNG TỔNG HỢP)
-            # -----------------------------------------------------------------
-            ws5 = wb.create_sheet('Tong hop')
-            ws5['B1'] = "TỔNG HỢP XÓI DƯỚI CẦU"
-            ws5['B1'].font = f_title
-            
-            cols_th = [self.tree_summary.heading(c, 'text') for c in self.tree_summary['columns']]
-            data_th = [self.tree_summary.item(item, 'values') for item in self.tree_summary.get_children()]
-            df_th = pd.DataFrame(data_th, columns=cols_th)
-            try:
-                df_exp = pd.DataFrame({
-                    'Tên trụ': df_th['Mố/Trụ'], 'Cao độ tự nhiên, m': df_th['CĐTN (m)'],
-                    'Độ sâu xói thu hẹp (m)': df_th['Xói co hẹp y_sc (m)'],
-                    'Chiều sâu xói cục bộ tại trụ (m)': df_th['Xói cục bộ ys (m)'],
-                    'Tổng chiều sâu xói (m)': df_th['Tổng xói Y_total (m)'],
-                    'Cao độ sau xói, m': df_th['Cao độ đáy sau xói (m)']
-                })
-            except: df_exp = df_th
-            
-            r = 3
-            for c_idx, c_name in enumerate(df_exp.columns, 1):
-                c = ws5.cell(row=r, column=c_idx, value=c_name)
-                c.font, c.alignment, c.border, c.fill = f_bold, al_center, bd_thin, fill_head
-            r += 1
-            for _, row_data in df_exp.iterrows():
-                for c_idx, val in enumerate(row_data, 1):
-                    c = ws5.cell(row=r, column=c_idx, value=val)
-                    c.font, c.alignment, c.border = f_norm, al_center, bd_thin
-                    try: c.value = float(val)
-                    except: pass
-                r += 1
-
-            # Tự động căn lề cột gọn gàng
-            for sheet_name in wb.sheetnames:
-                for col in wb[sheet_name].columns:
-                    max_len, col_letter = 0, col[0].column_letter
-                    for cell in col:
-                        if cell.row > 4 and cell.alignment and cell.alignment.horizontal == 'center':
-                            if cell.value: max_len = max(max_len, len(str(cell.value)))
-                    if max_len > 0:
-                        wb[sheet_name].column_dimensions[col_letter].width = min(max_len + 3, 20)
-
-            wb.save(file_path)
-            messagebox.showinfo("Thành công", f"Đã xuất file Excel chuẩn đẹp, công thức không bị đè chữ!\n\n{file_path}")
-            
-        except Exception as e:
-            messagebox.showerror("Lỗi", f"Xuất Excel thất bại:\n{e}")
-        finally:
-            for f in temp_img_files:
-                try: os.remove(f)
-                except: pass
-
-    # =========================================================================
-    # 2. XUẤT BÁO CÁO WORD ĐẦY ĐỦ 100% CÔNG THỨC & THUYẾT MINH "TRONG ĐÓ"
-    # =========================================================================
     def action_export_word(self):
         if not self.scour_results:
-            messagebox.showwarning("Cảnh báo", "Vui lòng chạy tính toán trước khi xuất báo cáo!")
+            messagebox.showwarning('Cảnh báo', 'Vui lòng chạy tính toán trước khi xuất báo cáo!')
             return
-            
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".docx", filetypes=[("Word Document", "*.docx")],
-            title="Lưu Báo Cáo Kết Quả Tính Xói Cầu (Word)"
-        )
-        if not file_path: return
-
-        temp_img_files = []
+        path = filedialog.asksaveasfilename(defaultextension='.docx',
+                    filetypes=[('Word Document', '*.docx')], title='Lưu báo cáo tính xói cầu')
+        if not path:
+            return
         try:
-            import os
-            from docx import Document
-            from docx.shared import Pt, Cm, Inches
-            from docx.enum.text import WD_ALIGN_PARAGRAPH
-            from docx.enum.section import WD_ORIENT
-
-            doc = Document()
-            section = doc.sections[-1]
-            section.orientation = WD_ORIENT.LANDSCAPE
-            section.page_width, section.page_height = section.page_height, section.page_width
-            section.left_margin = section.right_margin = Cm(1.2)
-            section.top_margin = section.bottom_margin = Cm(1.5)
-
-            def add_heading(text, level=1, align="CENTER"):
-                p = doc.add_paragraph()
-                r = p.add_run(text)
-                r.bold, r.font.name, r.font.size = True, 'Times New Roman', Pt(12 if level == 1 else 10.5)
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if align == "CENTER" else WD_ALIGN_PARAGRAPH.LEFT
-                p.paragraph_format.space_after = Pt(2)
-
-            def add_lines(lines):
-                for line in lines:
-                    p = doc.add_paragraph()
-                    p.paragraph_format.space_after = Pt(1.5)
-                    r = p.add_run(line)
-                    r.font.name, r.font.size = 'Times New Roman', Pt(9.5)
-                    if "Trong đó:" in line or line.startswith("1,") or line.startswith("2,") or line.startswith("3,"):
-                        r.bold = True
-
-            def add_eq_word(latex_str, width_in=None, fontsize=10.5):
-                img_path, w_in, _ = self._create_equation_img(latex_str, fontsize=fontsize)
-                if img_path:
-                    temp_img_files.append(img_path)
-                    p = doc.add_paragraph()
-                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    p.paragraph_format.space_before = Pt(3)
-                    p.paragraph_format.space_after = Pt(3)
-                    target_w = width_in if width_in else min(w_in, 7.5)
-                    doc.add_picture(img_path, width=Inches(target_w))
-
-            def add_two_column_definitions(left_list, right_list):
-                """Tạo bảng 2 cột không viền giúp thuyết minh 'Trong đó' trải đều chuẩn Word"""
-                max_len = max(len(left_list), len(right_list))
-                tbl = doc.add_table(rows=max_len, cols=2)
-                for i in range(max_len):
-                    cell_l = tbl.cell(i, 0)
-                    cell_r = tbl.cell(i, 1)
-                    if i < len(left_list):
-                        p = cell_l.paragraphs[0]
-                        p.paragraph_format.space_after = Pt(1)
-                        r = p.add_run(left_list[i])
-                        r.font.name, r.font.size = 'Times New Roman', Pt(9.5)
-                    if i < len(right_list):
-                        p = cell_r.paragraphs[0]
-                        p.paragraph_format.space_after = Pt(1)
-                        r = p.add_run(right_list[i])
-                        r.font.name, r.font.size = 'Times New Roman', Pt(9.5)
-                doc.add_paragraph().paragraph_format.space_after = Pt(2)
-
-            def add_table_from_tree(tree):
-                cols = [tree.heading(c, 'text') for c in tree['columns']]
-                data = [tree.item(item, 'values') for item in tree.get_children()]
-                table = doc.add_table(rows=1, cols=len(cols))
-                table.style = 'Table Grid'
-                for i, col_name in enumerate(cols):
-                    table.rows[0].cells[i].text = col_name
-                    for para in table.rows[0].cells[i].paragraphs:
-                        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        for run in para.runs:
-                            run.font.name, run.font.size, run.bold = 'Times New Roman', Pt(8), True
-                for row_data in data:
-                    row_cells = table.add_row().cells
-                    for i, val in enumerate(row_data):
-                        row_cells[i].text = str(val)
-                        for para in row_cells[i].paragraphs:
-                            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                            for run in para.runs:
-                                run.font.name, run.font.size = 'Times New Roman', Pt(8)
-                doc.add_paragraph().paragraph_format.space_after = Pt(2)
-
-            htk, qtk = self.project.get('htk', ''), self.project.get('qtk', '')
-            info_header = f"Htt = {htk} (m)   |   Qtk = {qtk} (m3/s)"
-
-            # -----------------------------------------------------------------
-            # 1. DIỆN TÍCH CHOÁN DÒNG & NƯỚC DỀNH
-            # -----------------------------------------------------------------
-            add_heading("TÍNH DIỆN TÍCH TRỤ VÀ CHIỀU RỘNG BÌNH QUÂN TRỤ")
-            add_heading(info_header, level=2)
-            add_table_from_tree(self.tree_vcau)
-            add_lines([line for line in self.txt_vcau_summary.get("1.0", "end-1c").split('\n') if line.strip()])
-
-            add_heading("TÍNH TOÁN NƯỚC DỀNH VÀ KHOẢNG CÁCH DỀNH LỚN NHẤT PHÍA THƯỢNG LƯU CẦU")
-            add_heading(info_header, level=2)
-            add_table_from_tree(self.tree_denh)
-            add_lines(["Trong đó:"])
-            add_eq_word(r"$\Delta h_{dmax} = K \frac{V_{cầu}^2 - V_{cầu\_o}^2}{2g} \qquad ; \qquad K = 1 + \left(\frac{V_o}{V_{cầu\_o}}\right)^2 \frac{a}{\sqrt{Fr / i_o}} \quad ; \quad Fr = \frac{V_o^2}{g L_{ngập}}$", width_in=6.5)
-            denh_explanations = [
-                "  - Δhdmax: trị số nước dềnh lớn nhất phía thượng lưu cầu",
-                "  - K: Hệ số xác định theo công thức trên",
-                "  - Fr/io: thành phần không thứ nguyên của dòng chảy khi chưa bị cầu thu hẹp",
-                "  - io: độ dốc dọc của đường mặt nước khi dòng chảy chưa bị cầu thu hẹp",
-                "  - Vcầu: lưu tốc bình quân dưới cầu ứng với lưu lượng thiết kế, m/s",
-                "  - Vcầu o: lưu tốc bình quân ở phần mặt cắt thực dưới cầu khi chưa thu hẹp, m/s",
-                "  - Vo: lưu tốc bình quân của dòng chảy trên toàn mặt cắt thực khi chưa có cầu, m/s",
-                "  - g: gia tốc trọng trường (9.81 m/s2)",
-                "  - Lngập: chiều rộng ngập tính toán, m",
-                "  - a: hệ số phụ thuộc vào Fr/io, QTK/Qcầu o"
-            ]
-            add_lines(denh_explanations)
-
-            # -----------------------------------------------------------------
-            # 2. PHÂN PHỐI LƯU LƯỢNG (PPLL)
-            # -----------------------------------------------------------------
-            doc.add_page_break()
-            add_heading("PHÂN PHỐI TỐC ĐỘ DÒNG CHẢY LŨ THIẾT KẾ QUA MẶT CẮT TIM CẦU")
-            add_heading(info_header, level=2)
-            add_table_from_tree(self.tree_ppll)
-
-            # -----------------------------------------------------------------
-            # 3. XÓI THU HẸP (XÓI CHUNG)
-            # -----------------------------------------------------------------
-            doc.add_page_break()
-            add_heading("TÍNH XÓI THU HẸP TRUNG BÌNH DƯỚI CẦU")
-            add_heading("(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)", level=2)
-            add_table_from_tree(self.tree_xoi_chung)
-            
-            add_lines(["Trong đó:"])
-            add_eq_word(r"$\Delta y_{xch} = y_2 - y_o \qquad ; \qquad y_2 = y_1 \left[\frac{Q_2}{Q_1}\right]^{6/7} \left[\frac{W_1}{W_2}\right]^{k_1} \qquad ; \qquad y_2 = \left[\frac{0.025 \cdot Q_2^2}{D_m^{2/3} \cdot W_2^2}\right]^{3/7}$", width_in=7.0)
-            
-            xc_full_texts = [
-                " - Δyxch - chiều sâu trung bình của xói chung, m: Δyxch = y2 - yo.",
-                " - y2 - chiều sâu trung bình sau xói chung ở mặt cắt bị thu hẹp, m (khi Vc < V: xói nước đục; khi Vc > V: xói nước trong).",
-                " - y1 - chiều sâu trung bình của dòng chảy ở thượng lưu, m;",
-                " - yo - chiều sâu hiện tại ở mặt cắt bị thu hẹp trước xói chung.",
-                " - Q1 - lưu lượng ở khu vực dòng chảy thượng lưu có vận chuyển bùn cát, m3/s;",
-                " - Q2 - lưu lượng ở khu vực dòng chảy bị thu hẹp, m3/s.",
-                " - W1 - bề rộng đáy ở khu vực dòng chảy thượng lưu, m;",
-                " - W2 - bề rộng đáy ở khu vực dòng chảy bị thu hẹp, trừ đi bề rộng trụ, m;",
-                " - k1 - số mũ xét đến dạng vận chuyển bùn cát, k1 = f(V* / ω).",
-                " - D50 - đường kính trung bình của hạt bùn cát đáy, mà đường kính hạt dưới 50% là nhỏ hơn, mm hoặc m;",
-                " - Vc - Tốc độ tới hạn của hạt bùn cát, Vc = f(y, D50), m/s.",
-                " - V - Tốc độ trung bình của dòng chảy, m/s.",
-                " - Dm - Đường kính của hạt bùn cát nhỏ nhất không bị dòng nước cuốn đi, Dm = 1.25 D50, m hoặc mm;",
-                " - V* = (g y1 S1)^1/2 - tốc độ khởi động của hạt bùn cát ở đoạn thượng lưu, m/s;",
-                " - g - gia tốc trọng trường, m/s2;",
-                " - S1 - độ dốc đường năng lượng ở đoạn sông;",
-                " - ω - tốc độ lắng chìm của hạt bùn cát có đường kính D50, m/s."
-            ]
-            add_lines(xc_full_texts)
-
-            # -----------------------------------------------------------------
-            # 4. XÓI CỤC BỘ TRỤ LỘ BỆ & CỌC
-            # -----------------------------------------------------------------
-            doc.add_page_break()
-            add_heading("TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ, NHÓM CỌC LỘ TRONG DÒNG CHẢY)")
-            add_heading("(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)", level=2)
-            
-            add_eq_word(r"$y_s = y_{spier} + y_{spc(footing)} + y_{spg} \qquad y_{spier} = K_{hpier} [2.0\, K_1 K_2 K_3 a_{pier}^{0.65} y_1^{0.35} Fr_1^{0.43}]$", width_in=7.0)
-            add_eq_word(r"$y_{spc} = 2.0\, K_1 K_2 K_3 K_w a_{pc*}^{0.65} y_2^{0.35} Fr_2^{0.43} \qquad y_{spg} = K_{hpg} \left[2.0\, K_1 K_2 K_3 a_{pg}^{*0.65} y_3^{0.35} \left(\frac{V_3}{\sqrt{g y_3}}\right)^{0.43}\right]$", width_in=7.2)
-            
-            add_lines(["Trong đó:"])
-            left_lc_word = [
-                "ys: Tổng chiều sâu xói, m",
-                "ys.pier: Thành phần xói do thân trụ (m)",
-                "ys.pc: Thành phần xói do bệ trụ (m)",
-                "ys.pg: Thành phần xói do nhóm cọc (m)",
-                "y1 = chiều sâu dòng chảy gần đúng trước khi tính xói, m",
-                "K1 = hệ số hiệu chỉnh cho hình dạng mũi trụ.",
-                "K2 = hệ số hiệu chỉnh cho góc chéo θ giữa trục dọc trụ và dòng chảy.",
-                "K3 = hệ số hiệu chỉnh cho tình trạng đáy sông.",
-                "apier = bề rộng trụ, m",
-                "g = gia tốc trọng trường (9,81 m/s2)",
-                "y2 = y1 + yspier / 2 = chiều sâu dòng chảy hiệu chỉnh tính cho bệ trụ, m",
-                "y3 = y1 + yspier / 2 + yspc / 2 = chiều sâu tính cho nhóm cọc, m",
-                "T = chiều cao bệ trụ, m",
-                "ho = Chiều cao của đáy bệ trụ so với đáy sông trước khi có xói, m",
-                "h1 = ho + T = Chiều cao đỉnh bệ so với đáy sông trước khi xói, m",
-                "h2 = ho + yspier / 2 = Chiều cao đáy bệ so với đáy sông sau khi xói thân, m",
-                "h3 = ho + yspier / 2 + yspc / 2 = Chiều cao nhóm cọc sau khi xói bệ, m",
-                "Khpier = f(h1/apier; f/apier) = Hệ số hiệu chỉnh thành phần xói do trụ"
-            ]
-            right_lc_word = [
-                "V1: Tốc độ dòng chảy đến trụ trước khi tính xói (m/s)",
-                "V2 = V1(y1/y2): Tốc độ dòng chảy hiệu chỉnh tính cho bệ trụ (m/s)",
-                "V3 = V1(y1/y3): Tốc độ dòng chảy hiệu chỉnh tính cho nhóm cọc (m/s)",
-                "Kw = hệ số hiệu chỉnh xét tới chiều sâu và bề rộng trụ (bệ trụ)",
-                "Fr1 = V1 / (gy1)^0.5   ;   Fr2 = V2 / (gy2)^0.5",
-                "f = khoảng cách từ mũi bệ (cọc) đến thân trụ, m",
-                "apc = bề rộng bệ trụ, m ; ap = bề rộng cọc, m",
-                "apc* = f(h2/y2, T/y2, apc) = chiều rộng trụ tương đương tính cho bệ, m",
-                "m = số hàng cọc theo chiều dòng chảy",
-                "n = số cột cọc theo hướng tim cầu",
-                "S: khoảng cách giữa các cột cọc",
-                "Khpg: Hệ số hiệu chỉnh chiều sâu xói do nhóm cọc gây ra"
-            ]
-            add_two_column_definitions(left_lc_word, right_lc_word)
-            
-            add_lines(["Công thức xác định hệ số Khpg và Khpier:"])
-            add_eq_word(r"$K_{hpg} = \left[ 3.08 \frac{h_3}{y_3} - 5.23 \left(\frac{h_3}{y_3}\right)^2 + 5.25 \left(\frac{h_3}{y_3}\right)^3 - 2.10 \left(\frac{h_3}{y_3}\right)^4 \right]^{1 / 0.65}$", width_in=4.8)
-            add_eq_word(r"$K_{hpier} = \left(0.4075 + 0.0669 \frac{f}{a_{pier}}\right) - \left(0.4271 - 0.0778 \frac{f}{a_{pier}}\right)\frac{h_1}{a_{pier}} + \left(0.1615 - 0.0455 \frac{f}{a_{pier}}\right)\left(\frac{h_1}{a_{pier}}\right)^2 - \left(0.0269 - 0.012 \frac{f}{a_{pier}}\right)\left(\frac{h_1}{a_{pier}}\right)^3$", width_in=7.2)
-            
-            add_heading("Bảng Tổng Hợp Kết Quả Xói Trụ Lộ Bệ & Cọc", level=2, align="LEFT")
-            add_table_from_tree(self.tree_lc_4)
-
-            # -----------------------------------------------------------------
-            # 5. XÓI CỤC BỘ TRỤ LỘ BỆ
-            # -----------------------------------------------------------------
-            doc.add_page_break()
-            add_heading("TÍNH XÓI CỤC BỘ TRỤ CẦU (TRƯỜNG HỢP CÓ BỆ TRỤ LỘ TRONG DÒNG CHẢY)")
-            add_heading("(Theo Hướng dẫn thuỷ lực công trình HEC No.18, 2012)", level=2)
-            
-            add_eq_word(r"$y_s = y_{spier} + y_{sfooting} \qquad y_{spier} = K_{hpier} [2.0\, K_1 K_2 K_3 K_w a_{pier}^{0.65} y_1^{0.35} Fr_1^{0.43}] \qquad y_{sfooting} = 2.0\, K_1 K_2 K_3 K_w a_f^{0.65} y_f^{0.35} Fr_f^{0.43}$", width_in=7.2)
-            
-            add_lines(["Trong đó:"])
-            left_lb_word = [
-                "yspier = chiều sâu hố xói cục bộ do thân trụ gây ra, m",
-                "y1 = chiều sâu dòng chảy gần đúng tại thời điểm bắt đầu tính toán, m",
-                "K1 = hệ số hiệu chỉnh cho hình dạng mũi trụ.",
-                "K2 = hệ số hiệu chỉnh cho góc chéo θ giữa trục dọc trụ và dòng chảy.",
-                "K3 = hệ số hiệu chỉnh cho tình trạng đáy sông.",
-                "apier = bề rộng trụ, m",
-                "V1 = tốc độ trung bình dòng chảy gần đúng, m/s",
-                "g = gia tốc trọng trường (9,81 m/s2)",
-                "Khpier = f(h1/apier; f/apier)",
-                "y2 = chiều sâu hiệu chỉnh của dòng chảy thượng lưu, y2 = y1 + yspier / 2, m",
-                "T = chiều cao bệ trụ, m",
-                "ho = chiều cao từ đáy bệ đến đáy sông ở điều kiện ban đầu, m",
-                "h1 = ho + T, (m)"
-            ]
-            right_lb_word = [
-                "yf = khoảng cách từ đáy đến đỉnh bệ, m (yf = h1 + yspier / 2)",
-                "V2 = tốc độ trung bình hiệu chỉnh ở thủy trực: V2 = V1(y1/y2), m/s",
-                "Vf = tốc độ trung bình ở khu vực dòng chảy dưới đỉnh bệ trụ, m/s",
-                "Ks = độ nhám vật liệu đáy (bằng D84 của vật liệu đáy), m",
-                "Kw = hệ số hiệu chỉnh xét tới chiều sâu và bề rộng trụ (bệ trụ)",
-                "Fr1 = V1 / (gy1)^0.5   ;   Frf = Vf / (gyf)^0.5",
-                "f = khoảng cách từ mũi bệ (cọc) đến thân trụ, m",
-                "h2 = ho + yspier / 2 = chiều cao mũ cọc sau xói do thân (m)",
-                "af: bề rộng bệ trụ, m"
-            ]
-            add_two_column_definitions(left_lb_word, right_lb_word)
-            add_eq_word(r"$\frac{V_f}{V_2} = \frac{\ln\left(10.93 \frac{y_f}{K_s} + 1\right)}{\ln\left(10.93 \frac{y_2}{K_s} + 1\right)}$", width_in=2.6)
-            
-            add_heading("1, Xói cục bộ do thân trụ gây ra", level=2, align="LEFT")
-            add_table_from_tree(self.tree_lobe_1)
-            add_heading("2, Xói cục bộ do bệ trụ", level=2, align="LEFT")
-            add_table_from_tree(self.tree_lobe_2)
-            add_heading("3, Kết quả phân tích xói cục bộ tại trụ", level=2, align="LEFT")
-            add_table_from_tree(self.tree_lobe_3)
-
-            # -----------------------------------------------------------------
-            # 6. TRỤ ĐƠN ĐẶC & TỔNG HỢP
-            # -----------------------------------------------------------------
-            doc.add_page_break()
-            add_heading("TÍNH XÓI CỤC BỘ TRỤ CẦU (TRỤ ĐƠN ĐẶC)")
-            add_eq_word(r"$y_{spier} = 2.0\, K_1 K_2 K_3 K_w a^{0.65} y_1^{0.35} Fr_1^{0.43}$", width_in=3.6)
-            add_table_from_tree(self.tree_single_pier)
-
-            doc.add_page_break()
-            add_heading("TỔNG HỢP XÓI DƯỚI CẦU")
-            add_table_from_tree(self.tree_summary)
-
-            doc.save(file_path)
-            messagebox.showinfo("Thành công", f"Đã xuất báo cáo Word đầy đủ công thức và thuyết minh 'Trong đó'!\n\n{file_path}")
-            
-        except Exception as e:
-            messagebox.showerror("Lỗi", f"Xuất Word thất bại:\n{e}")
-        finally:
-            for f in temp_img_files:
-                try: os.remove(f)
-                except: pass
+            self.export_word_report(path)
+            messagebox.showinfo('Thành công', f'Đã xuất báo cáo Word theo mẫu:\n{path}')
+        except Exception as exc:
+            messagebox.showerror('Lỗi', f'Xuất Word thất bại:\n{exc}')
 
 # =============================================================================
 # KHỞI CHẠY CHƯƠNG TRÌNH
