@@ -19,6 +19,8 @@ from matplotlib.backends.backend_tkagg import (
     NavigationToolbar2Tk,
 )
 from matplotlib.figure import Figure
+from matplotlib import dates as mdates
+from matplotlib.ticker import AutoLocator, ScalarFormatter
 import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution
@@ -250,7 +252,11 @@ def route_cascade(storage, inflow, dt, k):
     return (max(a,0.),max(b,0.)),max(out,0.)
 
 
-def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1.):
+class CalibrationStopped(Exception):
+    pass
+
+
+def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1., cancel_event=None):
     """NAM khái niệm không tuyết/tưới; CK_12 tuyến tính cố định.
 
     Không tuyên bố tương đương bộ giải MIKE NAM. P/PET là mm mỗi bước;
@@ -280,6 +286,7 @@ def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hou
     n=len(rain);components=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n)
     steps=int(np.ceil(dt/sub));h=dt/steps
     for t in range(n):
+        if cancel_event is not None and cancel_event.is_set():raise CalibrationStopped()
         before=U+L+sum(surf)+sum(inter)+base
         for _ in range(steps):
             U+=rain[t]/steps
@@ -367,7 +374,7 @@ class NAMDesktopApp:
 
         self._setup_style()
         self._build_ui()
-        self._busy=False;self._worker_queue=queue.Queue();self._result_signature=None
+        self._busy=False;self._worker_queue=queue.Queue();self._result_signature=None;self._stop_event=threading.Event()
         self._update_parameter_display()
         self.root.after(300,self._watch)
 
@@ -488,6 +495,8 @@ class NAMDesktopApp:
             command=self._start_calibration_thread,
         )
         self.btn_calibrate.pack(fill=tk.X, pady=6)
+        self.btn_stop=ttk.Button(left_frame,text="DỪNG TÍNH TOÁN",command=self._stop_calibration,state=tk.DISABLED)
+        self.btn_stop.pack(fill=tk.X,pady=2)
 
         self.progress_bar = ttk.Progressbar(left_frame, mode="indeterminate")
         self.progress_bar.pack(fill=tk.X, pady=2)
@@ -830,10 +839,16 @@ class NAMDesktopApp:
                 raise ValueError('Sau khởi động, phần hiệu chỉnh cần ≥3 Q thực đo và phương sai khác 0.')
             snapshot=(self._signature(),df.copy(deep=True),area,dt,warm,end,initial,maxiter,self.best_params.copy(),runs)
         except Exception as exc:messagebox.showerror('Hiệu chỉnh',str(exc));return
+        self._stop_event.clear();self.btn_stop.config(state=tk.NORMAL)
         self._busy=True;self.btn_calibrate.config(state=tk.DISABLED);self.progress_bar.start(10)
         self.lbl_calib_status.config(text='Đang hiệu chỉnh; dữ liệu đầu vào đã được chụp riêng.',foreground='#D9534F')
         threading.Thread(target=self._run_optimization_worker,args=(snapshot,),daemon=True).start()
         self.root.after(100,self._poll_worker)
+
+    def _stop_calibration(self):
+        if self._busy:
+            self._stop_event.set();self.btn_stop.config(state=tk.DISABLED)
+            self.lbl_calib_status.config(text="Đang dừng; giữ bộ thông số tốt nhất đã tìm được.")
 
     def _run_optimization_worker(self,snapshot):
         try:
@@ -841,8 +856,9 @@ class NAMDesktopApp:
             current=snapshot[8] if len(snapshot)>8 else dict(zip(PARAM_KEYS,[15,100,.5,15,.2,.2,.3,50,1000]))
             runs=snapshot[9] if len(snapshot)>9 else 1
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();obs=df['Q_ThucDo_m3s'].to_numpy()
+            best_params=current.copy();best_nse=np.nan
             def score(params):
-                sim=run_nam(params,area,rain[:end],pet[:end],dt,initial)['Q_sim']
+                sim=run_nam(params,area,rain[:end],pet[:end],dt,initial,cancel_event=self._stop_event)['Q_sim']
                 nse=compute_nse(obs[warm:end],sim[warm:end])
                 if not np.isfinite(nse):raise ValueError('NSE không xác định; kiểm tra chuỗi thực đo và giai đoạn đánh giá.')
                 return nse
@@ -868,6 +884,8 @@ class NAMDesktopApp:
             # Không bao giờ thay bộ hiện tại bằng bộ có NSE thấp hơn.
             self._worker_queue.put(('done',signature,best_params,float(best_nse),converged==runs,
                 f'Đã chạy {runs} lần; {converged} lần đạt điều kiện hội tụ, {runs-converged} lần hết giới hạn thế hệ.'))
+        except CalibrationStopped:
+            self._worker_queue.put(('done',signature,best_params,float(best_nse),False,'Đã dừng theo yêu cầu; giữ bộ tốt nhất đã đánh giá.'))
         except Exception as exc:self._worker_queue.put(('error',str(exc)))
 
     def _poll_worker(self):
@@ -879,7 +897,7 @@ class NAMDesktopApp:
         except queue.Empty:self.root.after(100,self._poll_worker);return
         if result[0]=='progress':
             self.lbl_calib_status.config(text=result[1]);self.root.after(100,self._poll_worker);return
-        self._busy=False;self.progress_bar.stop();self.btn_calibrate.config(state=tk.NORMAL)
+        self._busy=False;self.progress_bar.stop();self.btn_calibrate.config(state=tk.NORMAL);self.btn_stop.config(state=tk.DISABLED)
         if result[0]=='error':
             self.lbl_calib_status.config(text='Hiệu chỉnh thất bại.')
             messagebox.showerror('Hiệu chỉnh',result[1]);return
@@ -912,16 +930,24 @@ class NAMDesktopApp:
         self.lbl_metric_pbias.config(text=f'PBIAS (đo−mô phỏng): {fmt(metric["pbias"])}%')
         self.lbl_calib_status.config(text=f'Sai số cân bằng lớn nhất: {np.max(np.abs(res["Balance_error_mm"])):.2e} mm; loại {warm} bước khởi động.')
         self.ax_rain.clear();self.ax_flow.clear()
-        time=np.arange(len(rain))*dt
-        self.ax_rain.bar(time,rain,width=dt*.8,color='#1f77b4',label='Mưa tổng mỗi bước (mm)')
+        dated='ThoiGian' in df
+        time=mdates.date2num(pd.to_datetime(df['ThoiGian']).to_numpy()) if dated else np.arange(len(rain))*dt
+        step=dt/24 if dated else dt
+        if dated:
+            self.ax_flow.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3,maxticks=6))
+            self.ax_flow.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m/%Y\n%H:%M'))
+        else:
+            self.ax_flow.xaxis.set_major_locator(AutoLocator());self.ax_flow.xaxis.set_major_formatter(ScalarFormatter())
+        self.ax_rain.tick_params(axis='x',labelbottom=False)
+        self.ax_rain.bar(time,rain,width=step*.8,color='#1f77b4',label='Mưa tổng mỗi bước (mm)')
         self.ax_rain.set_ylabel('Mưa (mm)');self.ax_rain.set_ylim(max(10.,rain.max()*1.3),0);self.ax_rain.legend(fontsize=8)
         self.ax_rain.set_title('MƯA – DÒNG CHẢY NAM KHÁI NIỆM (KHÔNG TUYẾT; ĐIỀU TIẾT TUYẾN TÍNH)',fontsize=10)
         self.ax_flow.plot(time,q_obs,'k--',label='Lưu lượng thực đo')
         self.ax_flow.plot(time,q_sim,'r-',label='Lưu lượng mô phỏng trung bình bước')
         self.ax_flow.stackplot(time,res['Q_base'],res['Q_inter'],res['Q_surf'],labels=['Dòng ngầm','Dòng sát mặt','Dòng tràn'],alpha=.25)
-        if warm:self.ax_flow.axvspan(0,warm*dt,color='gray',alpha=.2,label='Khởi động (không đánh giá)')
-        if end<len(df):self.ax_flow.axvline(end*dt,color='navy',linestyle=':',label='Bắt đầu kiểm định')
-        self.ax_flow.set(xlabel='Thời gian (giờ)',ylabel='Lưu lượng (m³/s)',xlim=(0,max(dt,time[-1])))
+        if warm:self.ax_flow.axvspan(time[0],time[warm],color='gray',alpha=.2,label='Khởi động (không đánh giá)')
+        if end<len(df):self.ax_flow.axvline(time[end],color='navy',linestyle=':',label='Bắt đầu kiểm định')
+        self.ax_flow.set(xlabel='Ngày/tháng/năm – giờ:phút' if dated else 'Thời gian từ bước đầu (giờ)',ylabel='Lưu lượng (m³/s)',xlim=(time[0]-step*.5,time[-1]+step*.5))
         self.ax_flow.set_ylim(bottom=0);self.ax_flow.grid(alpha=.3);self.ax_flow.legend(fontsize=8)
         self.fig.tight_layout();self.canvas.draw()
 
