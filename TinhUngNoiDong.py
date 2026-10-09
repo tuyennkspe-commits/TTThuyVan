@@ -1,7 +1,7 @@
 """Mưa thiết kế và úng nội đồng — một file độc lập.
 Cài thư viện: python -m pip install numpy scipy matplotlib pandas openpyxl python-docx
 Căn cứ: hồ sơ Hà Nội–Gia Bình Part1, trang in 14–17, 29–30, 37–38.
-Hp là CAO ĐỘ mặt nước (m), Xp là lượng mưa (mm); IDF ngắn cần mưa thời đoạn ngắn.
+Htk/Hp là CAO ĐỘ mặt nước (m), Xp là lượng mưa (mm). Chỉ phục vụ tính úng nội đồng.
 Không có dữ liệu trạm hoặc hệ số khí hậu mặc định; dùng dữ liệu của dự án.
 """
 import csv
@@ -20,7 +20,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 
 GROWTH_HEADER='Phut;P_pct;X_toan_mm;X_coso_mm;Xi_mm;Tang_KB1_pct;Tang_KB2_pct'
 POINT_HEADER='Vi_tri;Hi_m;Nam_dieu_tra;Z_dat_m'
-COLUMN_TITLES={'duration':'Thời đoạn (phút)','p':'Tần suất vượt P (%)','scenario':'Kịch bản','Xp':'Mưa thiết kế Xp (mm)','Xi':'Mưa năm điều tra Xi (mm)','beta':'Hệ số β','deltaH':'Chênh mực nước ΔH (m)','location':'Vị trí','Hi':'Cao độ điều tra Hi (m)','Hp':'Cao độ thiết kế Hp% (m)','days':'Thời đoạn khống chế (ngày)','depth':'Chiều sâu ngập (m)','X_full':'Mưa toàn chuỗi (mm)','X_base':'Mưa cơ sở (mm)','change_percent':'Mức thay đổi (%)','ground':'Cao độ đất (m)','year':'Năm điều tra','full':'Mưa toàn chuỗi (mm)','base':'Mưa cơ sở (mm)','xi':'Mưa năm điều tra (mm)','mid':'Thay đổi KB1 (%)','end':'Thay đổi KB2 (%)'}
+COLUMN_TITLES={'duration':'Thời đoạn (phút)','p':'Tần suất vượt P (%)','scenario':'Kịch bản','Xp':'Mưa thiết kế Xp (mm)','Xi':'Mưa năm điều tra Xi (mm)','beta':'Hệ số β','deltaH':'Chênh mực nước ΔH (m)','location':'Vị trí','Hi':'Cao độ điều tra Hi (m)','Hp':'Mực nước thiết kế Htk (m)','days':'Thời đoạn khống chế (ngày)','depth':'Chiều sâu ngập (m)','X_full':'Mưa toàn chuỗi (mm)','X_base':'Mưa cơ sở (mm)','change_percent':'Mức thay đổi (%)','ground':'Cao độ đất (m)','year':'Năm điều tra','full':'Mưa toàn chuỗi (mm)','base':'Mưa cơ sở (mm)','xi':'Mưa năm điều tra (mm)','mid':'Thay đổi KB1 (%)','end':'Thay đổi KB2 (%)'}
 SCENARIOS=('Hiện trạng','Kịch bản 1','Kịch bản 2','Bao lớn nhất hiện trạng và 2 kịch bản')
 
 def num(value,name='Giá trị'):
@@ -197,14 +197,16 @@ def parse_design(text):
             if b['full']>a['full']+1e-8:raise ValueError('Mưa toàn chuỗi tăng khi P tăng; kiểm tra bảng.')
     return output
 
-def parse_locations(text,reference_year):
+def parse_locations(text,reference_year=None):
     rows=table(text);output=[];seen=set()
     if len(rows[0])!=4:raise ValueError('Vị trí cần 4 cột theo mẫu.')
     for row in rows[1:]:
         label,h,year,ground=row
-        if not label or label in seen:raise ValueError('Tên vị trí trống hoặc trùng.')
-        seen.add(label);year=num(year,'Năm điều tra')
-        if year!=reference_year:raise ValueError(f'{label}: năm Hi={year:g} khác năm Xi={reference_year}; phải ghép mưa và mực nước cùng năm.')
+        year=num(year,'Năm điều tra')
+        if year!=int(year) or not 1800<=year<=2300:raise ValueError('Năm điều tra phải nguyên và hợp lệ.')
+        if not label or (label,year) in seen:raise ValueError('Tên vị trí trống hoặc vị trí/năm bị trùng.')
+        seen.add((label,year))
+        if reference_year is not None and year!=reference_year:raise ValueError(f'{label}: năm Hi={year:g} khác năm Xi={reference_year}; phải ghép mưa và mực nước cùng năm.')
         output.append(dict(location=label,Hi=num(h,'Cao độ điều tra'),year=int(year),ground=None if not ground else num(ground,'Cao độ đất')))
     return output
 
@@ -232,6 +234,41 @@ def calculate_inland(design,locations,b1,b2,c,ratio,scenario,minimum_days=1):
             summary.append(dict(location=place['location'],p=p,Hi=place['Hi'],deltaH=governing['deltaH'],Hp=hp,days=governing['duration']/1440,scenario=governing['scenario'],ground=place['ground'],depth=None if place['ground'] is None else max(hp-place['ground'],0)))
     return details,summary,notes
 
+OBS_HEADER='Nam;Phut;Xi_mm'
+
+def parse_observed(text):
+    if len(text.strip().splitlines())<2:return {}
+    rows=table(text);mapping={}
+    if len(rows[0])!=3:raise ValueError('Mưa điều tra cần 3 cột: Năm, thời đoạn phút, Xi mm.')
+    for row in rows[1:]:
+        year,duration,xi=[num(v,'Mưa năm điều tra') for v in row]
+        if year!=int(year) or not 1800<=year<=2300 or duration<1440 or xi<0:raise ValueError('Năm phải nguyên; thời đoạn ≥1 ngày; Xi không âm.')
+        key=(int(year),duration)
+        if key in mapping:raise ValueError('Trùng năm và thời đoạn trong bảng Xi.')
+        mapping[key]=xi
+    return mapping
+
+def calculate_multi(design,locations,observed,b1,b2,c,ratio,scenario,reference_year=None):
+    details=[];per_year=[];notes=[]
+    for place in locations:
+        matched=[]
+        for row in design:
+            if row['duration']<1440:continue
+            key=(place['year'],row['duration'])
+            xi=observed.get(key)
+            if xi is None and reference_year==place['year']:xi=row['xi']
+            matched.append(dict(row,xi=xi))
+        d,s,n=calculate_inland(matched,[place],b1,b2,c,ratio,scenario)
+        details.extend(dict(row,location=place['location'],year=place['year'],Hi=place['Hi'],Hp=place['Hi']+row['deltaH']) for row in d)
+        if {r['p'] for r in s}!={r['p'] for r in matched}:raise ValueError('Một tần suất đã chọn chưa có thời đoạn đủ dữ liệu cho kịch bản này.')
+        per_year.extend(dict(row,year=place['year']) for row in s);notes.extend(n)
+    if not per_year:raise ValueError('Không có kết quả mực nước điều tra.')
+    summary=[]
+    for key in sorted({(r['location'],r['p']) for r in per_year}):
+        summary.append(max([r for r in per_year if (r['location'],r['p'])==key],key=lambda r:r['Hp']))
+    if len({r['year'] for r in per_year})>1:notes.append('Kết quả khống chế lấy Htk lớn nhất trong các năm điều tra đã nhập; cần đánh giá chất lượng và tính đại diện của từng năm trước khi dùng thiết kế.')
+    return details,per_year,summary,list(dict.fromkeys(notes))
+
 class DataGrid(ttk.Frame):
     """Bảng biên tập: giữ chuỗi gốc, chỉ làm tròn lớp hiển thị."""
     def __init__(self,parent):
@@ -248,7 +285,7 @@ class DataGrid(ttk.Frame):
         self.tree.configure(yscrollcommand=y.set,xscrollcommand=x.set);self.rowconfigure(1,weight=1);self.columnconfigure(0,weight=1)
         self.tree.bind('<Double-1>',self.edit);self.tree.bind('<Control-v>',lambda e:self.paste());self.tree.bind('<Control-c>',lambda e:self.copy())
     def title(self,key):
-        names={'Nam':'Năm','Vi_tri':'Vị trí','Hi_m':'Cao độ điều tra Hi (m)','Nam_dieu_tra':'Năm điều tra','Z_dat_m':'Cao độ đất (m)','Phut':'Thời đoạn (phút)','P_pct':'Tần suất P (%)','X_toan_mm':'Mưa toàn chuỗi (mm)','X_coso_mm':'Mưa cơ sở (mm)','Xi_mm':'Mưa năm điều tra (mm)','Tang_KB1_pct':'Thay đổi KB1 (%)','Tang_KB2_pct':'Thay đổi KB2 (%)','Tang_giua_pct':'Thay đổi KB1 (%)','Tang_cuoi_pct':'Thay đổi KB2 (%)'}
+        names={'Nam':'Năm','Vi_tri':'Vị trí','Hi_m':'Cao độ điều tra Hi (m)','Nam_dieu_tra':'Năm điều tra','Z_dat_m':'Cao độ đất (m)','Phut':'Thời đoạn (phút)','P_pct':'Tần suất P (%)','X_toan_mm':'Mưa toàn chuỗi (mm)','X_coso_mm':'Mưa cơ sở (mm)','Xi_mm':'Mưa năm điều tra Xi (mm)','Tang_KB1_pct':'Thay đổi KB1 (%)','Tang_KB2_pct':'Thay đổi KB2 (%)','Tang_giua_pct':'Thay đổi KB1 (%)','Tang_cuoi_pct':'Thay đổi KB2 (%)'}
         if key in names:return names[key]
         try:
             minutes=float(key);return f'Mưa {minutes/1440:g} ngày (mm)' if minutes>=1440 and minutes%1440==0 else f'Mưa {minutes:g} phút (mm)'
@@ -341,9 +378,9 @@ class InlandApp:
         header=ttk.Frame(root,padding=12);header.pack(fill='x');ttk.Label(header,text='MƯA THIẾT KẾ & ÚNG NỘI ĐỒNG',font=('Arial',16,'bold')).pack(side='left')
         for title,command in [('Mở dự án',self.open_project),('Lưu dự án',self.save_project),('Xuất Excel',self.export_excel),('Xuất Word',self.export_word)]:ttk.Button(header,text=title,command=command).pack(side='right',padx=3)
         meta=ttk.Frame(root,padding=(12,0));meta.pack(fill='x')
-        for name,var,width in [('Dự án',self.project,35),('Trạm',self.station,24),('Năm Xi / Hi',self.year,8)]:ttk.Label(meta,text=name).pack(side='left',padx=4);ttk.Entry(meta,textvariable=var,width=width).pack(side='left')
+        for name,var,width in [('Dự án',self.project,35),('Trạm',self.station,24),('Năm Xi mặc định',self.year,8)]:ttk.Label(meta,text=name).pack(side='left',padx=4);ttk.Entry(meta,textvariable=var,width=width).pack(side='left')
         self.book=ttk.Notebook(root);self.book.pack(fill='both',expand=True,padx=12,pady=8)
-        self.rain_tab=self.tab('1. Số liệu mưa');self.design_tab=self.tab('2. Mưa thiết kế & khí hậu');self.inland_tab=self.tab('3. Úng nội đồng');self.results_tab=self.tab('4. Kết quả');self.plot_tab=self.tab('5. Tần suất & IDF')
+        self.rain_tab=self.tab('1. Chọn P & phân tích mưa');self.design_tab=self.tab('2. Xp & kịch bản khí hậu');self.inland_tab=self.tab('3. Điều tra Hi, Xi & hệ số β');self.results_tab=self.tab('4. ΔH & Htk khống chế');self.plot_tab=self.tab('5. Đường tần suất mưa')
         self.build_rain();self.build_design();self.build_inland();self.build_results();self.build_plot()
         ttk.Label(root,textvariable=self.status,wraplength=1220,foreground='#155e75',padding=10).pack(fill='x')
         self.root.after(300,self.watch)
@@ -404,16 +441,31 @@ class InlandApp:
             self.put(self.design,'\n'.join(';'.join(row) for row in rows));self.status.set(f'Đã cập nhật mức thay đổi cho {count} tần suất ở thời đoạn {duration:g} phút.')
         except Exception as e:messagebox.showerror('Mức thay đổi',str(e))
 
+    def fill_observed(self):
+        try:
+            years,durations,matrix=parse_annual(self.read_text(self.annual));locations=parse_locations(self.read_text(self.locations));rows=[OBS_HEADER]
+            for year in sorted({r['year'] for r in locations}):
+                if year not in years:raise ValueError(f'Chuỗi mưa không có năm {year}; cần nhập Xi từ nguồn phù hợp.')
+                for j,d in enumerate(durations):
+                    if d>=1440:rows.append(f'{year};{d:g};{matrix[years==year,j][0]:.12g}')
+            self.put(self.observed,'\n'.join(rows));self.status.set('Đã ghép mưa Xi theo năm điều tra và thời đoạn; cần kiểm tra trạm đại diện trước khi tính.')
+        except Exception as e:messagebox.showerror('Mưa năm điều tra',str(e))
     def build_inland(self):
-        ttk.Label(self.inland_tab,text='Hp% = Hi + (1 + β) × (Xp% − Xi) / 1000; β = β1 + β2 + C × An/A\nLấy ΔH lớn nhất giữa các thời đoạn ≥1 ngày. Giữ dấu âm của ΔH. Hp là cao độ nước, chưa phải cao độ nền đường.',font=('Arial',11),wraplength=1150).pack(anchor='w',pady=8)
+        ttk.Label(self.inland_tab,text='Htk = Hi + (1 + β) × (Xp% − Xi) / 1000; β = β1 + β2 + C × An/A\nLấy ΔH lớn nhất giữa các thời đoạn ≥1 ngày. Giữ dấu âm của ΔH. Htk là cao độ nước, chưa phải cao độ nền đường.',font=('Arial',11),wraplength=1150).pack(anchor='w',pady=8)
         row=ttk.Frame(self.inland_tab);row.pack(fill='x')
         for title,var in [('β1',self.beta1),('β2',self.beta2),('C',self.c),('An/A (0–1)',self.ratio)]:ttk.Label(row,text=title).pack(side='left',padx=5);ttk.Entry(row,textvariable=var,width=9).pack(side='left')
         ttk.Combobox(row,textvariable=self.scenario,state='readonly',values=SCENARIOS,width=28).pack(side='left',padx=12)
         ttk.Label(self.inland_tab,text='Nhập β1, β2 theo điều kiện mặt phủ/canh tác của dự án; C là hệ số dòng chảy; An/A là tỷ lệ diện tích không ngập. Không dùng mặc định của địa phương khác.',wraplength=1150,foreground='#9a3412').pack(anchor='w',pady=6)
-        ttk.Label(self.inland_tab,text='Các vị trí: Vi_tri;Hi_m;Nam_dieu_tra;Z_dat_m (cao độ đất có thể để trống). Xi ở bước 2 phải khớp năm điều tra Hi.').pack(anchor='w',pady=10)
-        self.locations=self.text(self.inland_tab);self.put(self.locations,POINT_HEADER+'\n')
+        ttk.Label(self.inland_tab,text='Các vị trí: Vi_tri;Hi_m;Nam_dieu_tra;Z_dat_m (cao độ đất có thể để trống). Có thể nhập nhiều năm tại cùng vị trí; Xi phải khớp năm Hi. Bảng Xi riêng được ưu tiên; Xi ở bước 2 chỉ dùng cho năm mặc định.').pack(anchor='w',pady=10)
+        observed_tabs=ttk.Notebook(self.inland_tab);observed_tabs.pack(fill='both',expand=True)
+        place_tab=ttk.Frame(observed_tabs);rain_tab=ttk.Frame(observed_tabs)
+        observed_tabs.add(place_tab,text='Mực nước điều tra từng vị trí / năm');observed_tabs.add(rain_tab,text='Mưa Xi cùng năm, cùng thời đoạn')
+        self.locations=self.text(place_tab);self.put(self.locations,POINT_HEADER+'\n')
+        ttk.Button(rain_tab,text='Lấy Xi từ chuỗi mưa cho các năm điều tra',command=self.fill_observed).pack(anchor='w',pady=4)
+        ttk.Button(rain_tab,text='Nhập bảng Xi',command=lambda:self.import_table(self.observed)).pack(anchor='w')
+        self.observed=self.text(rain_tab);self.put(self.observed,OBS_HEADER+'\n')
         ttk.Button(self.inland_tab,text='Nhập vị trí tuyến',command=lambda:self.import_table(self.locations)).pack(side='left')
-        ttk.Button(self.inland_tab,text='TÍNH Hp% THIẾT KẾ',command=self.calculate).pack(side='right',pady=10)
+        ttk.Button(self.inland_tab,text='TÍNH ΔH → Htk KHỐNG CHẾ',command=self.calculate).pack(side='right',pady=10)
     def tree(self,parent,columns):
         frame=ttk.Frame(parent);frame.pack(fill='both',expand=True)
         widget=ttk.Treeview(frame,columns=list(columns),show='headings');widget.grid(row=0,column=0,sticky='nsew')
@@ -421,18 +473,25 @@ class InlandApp:
         for key,title in columns.items():widget.heading(key,text=title);widget.column(key,width=135,anchor='center')
         y=ttk.Scrollbar(frame,command=widget.yview);y.grid(row=0,column=1,sticky='ns');x=ttk.Scrollbar(frame,orient='horizontal',command=widget.xview);x.grid(row=1,column=0,sticky='ew');widget.configure(yscrollcommand=y.set,xscrollcommand=x.set);return widget
     def build_results(self):
-        self.tree_summary=self.tree(self.results_tab,dict(location='Vị trí',p='P (%)',Hi='Hi (m)',deltaH='ΔH khống chế (m)',Hp='Hp% (m)',days='Thời đoạn (ngày)',scenario='Kịch bản',depth='Chiều sâu ngập (m)'))
+        result_tabs=ttk.Notebook(self.results_tab);result_tabs.pack(fill='both',expand=True)
+        final=ttk.Frame(result_tabs);by_year=ttk.Frame(result_tabs);detail=ttk.Frame(result_tabs)
+        result_tabs.add(final,text='Htk khống chế theo vị trí / P');result_tabs.add(by_year,text='So sánh từng năm điều tra');result_tabs.add(detail,text='ΔH từng thời đoạn')
+        self.tree_summary=self.tree(final,dict(location='Vị trí',p='P (%)',year='Năm khống chế',Hi='Hi (m)',deltaH='ΔH khống chế (m)',Hp='Htk (m)',days='Thời đoạn (ngày)',scenario='Kịch bản',depth='Chiều sâu ngập (m)'))
+        self.tree_years=self.tree(by_year,dict(location='Vị trí',p='P (%)',year='Năm điều tra',Hi='Hi (m)',deltaH='ΔH (m)',Hp='Htk năm (m)',days='Thời đoạn (ngày)',scenario='Kịch bản'))
+        self.tree_details=self.tree(detail,dict(location='Vị trí',year='Năm',p='P (%)',duration='Thời đoạn (phút)',Xp='Xp (mm)',Xi='Xi (mm)',beta='β',deltaH='ΔH (m)',Hp='Htk (m)'))
         ttk.Label(self.results_tab,text='Bảng tính chi tiết, dữ liệu gốc, giả thiết và các cảnh báo được lưu trong báo cáo Excel/Word.').pack(pady=8)
+    def clear_tables(self):
+        for tree in (self.tree_summary,self.tree_years,self.tree_details):tree.delete(*tree.get_children())
     def build_plot(self):
         row=ttk.Frame(self.plot_tab);row.pack(fill='x');self.plot_source=tk.StringVar(value='Hiện trạng');ttk.Combobox(row,textvariable=self.plot_source,values=SCENARIOS[:3],state='readonly',width=20).pack(side='left',padx=5);ttk.Button(row,text='Vẽ từ bảng mưa thiết kế',command=self.plot).pack(side='left');ttk.Button(row,text='Lưu biểu đồ PNG',command=self.save_plot).pack(side='left',padx=5)
         self.figure=Figure(figsize=(11,6),dpi=100);self.canvas=FigureCanvasTkAgg(self.figure,self.plot_tab);self.canvas.get_tk_widget().pack(fill='both',expand=True);NavigationToolbar2Tk(self.canvas,self.plot_tab)
     def read_text(self,widget):return widget.get('1.0','end').strip()
     def signature(self):
         variables=(self.project,self.station,self.p,self.start,self.end,self.year,self.cs,self.method,self.scenario,self.beta1,self.beta2,self.c,self.ratio)
-        return tuple(v.get() for v in variables)+tuple(w.snapshot().strip() for w in (self.annual,self.design,self.locations))
+        return tuple(v.get() for v in variables)+tuple(w.snapshot().strip() for w in (self.annual,self.design,self.locations,self.observed))
     def watch(self):
         if self.result is not None and self.signature()!=self._signature:
-            self.result=None;self.tree_summary.delete(*self.tree_summary.get_children());self.figure.clear();self.canvas.draw();self.status.set('Dữ liệu đã thay đổi: cần tính lại trước khi xuất báo cáo.')
+            self.result=None;self.clear_tables();self.figure.clear();self.canvas.draw();self.status.set('Dữ liệu đã thay đổi: cần tính lại trước khi xuất báo cáo.')
         self.root.after(300,self.watch)
     def import_table(self,widget):
         path=filedialog.askopenfilename(filetypes=[('Bảng số liệu','*.csv *.txt *.xlsx'),('Tất cả','*.*')])
@@ -494,16 +553,22 @@ class InlandApp:
             self.book.select(self.design_tab);self.status.set('Đã phân tích toàn chuỗi. '+('Đã tính thêm thời kỳ cơ sở. ' if baseline is not None else 'Chưa khai báo cơ sở: chưa tính mưa kịch bản khí hậu. ')+('Xi đã lấy theo năm điều tra. ' if year is not None else 'Chưa khai báo năm điều tra: chỉ tính mưa, chưa tính úng. ')+'Chuỗi <30 năm cần thận trọng khi ngoại suy P nhỏ.')
         except Exception as e:messagebox.showerror('Phân tích tần suất',str(e))
     def calculate(self):
-        self.result=None;self.tree_summary.delete(*self.tree_summary.get_children())
+        self.result=None;self.clear_tables()
         try:
-            year=num(self.year.get(),'Năm điều tra')
-            if year!=int(year):raise ValueError('Năm điều tra phải nguyên.')
-            design=parse_design(self.read_text(self.design));locations=parse_locations(self.read_text(self.locations),int(year))
-            details,summary,notes=calculate_inland(design,locations,num(self.beta1.get()),num(self.beta2.get()),num(self.c.get()),num(self.ratio.get()),self.scenario.get())
+            year=num(self.year.get(),'Năm Xi mặc định') if self.year.get().strip() else None
+            if year is not None and year!=int(year):raise ValueError('Năm mặc định phải nguyên.')
+            design=parse_design(self.read_text(self.design));locations=parse_locations(self.read_text(self.locations))
+            probabilities=[num(value,'P thiết kế') for value in self.p.get().split(';') if value.strip()]
+            if not probabilities or any(not 0<p<100 for p in probabilities):raise ValueError('Chọn P thiết kế trong (0;100).')
+            if any(not any(r['p']==p for r in design) for p in probabilities):raise ValueError('Bảng Xp chưa có đủ các tần suất thiết kế đã chọn.')
+            design=[r for r in design if r['p'] in probabilities]
+            details,per_year,summary,notes=calculate_multi(design,locations,parse_observed(self.read_text(self.observed)),num(self.beta1.get()),num(self.beta2.get()),num(self.c.get()),num(self.ratio.get()),self.scenario.get(),year)
             if self._fit_source and self._fit_source!=(self.read_text(self.annual),self.method.get(),self.cs.get(),self.start.get(),self.end.get(),self.read_text(self.design)):notes.append('Bảng mưa hoặc đầu vào phân tích đã được sửa; không gắn thống kê cũ vào kết quả hiện tại.')
-            for row in summary:self.tree_summary.insert('','end',values=[row[k] if isinstance(row[k],str) else '—' if row[k] is None else f'{row[k]:.3f}' for k in self.tree_summary['columns']])
-            self.result=dict(design=design,details=details,summary=summary,notes=notes,project=self.project.get(),station=self.station.get(),scenario=self.scenario.get(),year=int(year),beta=num(self.beta1.get())+num(self.beta2.get())+num(self.c.get())*num(self.ratio.get()),locations=locations,coefficients={'beta1':num(self.beta1.get()),'beta2':num(self.beta2.get()),'C':num(self.c.get()),'An_A':num(self.ratio.get())})
-            self._signature=self.signature();self.book.select(self.results_tab);self.status.set(f'Đã tính {len(summary)} kết quả Hp%. '+(f'Có {len(notes)} ghi chú về dữ liệu thiếu/đã sửa; xem báo cáo xuất. Không tự gán mức tăng cho thời đoạn thiếu.' if notes else 'Đủ dữ liệu cho kịch bản đang dùng.'))
+            for tree,records in [(self.tree_summary,summary),(self.tree_years,per_year),(self.tree_details,details)]:
+                tree.delete(*tree.get_children())
+                for row in records:tree.insert('','end',values=[row[k] if isinstance(row[k],str) else '—' if row[k] is None else f'{row[k]:.3f}' for k in tree['columns']])
+            self.result=dict(design=design,details=details,summary=summary,notes=notes,project=self.project.get(),station=self.station.get(),scenario=self.scenario.get(),year=year,per_year=per_year,beta=num(self.beta1.get())+num(self.beta2.get())+num(self.c.get())*num(self.ratio.get()),locations=locations,coefficients={'beta1':num(self.beta1.get()),'beta2':num(self.beta2.get()),'C':num(self.c.get()),'An_A':num(self.ratio.get())})
+            self._signature=self.signature();self.book.select(self.results_tab);self.status.set(f'Đã tính {len(summary)} kết quả Htk khống chế. '+(f'Có {len(notes)} ghi chú về dữ liệu thiếu/đã sửa; xem báo cáo xuất. Không tự gán mức tăng cho thời đoạn thiếu.' if notes else 'Đủ dữ liệu cho kịch bản đang dùng.'))
         except Exception as e:messagebox.showerror('Không tính được',str(e))
     def current(self):
         if self.result is None or self.signature()!=self._signature:
@@ -516,16 +581,13 @@ class InlandApp:
             if selected!='Hiện trạng':
                 key='mid' if selected=='Kịch bản 1' else 'end'
                 rows=[dict(r,full=r['base']*(1+r[key]/100)) for r in rows if r['base'] is not None and r[key] is not None]
-                if not rows:raise ValueError('Không có dữ liệu mưa cơ sở và mức thay đổi cho biểu đồ kịch bản này.')
-            a=self.figure.add_subplot(121);b=self.figure.add_subplot(122)
+            rows=[r for r in rows if r['duration']>=1440]
+            if not rows:raise ValueError('Không có mưa thiết kế thời đoạn ≥1 ngày cho kịch bản này.')
+            ax=self.figure.add_subplot(111)
             for duration in sorted({r['duration'] for r in rows}):
-                subset=sorted([r for r in rows if r['duration']==duration],key=lambda r:r['p']);a.plot([r['p'] for r in subset],[r['full'] for r in subset],marker='o',label=f'{duration:g} phút')
-            for p in sorted({r['p'] for r in rows}):
-                subset=sorted([r for r in rows if r['p']==p],key=lambda r:r['duration']);b.plot([r['duration'] for r in subset],[r['full']*60/r['duration'] for r in subset],marker='o',label=f'P={p:g}%; T={100/p:g} năm')
-            a.set(xlabel='Tần suất vượt P (%)',ylabel='Mưa thiết kế Xp (mm)',title='Tần suất — '+selected);a.set_xscale('log')
-            short=any(r['duration']<1440 for r in rows)
-            b.set(xlabel='Thời đoạn (phút)',ylabel='Cường độ trung bình (mm/h)',title='IDF theo số liệu thời đoạn' if short else 'DDF/IDF dài ngày — không suy ra mưa ngắn');b.set_xscale('log')
-            for ax in (a,b):ax.grid(alpha=.25);ax.legend(fontsize=8)
+                subset=sorted([r for r in rows if r['duration']==duration],key=lambda r:r['p'])
+                ax.plot([r['p'] for r in subset],[r['full'] for r in subset],marker='o',label=f'Mưa {duration/1440:g} ngày')
+            ax.set(xlabel='Tần suất vượt P (%)',ylabel='Lượng mưa thiết kế Xp (mm)',title='Tần suất mưa dùng tính úng — '+selected);ax.set_xscale('log');ax.grid(alpha=.25);ax.legend()
             self.figure.tight_layout();self.canvas.draw();self.book.select(self.plot_tab)
         except Exception as e:self.canvas.draw();messagebox.showerror('Biểu đồ',str(e))
     def save_plot(self):
@@ -534,7 +596,7 @@ class InlandApp:
         path=filedialog.asksaveasfilename(defaultextension='.png',filetypes=[('Ảnh PNG','*.png')])
         if path:self.figure.savefig(path,dpi=200)
     def project_data(self):
-        return dict(version=1,vars={name:getattr(self,name).get() for name in ['project','station','p','method','start','end','year','cs','scenario','beta1','beta2','c','ratio']},annual=self.read_text(self.annual),design=self.read_text(self.design),locations=self.read_text(self.locations))
+        return dict(version=1,vars={name:getattr(self,name).get() for name in ['project','station','p','method','start','end','year','cs','scenario','beta1','beta2','c','ratio']},annual=self.read_text(self.annual),design=self.read_text(self.design),locations=self.read_text(self.locations),observed=self.read_text(self.observed))
     def save_project(self):
         path=filedialog.asksaveasfilename(defaultextension='.ung',filetypes=[('Dự án úng nội đồng','*.ung')])
         if path:
@@ -550,22 +612,23 @@ class InlandApp:
             mapping={'Giữa thế kỷ':SCENARIOS[1],'Cuối thế kỷ':SCENARIOS[2],'Bao lớn nhất 3 kịch bản':SCENARIOS[3]}
             if self.scenario.get() in mapping:self.scenario.set(mapping[self.scenario.get()])
             for name in ['annual','design','locations']:self.put(getattr(self,name),data[name])
-            self.result=None;self.stats=[];self._fit_source=None;self.tree_summary.delete(*self.tree_summary.get_children());self.figure.clear();self.canvas.draw();self.status.set('Đã mở dự án. Bấm tính để tạo kết quả.')
+            self.put(self.observed,data.get('observed',OBS_HEADER+'\n'))
+            self.result=None;self.stats=[];self._fit_source=None;self.clear_tables();self.figure.clear();self.canvas.draw();self.status.set('Đã mở dự án. Bấm tính để tạo kết quả.')
         except Exception as e:messagebox.showerror('Mở dự án',str(e))
     def assumptions(self):
-        return ['Hp là cao độ mặt nước (m); X là lượng mưa (mm). Không tự chọn cao độ nền đường.',f"Năm điều tra Hi và Xi: {self.result['year']}; β={self.result['beta']:.6g}; thành phần: {self.result['coefficients']}.",'Hp = Hi + (1+β)(Xp−Xi)/1000; lấy ΔH lớn nhất theo thời đoạn, không làm tròn trước khi tính.',f"Kịch bản: {self.result['scenario']}. Mức thay đổi áp dụng lên mưa thời kỳ cơ sở; không nhân toàn chuỗi nếu chưa có căn cứ.",'IDF thời đoạn ngắn cần cực đại mưa thời đoạn ngắn; không ngoại suy từ mưa ngày. Các đoạn nối điểm không phải mô hình IDF đã hiệu chỉnh.','Pearson III/Gumbel ước lượng mômen; người dùng cần kiểm tra độ phù hợp phân phối, độ dài chuỗi và tính đại diện của trạm.']+self.result['notes']
+        return ['Htk là cao độ mặt nước (m); X là lượng mưa (mm). Không tự chọn cao độ nền đường.',f"Các năm điều tra: {sorted({r['year'] for r in self.result['locations']})}; β={self.result['beta']:.6g}; thành phần: {self.result['coefficients']}.",'Htk = Hi + (1+β)(Xp−Xi)/1000; lấy ΔH lớn nhất theo thời đoạn, không làm tròn trước khi tính.',f"Kịch bản: {self.result['scenario']}. Mức thay đổi áp dụng lên mưa thời kỳ cơ sở; không nhân toàn chuỗi nếu chưa có căn cứ.",'Hi và Xi phải cùng năm; Xi và Xp phải cùng thời đoạn; Hi và cao độ đất phải cùng hệ cao độ; lấy ΔH lớn nhất theo thời đoạn từng năm rồi Htk lớn nhất trong các năm đã nhập. Không làm tròn số trung gian.','Pearson III/Gumbel ước lượng mômen; người dùng cần kiểm tra độ phù hợp phân phối, độ dài chuỗi và tính đại diện của trạm.']+self.result['notes']
     def export_excel(self):
         if not self.current():return
         path=filedialog.asksaveasfilename(defaultextension='.xlsx',filetypes=[('Excel','*.xlsx')])
         if not path:return
         try:
             with pd.ExcelWriter(path,engine='openpyxl') as writer:
-                for sheet,key in [('Mua_thiet_ke','design'),('DeltaH_chi_tiet','details'),('Hp_tuyen','summary'),('Vi_tri','locations')]:pd.DataFrame(self.result[key]).rename(columns=COLUMN_TITLES).to_excel(writer,sheet_name=sheet,index=False)
+                for sheet,key in [('Mua_thiet_ke','design'),('DeltaH_chi_tiet','details'),('Hp_tuyen','summary'),('Vi_tri','locations'),('Htk_tung_nam','per_year')]:pd.DataFrame(self.result[key]).rename(columns=COLUMN_TITLES).to_excel(writer,sheet_name=sheet,index=False)
                 pd.DataFrame({'Ghi_chu':[self.project.get(),self.station.get()]+self.assumptions()}).to_excel(writer,sheet_name='Can_cu_gia_thiet',index=False)
                 if self.stats and self._fit_source and self._fit_source[:5]==(self.read_text(self.annual),self.method.get(),self.cs.get(),self.start.get(),self.end.get()):
                     pd.DataFrame(self.stats).to_excel(writer,sheet_name='Thong_ke_tan_suat',index=False)
                 pd.DataFrame([{'Ký hiệu':key,'Diễn giải':title} for key,title in COLUMN_TITLES.items()]).to_excel(writer,sheet_name='Dien_giai_ky_hieu',index=False)
-                for name in ('annual','design','locations'):
+                for name in ('annual','design','locations','observed'):
                     rows=table(self.read_text(getattr(self,name))) if len(self.read_text(getattr(self,name)).splitlines())>1 else []
                     if rows:pd.DataFrame(rows[1:],columns=rows[0]).to_excel(writer,sheet_name='Goc_'+name,index=False)
                 from openpyxl.styles import Font,PatternFill
@@ -576,7 +639,7 @@ class InlandApp:
                         for cell in row:
                             if isinstance(cell.value,(float,int)):cell.number_format='0.000'
                     for column in ws.columns:ws.column_dimensions[column[0].column_letter].width=min(65,max(16,len(str(column[0].value))+3))
-            self.status.set('Đã xuất Excel: số liệu gốc, bảng mưa, ΔH, Hp và giả thiết.')
+            self.status.set('Đã xuất Excel: số liệu gốc, bảng mưa, ΔH, Htk và giả thiết.')
         except Exception as e:messagebox.showerror('Xuất Excel',str(e))
     def export_word(self):
         if not self.current():return
@@ -589,7 +652,7 @@ class InlandApp:
             doc.styles['Normal'].font.name='Times New Roman';doc.styles['Normal'].font.size=Pt(10)
             doc.add_heading('TÍNH MỰC NƯỚC ÚNG NỘI ĐỒNG',0);doc.add_paragraph(self.result['project']+' — '+self.result['station'])
             for note in self.assumptions():doc.add_paragraph(note)
-            for title,key,cols in [('Mưa và chênh lệch mực nước','details',['duration','p','scenario','Xp','Xi','beta','deltaH']),('Mực nước thiết kế theo vị trí','summary',['location','p','Hi','deltaH','Hp','days','scenario','depth'])]:
+            for title,key,cols in [('Mưa và chênh lệch mực nước','details',['location','year','duration','p','Xp','Xi','deltaH']),('Mực nước thiết kế từng năm điều tra','per_year',['location','p','year','Hi','deltaH','Hp','days','scenario']),('Mực nước thiết kế khống chế theo vị trí','summary',['location','p','year','Hi','deltaH','Hp','days','scenario'])]:
                 doc.add_heading(title,1);t=doc.add_table(rows=1,cols=len(cols));t.style='Table Grid'
                 for cell,keycol in zip(t.rows[0].cells,cols):cell.text=COLUMN_TITLES.get(keycol,keycol)
                 for row in self.result[key]:
