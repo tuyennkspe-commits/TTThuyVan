@@ -393,7 +393,7 @@ class HEC18Calculations:
 class MainScourApplication(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("TT Xói Cầu • HEC-18 2012")
+        self.title("Tính toán xói cục bộ tại Cầu • HEC-18 2012")
         self.geometry(f"{min(1440, self.winfo_screenwidth())}x{min(940, self.winfo_screenheight()-70)}")
         self.minsize(1100, 720)
 
@@ -496,7 +496,7 @@ class MainScourApplication(tk.Tk):
     def _build_header_banner(self):
         header = tk.Frame(self, bg="#142C42")
         header.pack(fill=tk.X)
-        tk.Label(header, text="TT XÓI CẦU", bg="#142C42", fg="white",
+        tk.Label(header, text="TÍNH TOÁN XÓI CỤC BỘ TẠI CẦU", bg="#142C42", fg="white",
                  font=(UI_FONT, 18, "bold")).pack(anchor="w", padx=20, pady=(12, 2))
         self.lbl_title = tk.Label(header, text=f"{self.project['bridge_name']}  •  {self.project['project_name']}",
                                   bg="#142C42", fg="#BBD1E0", font=(UI_FONT, 10))
@@ -1834,7 +1834,7 @@ Ks: D84 cho cát; 3,5 D84 cho sỏi/cuội.
 
         # 7.2: TRỤ LỘ BỆ
         self.subtab_lobe = ttk.Frame(self.nb_scour)
-        self.nb_scour.add(self.subtab_lobe, text="7.2 Case 2: bệ trên/dưới đáy")
+        self.nb_scour.add(self.subtab_lobe, text="7.2 Case 2: XCB Lộ Bệ")
 
         f_lobe_1 = ttk.LabelFrame(self.subtab_lobe, text="1, Xói cục bộ do thân trụ gây ra (yspier)")
         f_lobe_1.pack(fill=tk.X, padx=6, pady=2)
@@ -1880,7 +1880,7 @@ Ks: D84 cho cát; 3,5 D84 cho sỏi/cuội.
 
         # 7.3: TRỤ LỘ BỆ & CỌC
         self.subtab_lococ = ttk.Frame(self.nb_scour)
-        self.nb_scour.add(self.subtab_lococ, text="7.3 Case 1: bệ trên đáy")
+        self.nb_scour.add(self.subtab_lococ, text="7.3 Case 1: XCB Lộ Cọc")
 
         f_lc_4 = ttk.LabelFrame(self.subtab_lococ, text="Xói bệ trên đáy sông (Case 1); nhóm cọc nếu có")
         f_lc_4.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
