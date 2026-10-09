@@ -168,6 +168,30 @@ def select_period(data,start='',end=''):
     return result.copy()
 
 
+def detect_common_period(stations,inputs,dt):
+    """Chọn đoạn liên tục dài nhất có đủ cả ba yếu tố; không bắc qua lỗ hổng."""
+    if not all(k in inputs for k in ['BocHoi_mm','Q_ThucDo_m3s']):return None
+    active=[v for v in stations.values() if v['weight']>0]
+    if not active:return None
+    weights=[finite_number(v['weight'],'Trọng số') for v in stations.values()]
+    if any(not 0<=w<=1 for w in weights) or not np.isclose(sum(weights),1,rtol=0,atol=1e-8):raise ValueError('Tổng trọng số trạm mưa phải bằng 1 trước khi nhận diện khoảng chung.')
+    data=[(v['data'],'Mua_mm') for v in active]+[(inputs[k],k) for k in ['BocHoi_mm','Q_ThucDo_m3s']]
+    axis=series_axis(data[0][0]);common=None
+    for frame,key in data:
+        if series_axis(frame)!=axis:raise ValueError('Các chuỗi phải cùng kiểu ngày giờ hoặc thứ tự bước.')
+        index=pd.Index(frame.loc[frame[key].notna(),axis])
+        common=index if common is None else common.intersection(index)
+    common=common.sort_values()
+    if len(common)<2:raise ValueError('Không có ít nhất 2 bước chung đủ mưa, bốc hơi và Q thực đo.')
+    gaps=common.to_series().diff().dropna().dt.total_seconds().to_numpy()/3600 if axis=='ThoiGian' else np.diff(common.to_numpy(dtype=float))
+    expected=finite_number(dt,'Bước tính',True) if axis=='ThoiGian' else 1.
+    cuts=np.r_[0,np.flatnonzero(~np.isclose(gaps,expected,rtol=0,atol=1e-6))+1,len(common)]
+    lengths=np.diff(cuts);chosen=int(np.argmax(lengths));lo,hi=cuts[chosen],cuts[chosen+1]
+    if hi-lo<2:raise ValueError('Các thời điểm chung không liên tục theo bước tính đã nhập.')
+    fmt=lambda x:x.strftime('%Y-%m-%d %H:%M:%S') if axis=='ThoiGian' else str(int(x))
+    return fmt(common[lo]),fmt(common[hi-1]),len(lengths),int(hi-lo)
+
+
 def weighted_rainfall(stations,start='',end=''):
     if not stations:raise ValueError('Chưa nhập trạm mưa.')
     weights=[finite_number(v['weight'],'Trọng số') for v in stations.values()]
@@ -327,6 +351,7 @@ class NAMDesktopApp:
         self.input_series={}
         self.rain_stations={}
         self._is_demo=False
+        self.auto_period=tk.BooleanVar(value=True)
         self.best_params = {
             "U_max": 15.0,
             "L_max": 100.0,
@@ -406,7 +431,8 @@ class NAMDesktopApp:
             row=ttk.Frame(left_frame);row.pack(fill='x',pady=2)
             ttk.Label(row,text=label).pack(side='left')
             entry=ttk.Entry(row,width=24);entry.pack(side='right');setattr(self,attr,entry);self.setting_entries.append(entry)
-        ttk.Label(left_frame,text='Có ngày giờ: YYYY-MM-DD [HH:MM].\nChuỗi một cột: nhập số bước đầu/cuối.\nĐể trống: dùng toàn chuỗi mưa. Khởi động tính từ đầu khoảng.',wraplength=350).pack(anchor='w')
+        ttk.Checkbutton(left_frame,text='Tự nhận khoảng đủ mưa, bốc hơi và Q',variable=self.auto_period,command=self._refresh_inputs).pack(anchor='w')
+        ttk.Label(left_frame,text='Có ngày giờ: YYYY-MM-DD [HH:MM].\nChuỗi một cột: nhập số bước đầu/cuối.\nCó khoảng đứt đoạn: chọn đoạn đủ dữ liệu dài nhất.\nBỏ chọn tự nhận để sửa khoảng bằng tay.',wraplength=350).pack(anchor='w')
         ttk.Label(left_frame,text='NAM khái niệm: CK_12 cố định; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV hoặc Excel.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
@@ -631,7 +657,7 @@ class NAMDesktopApp:
         return area,dt,int(np.ceil(warm/dt)),split/100,initial
 
     def _signature(self):
-        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get())+tuple(self.best_params.items())+(id(self.df_data),)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
+        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get())+tuple(self.best_params.items())+(id(self.df_data),)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
 
     def _watch(self):
         if self.current_sim is not None and self._result_signature!=self._signature():
@@ -742,6 +768,19 @@ class NAMDesktopApp:
     def _refresh_inputs(self):
         self.df_data=None;self.current_sim=None;self.ax_rain.clear();self.ax_flow.clear();self.canvas.draw()
         for label in [self.lbl_metric_nse,self.lbl_metric_peak,self.lbl_metric_pbias]:label.config(text='Chưa tính')
+        auto_note=''
+        if self.auto_period.get():
+            try:
+                detected=detect_common_period(self.rain_stations,self.input_series,finite_number(self.ent_dt.get(),'Bước tính',True))
+                for entry in [self.ent_period_start,self.ent_period_end]:entry.delete(0,'end')
+                if detected:
+                    start,end,segments,count=detected
+                    self.ent_period_start.insert(0,start);self.ent_period_end.insert(0,end)
+                    auto_note=f' Tự nhận đủ 3 yếu tố: {count} bước.'+ (f' Có {segments} đoạn; chọn đoạn liên tục dài nhất.' if segments>1 else '')
+                else:auto_note=' Chưa đủ 3 yếu tố để tự nhận khoảng; chỉ mô phỏng khi đã có mưa/bốc hơi.'
+            except Exception as exc:
+                for entry in [self.ent_period_start,self.ent_period_end]:entry.delete(0,'end')
+                self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
         if self.rain_stations:
             try:self.input_series['Mua_mm']=weighted_rainfall(self.rain_stations,*self._period())
             except Exception as exc:
@@ -753,7 +792,7 @@ class NAMDesktopApp:
             _,dt,_,_,_=self._settings()
             self.df_data=merge_series(self.input_series,dt,*self._period())
             count=self.df_data['Q_ThucDo_m3s'].notna().sum()
-            self.lbl_data_status.config(text=f'{len(self.df_data)} bước; {count} Q thực đo; {self.df_data.attrs.get("outside_Q_count",0)} Q ngoài khoảng không dùng.\n{self.df_data.iloc[0,0]} → {self.df_data.iloc[-1,0]}',foreground='blue')
+            self.lbl_data_status.config(text=f'{len(self.df_data)} bước; {count} Q thực đo; {self.df_data.attrs.get("outside_Q_count",0)} Q ngoài khoảng không dùng.\n{self.df_data.iloc[0,0]} → {self.df_data.iloc[-1,0]}'+auto_note,foreground='blue')
         except Exception as exc:self.lbl_data_status.config(text=str(exc),foreground='#b00020')
 
     def _clear_observed(self):
