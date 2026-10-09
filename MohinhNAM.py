@@ -7,6 +7,7 @@ P/PET tổng mm mỗi bước; Q trung bình bước m³/s. Hiệu chỉnh cần
 """
 
 import os
+from pathlib import Path
 import threading
 import queue
 import tkinter as tk
@@ -86,20 +87,47 @@ def validate_data(df, dt_hours):
 SERIES_NAMES={'Mua_mm':'Mưa (mm/bước)','BocHoi_mm':'Bốc hơi tiềm năng (mm/bước)','Q_ThucDo_m3s':'Lưu lượng thực đo (m³/s)'}
 
 
+def read_series_file(path,key):
+    if path.lower().endswith('.xlsx'):
+        raw=pd.read_excel(path,header=None)
+    else:
+        first=Path(path).read_text(encoding='utf-8-sig').splitlines()[0]
+        sep=';' if ';' in first else '\t' if '\t' in first else ','
+        raw=pd.read_csv(path,sep=sep,header=None,encoding='utf-8-sig')
+    if raw.empty:raise ValueError('Tệp không có dữ liệu.')
+    # Chuỗi một cột có thể có tiêu đề hoặc chỉ có các giá trị.
+    if raw.shape[1]==1:
+        try:float(raw.iloc[0,0]);start=0
+        except (ValueError,TypeError):start=1
+        return pd.DataFrame({key:raw.iloc[start:,0].to_numpy()})
+    raw.columns=[str(v).strip() for v in raw.iloc[0]]
+    return raw.iloc[1:].reset_index(drop=True)
+
+
 def prepare_series(df,key):
-    """Một tệp cho một đại lượng: ThoiGian + cột giá trị."""
+    """Có ThoiGian: ghép theo ngày giờ; không có: ghép theo bước 1..n."""
     df=df.copy();df.columns=[str(c).strip() for c in df.columns]
-    if 'ThoiGian' not in df:raise ValueError('Cần cột ThoiGian, ví dụ 2026-01-01 01:00. Mỗi dòng ứng với cuối một bước tính.')
-    value_col=key if key in df else 'GiaTri' if 'GiaTri' in df else None
-    if value_col is None:raise ValueError(f'Cần cột {key} hoặc GiaTri; mỗi tệp chỉ nhập một đại lượng.')
-    times=pd.to_datetime(df['ThoiGian'],errors='raise')
-    if times.isna().any() or times.duplicated().any():raise ValueError('Thời gian bị thiếu hoặc trùng.')
-    if times.dt.tz is not None:raise ValueError('Dùng giờ địa phương thống nhất, không kèm múi giờ trong cột ThoiGian.')
+    value_col=key if key in df else 'GiaTri' if 'GiaTri' in df else df.columns[0] if len(df.columns)==1 else None
+    if value_col is None:raise ValueError(f'Cần cột {key}, GiaTri, hoặc tệp một cột giá trị. ThoiGian là tùy chọn.')
     values=pd.to_numeric(df[value_col],errors='raise')
     if np.isinf(values).any() or (values.dropna()<0).any():raise ValueError('Giá trị phải không âm và không vô hạn.')
     if key!='Q_ThucDo_m3s' and values.isna().any():raise ValueError('Không được thiếu mưa/bốc hơi; không tự thay bằng 0.')
     if len(df)<1:raise ValueError('Tệp không có số liệu.')
-    return pd.DataFrame({'ThoiGian':times,key:values}).sort_values('ThoiGian').reset_index(drop=True)
+    if 'ThoiGian' in df:
+        axis='ThoiGian';coordinates=pd.to_datetime(df[axis],errors='raise')
+        if coordinates.isna().any() or coordinates.duplicated().any():raise ValueError('Thời gian bị thiếu hoặc trùng.')
+        if coordinates.dt.tz is not None:raise ValueError('Dùng giờ địa phương thống nhất, không kèm múi giờ.')
+        coordinates=coordinates.astype('datetime64[ns]')
+    else:
+        axis='Buoc'
+        coordinates=pd.to_numeric(df[axis],errors='raise') if axis in df else pd.Series(np.arange(1,len(df)+1),index=df.index)
+        if not np.all(np.isfinite(coordinates)) or np.any(coordinates<1) or np.any(coordinates!=np.floor(coordinates)) or coordinates.duplicated().any():
+            raise ValueError('Buoc phải là số nguyên dương, không trùng.')
+    return pd.DataFrame({axis:coordinates,key:values}).sort_values(axis).reset_index(drop=True)
+
+
+def series_axis(data):
+    return 'ThoiGian' if 'ThoiGian' in data else 'Buoc'
 
 
 def weighted_rainfall(stations):
@@ -107,25 +135,30 @@ def weighted_rainfall(stations):
     weights=[finite_number(v['weight'],'Trọng số') for v in stations.values()]
     if any(w<0 or w>1 for w in weights) or not np.isclose(sum(weights),1,rtol=0,atol=1e-8):
         raise ValueError(f'Tổng trọng số trạm mưa phải bằng 1 (hiện tại {sum(weights):.6f}); mỗi trọng số thuộc [0;1].')
-    result=None
+    result=None;axis=None
     for item in stations.values():
         if item['weight']==0:continue
-        series=item['data'].set_index('ThoiGian')['Mua_mm']
-        if result is None:result=series*item['weight']
+        current_axis=series_axis(item['data']);series=item['data'].set_index(current_axis)['Mua_mm']
+        if result is None:result=series*item['weight'];axis=current_axis
         else:
-            if not series.index.equals(result.index):raise ValueError('Các trạm mưa có trọng số >0 phải cùng thời gian; không tự điền mưa thiếu bằng 0.')
+            if current_axis!=axis or not series.index.equals(result.index):raise ValueError('Các trạm có trọng số >0 phải khớp ngày giờ hoặc cùng số bước; không trộn hai kiểu nhập.')
             result=result+series*item['weight']
     return result.rename('Mua_mm').reset_index()
 
 
 def merge_series(series,dt):
-    if not all(k in series for k in ['Mua_mm','BocHoi_mm']):raise ValueError('Nhập riêng đủ chuỗi mưa và bốc hơi trước khi mô phỏng.')
-    rain=series['Mua_mm'].set_index('ThoiGian');pet=series['BocHoi_mm'].set_index('ThoiGian')
-    if not rain.index.equals(pet.index):raise ValueError('Thời gian mưa và bốc hơi chưa khớp: kiểm tra thời kỳ, bước giờ và các dòng thiếu. Không tự cắt chuỗi hoặc điền 0.')
+    dt=finite_number(dt,'Bước giờ',True)
+    if not all(k in series for k in ['Mua_mm','BocHoi_mm']):raise ValueError('Nhập đủ mưa và bốc hơi trước khi mô phỏng.')
+    axis=series_axis(series['Mua_mm'])
+    if any(series_axis(data)!=axis for data in series.values()):raise ValueError('Dùng cùng kiểu cho các chuỗi: tất cả có ThoiGian hoặc tất cả theo thứ tự bước. Không tự ghép hai kiểu.')
+    rain=series['Mua_mm'].set_index(axis);pet=series['BocHoi_mm'].set_index(axis)
+    if not rain.index.equals(pet.index):raise ValueError('Mưa/bốc hơi phải khớp ngày giờ hoặc số bước; không tự cắt chuỗi hay điền 0.')
+    if axis=='Buoc' and not np.array_equal(rain.index.to_numpy(),np.arange(1,len(rain)+1)):
+        raise ValueError('Chuỗi mưa/bốc hơi cần đủ các bước liên tiếp từ 1.')
     df=rain.join(pet)
     if 'Q_ThucDo_m3s' in series:
-        q=series['Q_ThucDo_m3s'].set_index('ThoiGian')
-        if not q.index.isin(df.index).all():raise ValueError('Có thời điểm Q thực đo ngoài chuỗi mưa/bốc hơi hoặc lệch bước giờ; chọn lại thời kỳ phù hợp.')
+        q=series['Q_ThucDo_m3s'].set_index(axis)
+        if not q.index.isin(df.index).all():raise ValueError('Q thực đo có ngày giờ hoặc bước ngoài chuỗi mưa/bốc hơi.')
         df=df.join(q)
     return validate_data(df.reset_index(),dt)
 
@@ -324,7 +357,7 @@ class NAMDesktopApp:
             ttk.Label(f_basin,text=label).grid(row=row,column=0,sticky='w',padx=3,pady=2)
             entry=ttk.Entry(f_basin,width=10);entry.insert(0,default);entry.grid(row=row,column=1,padx=3)
             setattr(self,attr,entry);self.setting_entries.append(entry)
-        ttk.Label(left_frame,text='NAM khái niệm: CK_12 cố định; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV hoặc Excel.\nMỗi tệp: ThoiGian + giá trị; giờ cuối bước tính.\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
+        ttk.Label(left_frame,text='NAM khái niệm: CK_12 cố định; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV hoặc Excel.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
         )
@@ -584,10 +617,10 @@ class NAMDesktopApp:
         window.transient(self.root);window.grab_set()
 
     def _import_rain_station(self):
-        path=filedialog.askopenfilename(title='Nhập mưa một trạm: ThoiGian + Mua_mm',filetypes=[('CSV / Excel','*.csv *.xlsx')])
+        path=filedialog.askopenfilename(title='Nhập mưa một trạm: giá trị hoặc ThoiGian + Mua_mm',filetypes=[('CSV / Excel','*.csv *.xlsx')])
         if not path:return
         try:
-            df=pd.read_excel(path) if path.lower().endswith('.xlsx') else pd.read_csv(path,sep=None,engine='python',encoding='utf-8-sig')
+            df=read_series_file(path,'Mua_mm')
             data=prepare_series(df,'Mua_mm')
             name=simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
             if name is None:return
@@ -642,7 +675,7 @@ class NAMDesktopApp:
         path=filedialog.askopenfilename(title='Nhập riêng '+SERIES_NAMES[key],filetypes=[('CSV / Excel','*.csv *.xlsx'),('CSV','*.csv'),('Excel','*.xlsx')])
         if not path:return
         try:
-            df=pd.read_excel(path) if path.lower().endswith('.xlsx') else pd.read_csv(path,sep=None,engine='python',encoding='utf-8-sig')
+            df=read_series_file(path,key)
             prepared=prepare_series(df,key)
             if self._is_demo:
                 self.input_series={};self.rain_stations={};self._is_demo=False
@@ -680,12 +713,12 @@ class NAMDesktopApp:
         window=tk.Toplevel(self.root);window.title(SERIES_NAMES[key]);window.geometry('650x450')
         frame=ttk.Frame(window);frame.pack(fill='both',expand=True)
         tree=ttk.Treeview(frame,columns=('time','value'),show='headings')
-        tree.heading('time',text='Thời gian (cuối bước tính)');tree.heading('value',text=SERIES_NAMES[key])
+        tree.heading('time',text='Thời gian (cuối bước)' if series_axis(self.input_series[key] if data is None else data)=='ThoiGian' else 'Bước tính (1, 2, 3…)');tree.heading('value',text=SERIES_NAMES[key])
         scroll=ttk.Scrollbar(frame,orient='vertical',command=tree.yview);tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right',fill='y');tree.pack(fill='both',expand=True)
         for timestamp,value in (self.input_series[key] if data is None else data).itertuples(index=False,name=None):
             tree.insert('', 'end',values=(str(timestamp),'—' if pd.isna(value) else f'{value:.3f}'))
-        ttk.Label(window,text='Ghép bằng thời gian, không ghép theo số thứ tự dòng.').pack(pady=5)
+        ttk.Label(window,text='Có ngày giờ: ghép theo thời gian. Một cột: ghép theo thứ tự bước, cùng thời điểm bắt đầu.').pack(pady=5)
 
     def _start_calibration_thread(self):
         if self._busy:return
@@ -814,7 +847,7 @@ class NAMDesktopApp:
             out['TruLuongDau_mm']=res['Initial_storage_mm']
             for i,(name,item) in enumerate(self.rain_stations.items(),1):
                 out[f'Tram_{i}_Ten']=name;out[f'Tram_{i}_TrongSo']=item['weight']
-                out[f'Tram_{i}_Mua_mm']=item['data'].set_index('ThoiGian')['Mua_mm'].reindex(pd.DatetimeIndex(out['ThoiGian'])).to_numpy()
+                out[f'Tram_{i}_Mua_mm']=item['data'].set_index(series_axis(item['data']))['Mua_mm'].reindex(out[series_axis(item['data'])]).to_numpy()
             for key,value in settings['params'].items():out[key]=value
             for key,value in settings['initial'].items():out['BanDau_'+key]=value
             out.to_csv(path,index=False,encoding='utf-8-sig')
