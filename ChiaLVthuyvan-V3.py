@@ -636,13 +636,13 @@ class GeoCatchmentApp(ctk.CTk):
         for _, row in df.iterrows():
             tree.insert("", tk.END, values=(
                 f"LV_{int(row['ID_LuuVuc'])}",
-                row['DienTich'],
-                row['Doc_LV_pm'],
-                row['Z_Nguon'],
-                row['Z_CuaXa'],
-                row['Dai_SC'],
-                row['Doc_SC_pm'],
-                row['Dai_SNhanh']
+                (f"{row['DienTich']:.3f}" if np.isfinite(row['DienTich']) else '—'),
+                (f"{row['Doc_LV_pm']:.3f}" if np.isfinite(row['Doc_LV_pm']) else '—'),
+                (f"{row['Z_Nguon']:.3f}" if np.isfinite(row['Z_Nguon']) else '—'),
+                (f"{row['Z_CuaXa']:.3f}" if np.isfinite(row['Z_CuaXa']) else '—'),
+                (f"{row['Dai_SC']:.3f}" if np.isfinite(row['Dai_SC']) else '—'),
+                (f"{row['Doc_SC_pm']:.3f}" if np.isfinite(row['Doc_SC_pm']) else '—'),
+                (f"{row['Dai_SNhanh']:.3f}" if np.isfinite(row['Dai_SNhanh']) else '—')
             ))
 
         tree.pack(fill="both", expand=True, side="left")
@@ -695,17 +695,25 @@ class GeoCatchmentApp(ctk.CTk):
 
             try:
                 df_export = df.copy()
+                numeric_columns = df_export.columns.drop("ID_LuuVuc")
+                df_export[numeric_columns] = df_export[numeric_columns].round(3)
                 df_export['ID_LuuVuc'] = df_export['ID_LuuVuc'].apply(lambda x: f"LV_{int(x)}")
                 df_export.columns = columns
 
                 if file_path.endswith('.csv'):
-                    df_export.to_csv(file_path, index=False, encoding='utf-8-sig')
+                    df_export.to_csv(file_path, index=False, encoding='utf-8-sig', float_format='%.3f')
                 else:
                     try:
-                        df_export.to_excel(file_path, index=False)
+                        import pandas as pd
+                        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                            df_export.to_excel(writer, index=False)
+                            worksheet = writer.sheets['Sheet1']
+                            for cells in worksheet.iter_rows(min_row=2, min_col=2):
+                                for cell in cells:
+                                    cell.number_format = '0.000'
                     except Exception:
                         csv_path = os.path.splitext(file_path)[0] + ".csv"
-                        df_export.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                        df_export.to_csv(csv_path, index=False, encoding='utf-8-sig', float_format='%.3f')
                         file_path = csv_path
 
                 messagebox.showinfo("Thành công", f"Đã xuất file dữ liệu thành công:\n{file_path}")
