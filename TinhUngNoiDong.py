@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import pandas as pd
-from scipy.stats import pearson3, gumbel_r, skew
+from scipy.stats import pearson3, gumbel_r, skew, norm
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
@@ -483,7 +483,7 @@ class InlandApp:
     def clear_tables(self):
         for tree in (self.tree_summary,self.tree_years,self.tree_details):tree.delete(*tree.get_children())
     def build_plot(self):
-        row=ttk.Frame(self.plot_tab);row.pack(fill='x');self.plot_source=tk.StringVar(value='Hiện trạng');ttk.Combobox(row,textvariable=self.plot_source,values=SCENARIOS[:3],state='readonly',width=20).pack(side='left',padx=5);ttk.Button(row,text='Vẽ từ bảng mưa thiết kế',command=self.plot).pack(side='left');ttk.Button(row,text='Lưu biểu đồ PNG',command=self.save_plot).pack(side='left',padx=5)
+        row=ttk.Frame(self.plot_tab);row.pack(fill='x');self.plot_source=tk.StringVar(value='Hiện trạng');ttk.Combobox(row,textvariable=self.plot_source,values=SCENARIOS[:3],state='readonly',width=20).pack(side='left',padx=5);ttk.Button(row,text='Vẽ đường tần suất & điểm thực nghiệm',command=self.plot).pack(side='left');ttk.Button(row,text='Lưu biểu đồ PNG',command=self.save_plot).pack(side='left',padx=5)
         self.figure=Figure(figsize=(11,6),dpi=100);self.canvas=FigureCanvasTkAgg(self.figure,self.plot_tab);self.canvas.get_tk_widget().pack(fill='both',expand=True);NavigationToolbar2Tk(self.canvas,self.plot_tab)
     def read_text(self,widget):return widget.get('1.0','end').strip()
     def signature(self):
@@ -577,19 +577,50 @@ class InlandApp:
     def plot(self):
         self.figure.clear()
         try:
-            rows=parse_design(self.read_text(self.design));selected=self.plot_source.get()
+            years,durations,matrix=parse_annual(self.read_text(self.annual))
+            selected=self.plot_source.get();rows=parse_design(self.read_text(self.design))
+            mask=np.ones(len(years),dtype=bool)
             if selected!='Hiện trạng':
-                key='mid' if selected=='Kịch bản 1' else 'end'
-                rows=[dict(r,full=r['base']*(1+r[key]/100)) for r in rows if r['base'] is not None and r[key] is not None]
-            rows=[r for r in rows if r['duration']>=1440]
-            if not rows:raise ValueError('Không có mưa thiết kế thời đoạn ≥1 ngày cho kịch bản này.')
+                start=num(self.start.get(),'Năm đầu thời kỳ cơ sở');end=num(self.end.get(),'Năm cuối thời kỳ cơ sở')
+                if start!=int(start) or end!=int(end) or start>end:raise ValueError('Thời kỳ cơ sở không hợp lệ.')
+                mask=(years>=start)&(years<=end)
             ax=self.figure.add_subplot(111)
-            for duration in sorted({r['duration'] for r in rows}):
-                subset=sorted([r for r in rows if r['duration']==duration],key=lambda r:r['p'])
-                ax.plot([r['p'] for r in subset],[r['full'] for r in subset],marker='o',label=f'Mưa {duration/1440:g} ngày')
-            ax.set(xlabel='Tần suất vượt P (%)',ylabel='Lượng mưa thiết kế Xp (mm)',title='Tần suất mưa dùng tính úng — '+selected);ax.set_xscale('log');ax.grid(alpha=.25);ax.legend()
-            self.figure.tight_layout();self.canvas.draw();self.book.select(self.plot_tab)
-        except Exception as e:self.canvas.draw();messagebox.showerror('Biểu đồ',str(e))
+            # Giấy xác suất chuẩn: tọa độ x = Φ⁻¹(P vượt/100), nhãn vẫn là P%.
+            ticks=np.array([.1,.2,.5,1,2,5,10,20,30,50,70,80,90,95,98,99,99.5,99.8,99.9])
+            probabilities=norm.cdf(np.linspace(norm.ppf(.001),norm.ppf(.999),600))*100
+            plotted=0;omitted=[]
+            for j,duration in enumerate(durations):
+                if duration<1440:continue
+                values=matrix[mask,j];factor=1.
+                if selected!='Hiện trạng':
+                    key='mid' if selected=='Kịch bản 1' else 'end'
+                    rates={r[key] for r in rows if r['duration']==duration and r[key] is not None}
+                    if not rates:omitted.append(f'{duration/1440:g} ngày');continue
+                    if len(rates)!=1:raise ValueError('Mức thay đổi theo P khác nhau: chưa thể xác định một đường phân phối khí hậu duy nhất cho thời đoạn này.')
+                    factor=1+next(iter(rates))/100
+                _,meta=frequency(values,[50],self.method.get(),self.cs.get().strip() or None)
+                mean=meta['mean'];sd=meta['cv']*mean
+                if sd==0:quantiles=np.full(len(probabilities),mean)
+                elif self.method.get()=='Gumbel':
+                    scale=sd*np.sqrt(6)/np.pi
+                    quantiles=gumbel_r.isf(probabilities/100,loc=mean-np.euler_gamma*scale,scale=scale)
+                else:quantiles=mean+sd*pearson3.isf(probabilities/100,skew=meta['cs_used'])
+                valid=np.isfinite(quantiles)&(quantiles>=0)
+                line,=ax.plot(norm.ppf(probabilities[valid]/100),quantiles[valid]*factor,label=f'{duration/1440:g} ngày — {meta["method"]}, n={meta["n"]}')
+                empirical=np.sort(values)[::-1];p_emp=np.arange(1,len(values)+1)/(len(values)+1)
+                ax.scatter(norm.ppf(p_emp),empirical*factor,color=line.get_color(),s=22,facecolors='none')
+                plotted+=1
+            if not plotted:raise ValueError('Không có chuỗi mưa và mức thay đổi đủ dữ liệu để vẽ.')
+            ax.set_xticks(norm.ppf(ticks/100));ax.set_xticklabels([f'{v:g}' for v in ticks],rotation=45,fontsize=8)
+            ax.set_xlim(norm.ppf(.001),norm.ppf(.999));ax.set_ylim(bottom=0)
+            ax.set(xlabel='Tần suất vượt P (%) — thang xác suất chuẩn',ylabel='Lượng mưa X (mm)',title='ĐƯỜNG TẦN SUẤT MƯA — '+self.station.get()+' — '+selected)
+            ax.grid(alpha=.3);ax.legend(fontsize=8)
+            subtitle='Đường liền: phân phối lý luận (ước lượng mômen). Điểm: P = m/(n+1), xếp mưa giảm dần (Weibull).'
+            if selected!='Hiện trạng':subtitle+=' Điểm kịch bản được nhân hệ số thay đổi; không phải quan trắc tương lai.'
+            self.figure.text(.5,.015,subtitle,ha='center',fontsize=8,wrap=True)
+            self.figure.tight_layout(rect=(0,.07,1,1));self.canvas.draw();self.book.select(self.plot_tab)
+            self.status.set('Đã vẽ trên giấy xác suất chuẩn; không nối các điểm P thiết kế. Phần phân vị mưa âm không hiển thị.'+(' Thiếu kịch bản: '+', '.join(omitted) if omitted else ''))
+        except Exception as e:self.figure.clear();self.canvas.draw();messagebox.showerror('Biểu đồ',str(e))
     def save_plot(self):
         self.plot()
         if not self.figure.axes:return
