@@ -7,6 +7,8 @@ P/PET tổng mm mỗi bước; Q trung bình bước m³/s. Hiệu chỉnh cần
 """
 
 import os
+import re
+from datetime import datetime, date
 from pathlib import Path
 import threading
 import queue
@@ -100,6 +102,12 @@ def read_series_file(path,key):
         try:float(raw.iloc[0,0]);start=0
         except (ValueError,TypeError):start=1
         return pd.DataFrame({key:raw.iloc[start:,0].to_numpy()})
+    if raw.shape[1]==2:
+        first_time=raw.iloc[0,0]
+        is_date=isinstance(first_time,(datetime,date,pd.Timestamp)) or isinstance(first_time,str) and bool(re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T].*)?$',first_time.strip()))
+        if is_date:
+            # Hai cột ngày giờ / giá trị, không tiêu đề: giữ cả dòng đầu.
+            return pd.DataFrame({'ThoiGian':raw.iloc[:,0].to_numpy(),key:raw.iloc[:,1].to_numpy()})
     raw.columns=[str(v).strip() for v in raw.iloc[0]]
     return raw.iloc[1:].reset_index(drop=True)
 
