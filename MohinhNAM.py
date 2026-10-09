@@ -121,9 +121,17 @@ def prepare_series(df,key):
     if np.isinf(values).any() or (values.dropna()<0).any():raise ValueError('Giá trị phải không âm và không vô hạn.')
     if key!='Q_ThucDo_m3s' and values.isna().any():raise ValueError('Không được thiếu mưa/bốc hơi; không tự thay bằng 0.')
     if len(df)<1:raise ValueError('Tệp không có số liệu.')
+    import_notes=[]
     if 'ThoiGian' in df:
         axis='ThoiGian';coordinates=pd.to_datetime(df[axis],errors='raise')
-        if coordinates.isna().any() or coordinates.duplicated().any():raise ValueError('Thời gian bị thiếu hoặc trùng.')
+        missing=coordinates.isna()
+        if missing.any():
+            if key!='Q_ThucDo_m3s':raise ValueError('Mưa/bốc hơi có dòng thiếu ngày giờ; kiểm tra tệp nguồn.')
+            records=[f'dòng dữ liệu {i+1}: Q={values.iloc[i]}' for i in np.flatnonzero(missing.to_numpy())]
+            import_notes.append('Không dùng Q thiếu ngày giờ: '+ '; '.join(records))
+            coordinates=coordinates[~missing];values=values[~missing]
+            if not len(coordinates):raise ValueError('Không có lưu lượng nào đủ ngày giờ để nhập.')
+        if coordinates.duplicated().any():raise ValueError('Trùng ngày giờ trong tệp; cần kiểm tra và sửa số liệu.')
         if coordinates.dt.tz is not None:raise ValueError('Dùng giờ địa phương thống nhất, không kèm múi giờ.')
         coordinates=coordinates.astype('datetime64[ns]')
     else:
@@ -131,7 +139,9 @@ def prepare_series(df,key):
         coordinates=pd.to_numeric(df[axis],errors='raise') if axis in df else pd.Series(np.arange(1,len(df)+1),index=df.index)
         if not np.all(np.isfinite(coordinates)) or np.any(coordinates<1) or np.any(coordinates!=np.floor(coordinates)) or coordinates.duplicated().any():
             raise ValueError('Buoc phải là số nguyên dương, không trùng.')
-    return pd.DataFrame({axis:coordinates,key:values}).sort_values(axis).reset_index(drop=True)
+    result=pd.DataFrame({axis:coordinates,key:values}).sort_values(axis).reset_index(drop=True)
+    result.attrs['import_notes']=import_notes
+    return result
 
 
 def series_axis(data):
@@ -689,8 +699,9 @@ class NAMDesktopApp:
                 self.input_series={};self.rain_stations={};self._is_demo=False
                 for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
             self.input_series[key]=prepared
-            self.series_labels[key].config(text=f'{os.path.basename(path)} — {len(prepared)} dòng',foreground='blue')
+            self.series_labels[key].config(text=f'{os.path.basename(path)} — {len(prepared)} dòng'+(' (có Q thiếu ngày bị loại)' if prepared.attrs.get('import_notes') else ''),foreground='blue')
             self._refresh_inputs()
+            if prepared.attrs.get('import_notes'):messagebox.showwarning('Dòng không đủ ngày giờ','\n'.join(prepared.attrs['import_notes'])+'\nCác dòng này không được ghép hoặc dùng tính NSE. Hãy kiểm tra ngày trong tệp gốc.')
         except Exception as exc:messagebox.showerror('Nhập '+SERIES_NAMES[key],str(exc))
 
     def _refresh_inputs(self):
@@ -853,6 +864,7 @@ class NAMDesktopApp:
             out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
             out['DienTich_km2']=settings['area'];out['BuocGio']=dt
             out['TruLuongDau_mm']=res['Initial_storage_mm']
+            out['GhiChuNhapQ']='; '.join(self.input_series.get('Q_ThucDo_m3s',pd.DataFrame()).attrs.get('import_notes',[]))
             for i,(name,item) in enumerate(self.rain_stations.items(),1):
                 out[f'Tram_{i}_Ten']=name;out[f'Tram_{i}_TrongSo']=item['weight']
                 out[f'Tram_{i}_Mua_mm']=item['data'].set_index(series_axis(item['data']))['Mua_mm'].reindex(out[series_axis(item['data'])]).to_numpy()
