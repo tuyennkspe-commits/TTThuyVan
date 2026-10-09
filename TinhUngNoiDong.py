@@ -232,6 +232,103 @@ def calculate_inland(design,locations,b1,b2,c,ratio,scenario,minimum_days=1):
             summary.append(dict(location=place['location'],p=p,Hi=place['Hi'],deltaH=governing['deltaH'],Hp=hp,days=governing['duration']/1440,scenario=governing['scenario'],ground=place['ground'],depth=None if place['ground'] is None else max(hp-place['ground'],0)))
     return details,summary,notes
 
+class DataGrid(ttk.Frame):
+    """Bảng biên tập: giữ chuỗi gốc, chỉ làm tròn lớp hiển thị."""
+    def __init__(self,parent):
+        super().__init__(parent);self.pack(fill='both',expand=True,pady=6)
+        self.header=[];self.rows=[];self.editor=None
+        bar=ttk.Frame(self);bar.grid(row=0,column=0,sticky='ew')
+        for title,command in [('Thêm hàng',self.add_row),('Xóa hàng chọn',self.remove_rows),('Dán từ Excel',self.paste),('Sao chép bảng',self.copy),('Thêm thời đoạn',self.add_column)]:
+            button=ttk.Button(bar,text=title,command=command);button.pack(side='left',padx=3,pady=3)
+            if title=='Thêm thời đoạn':self.column_button=button
+        ttk.Label(bar,text='Nhấp đúp để sửa ô · Enter: lưu · Esc: hủy').pack(side='right',padx=8)
+        self.tree=ttk.Treeview(self,show='headings',selectmode='extended');self.tree.grid(row=1,column=0,sticky='nsew')
+        self.tree.tag_configure('even',background='#f0f7fa');self.tree.tag_configure('odd',background='white')
+        y=ttk.Scrollbar(self,command=self.tree.yview);y.grid(row=1,column=1,sticky='ns');x=ttk.Scrollbar(self,orient='horizontal',command=self.tree.xview);x.grid(row=2,column=0,sticky='ew')
+        self.tree.configure(yscrollcommand=y.set,xscrollcommand=x.set);self.rowconfigure(1,weight=1);self.columnconfigure(0,weight=1)
+        self.tree.bind('<Double-1>',self.edit);self.tree.bind('<Control-v>',lambda e:self.paste());self.tree.bind('<Control-c>',lambda e:self.copy())
+    def title(self,key):
+        names={'Nam':'Năm','Vi_tri':'Vị trí','Hi_m':'Cao độ điều tra Hi (m)','Nam_dieu_tra':'Năm điều tra','Z_dat_m':'Cao độ đất (m)','Phut':'Thời đoạn (phút)','P_pct':'Tần suất P (%)','X_toan_mm':'Mưa toàn chuỗi (mm)','X_coso_mm':'Mưa cơ sở (mm)','Xi_mm':'Mưa năm điều tra (mm)','Tang_KB1_pct':'Thay đổi KB1 (%)','Tang_KB2_pct':'Thay đổi KB2 (%)','Tang_giua_pct':'Thay đổi KB1 (%)','Tang_cuoi_pct':'Thay đổi KB2 (%)'}
+        if key in names:return names[key]
+        try:
+            minutes=float(key);return f'Mưa {minutes/1440:g} ngày (mm)' if minutes>=1440 and minutes%1440==0 else f'Mưa {minutes:g} phút (mm)'
+        except ValueError:return key
+    def display(self,value,column):
+        if value=='':return ''
+        if self.header[column] in ('Nam','Nam_dieu_tra','Vi_tri'):return value
+        try:return f'{num(value):.3f}'
+        except ValueError:return value
+    def refresh(self):
+        if self.header and self.header[0]=='Nam':self.column_button.pack(side='left',padx=3,pady=3)
+        else:self.column_button.pack_forget()
+        self.tree.delete(*self.tree.get_children());columns=[str(i) for i in range(len(self.header))];self.tree.configure(columns=columns)
+        for i,key in enumerate(self.header):
+            self.tree.heading(str(i),text=self.title(key));self.tree.column(str(i),width=max(125,min(190,len(self.title(key))*7)),anchor='center')
+        for i,row in enumerate(self.rows):self.tree.insert('','end',iid=str(i),values=[self.display(v,j) for j,v in enumerate(row)],tags=('even' if i%2==0 else 'odd',))
+    def commit(self):
+        if self.editor:
+            widget,row,column=self.editor;value=widget.get().strip();self.editor=None;widget.destroy();self.rows[row][column]=value;self.refresh()
+    def edit(self,event):
+        self.commit();item=self.tree.identify_row(event.y);column=self.tree.identify_column(event.x)
+        if not item or not column:return
+        j=int(column[1:])-1;box=self.tree.bbox(item,column)
+        if not box:return
+        widget=ttk.Entry(self.tree);widget.insert(0,self.rows[int(item)][j]);widget.place(x=box[0],y=box[1],width=box[2],height=box[3]);widget.select_range(0,'end');widget.focus_set();self.editor=(widget,int(item),j)
+        widget.bind('<Return>',lambda e:self.commit());widget.bind('<FocusOut>',lambda e:self.commit());widget.bind('<Escape>',lambda e:self.cancel())
+    def cancel(self):
+        if self.editor:
+            widget,_,_=self.editor;self.editor=None;widget.destroy()
+    def snapshot(self):
+        rows=[row.copy() for row in self.rows]
+        if self.editor:
+            widget,row,column=self.editor;rows[row][column]=widget.get().strip()
+        out=io.StringIO();writer=csv.writer(out,delimiter=';',lineterminator='\n');writer.writerow(self.header);writer.writerows(rows);return out.getvalue()
+    def get(self,*args):
+        self.commit();return self.snapshot()
+    def delete(self,*args):self.cancel();self.header=[];self.rows=[];self.refresh()
+    def insert(self,index,text):
+        self.cancel();lines=[line for line in text.strip().splitlines() if line.strip()]
+        if not lines:return
+        delimiter=';' if ';' in lines[0] else '\t' if '\t' in lines[0] else ','
+        rows=list(csv.reader(lines,delimiter=delimiter));size=len(rows[0])
+        if any(len(row)!=size for row in rows):raise ValueError('Các hàng không có cùng số cột.')
+        self.header=rows[0];self.rows=rows[1:];self.refresh()
+    def add_row(self):
+        self.commit()
+        if not self.header:return
+        self.rows.append(['']*len(self.header));self.refresh();self.tree.see(str(len(self.rows)-1))
+    def remove_rows(self):
+        selected=[int(item) for item in self.tree.selection()];self.commit()
+        for i in sorted(selected,reverse=True):del self.rows[i]
+        self.refresh()
+    def copy(self):
+        self.commit();chosen=self.tree.selection();rows=[self.rows[int(i)] for i in chosen] if chosen else self.rows
+        out=io.StringIO();writer=csv.writer(out,delimiter='\t',lineterminator='\n');writer.writerow(self.header);writer.writerows(rows)
+        self.clipboard_clear();self.clipboard_append(out.getvalue())
+    def paste(self):
+        self.commit()
+        try:
+            text=self.clipboard_get();lines=text.strip('\r\n').splitlines()
+            if not lines:return
+            delimiter='\t' if '\t' in lines[0] else ';' if ';' in lines[0] else ',';rows=list(csv.reader(lines,delimiter=delimiter))
+            if rows[0]==self.header:rows=rows[1:]
+            if any(len(row)!=len(self.header) for row in rows):raise ValueError(f'Dán đủ {len(self.header)} cột; có thể kèm tiêu đề giống mẫu.')
+            self.rows.extend(rows);self.refresh()
+        except (ValueError,tk.TclError) as e:messagebox.showerror('Dán bảng',str(e))
+    def add_column(self):
+        self.commit()
+        if not self.header or self.header[0]!='Nam':messagebox.showinfo('Thời đoạn','Chỉ thêm cột thời đoạn ở bảng mưa theo năm.');return
+        from tkinter import simpledialog
+        value=simpledialog.askstring('Thêm thời đoạn','Thời đoạn mới (phút):',parent=self)
+        if value is None:return
+        try:
+            duration=num(value,'Thời đoạn')
+            if duration<=0 or any(abs(num(v)-duration)<1e-9 for v in self.header[1:]):raise ValueError('Thời đoạn phải dương và chưa có trong bảng.')
+            self.header.append(f'{duration:g}')
+            for row in self.rows:row.append('')
+            self.refresh()
+        except ValueError as e:messagebox.showerror('Thời đoạn',str(e))
+
 class InlandApp:
     def __init__(self,root):
         self.root=root;root.title('Thủy văn tuyến đường — mưa thiết kế và úng nội đồng');root.geometry('1280x920');root.minsize(1050,740)
@@ -253,9 +350,7 @@ class InlandApp:
     def tab(self,title):
         frame=ttk.Frame(self.book,padding=12);self.book.add(frame,text=title);return frame
     def text(self,parent,height=15):
-        frame=ttk.Frame(parent);frame.pack(fill='both',expand=True,pady=6)
-        widget=tk.Text(frame,height=height,wrap='none',font=('Consolas',10));widget.grid(row=0,column=0,sticky='nsew');frame.rowconfigure(0,weight=1);frame.columnconfigure(0,weight=1)
-        y=ttk.Scrollbar(frame,command=widget.yview);y.grid(row=0,column=1,sticky='ns');x=ttk.Scrollbar(frame,orient='horizontal',command=widget.xview);x.grid(row=1,column=0,sticky='ew');widget.configure(yscrollcommand=y.set,xscrollcommand=x.set);return widget
+        return DataGrid(parent)
     def put(self,widget,value):widget.delete('1.0','end');widget.insert('1.0',value)
     def build_rain(self):
         ttk.Label(self.rain_tab,text='Mỗi hàng là một năm; cột thời đoạn dùng PHÚT; giá trị là lượng mưa cực đại năm (mm). Không tự biến mưa ngày thành mưa 5–60 phút.',wraplength=1150).pack(anchor='w')
@@ -269,7 +364,7 @@ class InlandApp:
         ttk.Button(self.rain_tab,text='Phân tích tần suất → tạo bảng mưa thiết kế',command=self.fit).pack(anchor='e',pady=8)
         ttk.Label(self.rain_tab,text='Phương pháp mômen: độ lệch chuẩn mẫu n−1, Cs mẫu hiệu chỉnh scipy. Cs nhập tay áp dụng cho các chuỗi; muốn dùng hệ số riêng từng thời đoạn, nhập bảng mưa đã kiểm chứng ở bước 2.').pack(anchor='w')
     def build_design(self):
-        ttk.Label(self.design_tab,text='Phut;P_pct;X_toan_mm;X_coso_mm;Xi_mm;Tang_KB1_pct;Tang_KB2_pct\nMưa khí hậu = mưa CƠ SỞ × (1 + mức thay đổi/100). Xi phải cùng năm và cùng thời đoạn với mực nước điều tra.',wraplength=1150).pack(anchor='w')
+        ttk.Label(self.design_tab,text='Nhập hoặc dán dữ liệu theo các cột bên dưới. Nhấp đúp vào ô để sửa.\nMưa khí hậu = mưa CƠ SỞ × (1 + mức thay đổi/100). Xi phải cùng năm và cùng thời đoạn với mực nước điều tra.',wraplength=1150).pack(anchor='w')
         row=ttk.Frame(self.design_tab);row.pack(fill='x',pady=8)
         ttk.Button(row,text='Nhập bảng mưa thiết kế',command=lambda:self.import_table(self.design)).pack(side='left',padx=5)
         climate=ttk.Frame(self.design_tab);climate.pack(fill='x',pady=6)
@@ -334,7 +429,7 @@ class InlandApp:
     def read_text(self,widget):return widget.get('1.0','end').strip()
     def signature(self):
         variables=(self.project,self.station,self.p,self.start,self.end,self.year,self.cs,self.method,self.scenario,self.beta1,self.beta2,self.c,self.ratio)
-        return tuple(v.get() for v in variables)+tuple(self.read_text(w) for w in (self.annual,self.design,self.locations))
+        return tuple(v.get() for v in variables)+tuple(w.snapshot().strip() for w in (self.annual,self.design,self.locations))
     def watch(self):
         if self.result is not None and self.signature()!=self._signature:
             self.result=None;self.tree_summary.delete(*self.tree_summary.get_children());self.figure.clear();self.canvas.draw();self.status.set('Dữ liệu đã thay đổi: cần tính lại trước khi xuất báo cáo.')
