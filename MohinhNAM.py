@@ -367,7 +367,9 @@ def compute_metrics(obs,sim):
 
 class NAMDesktopApp:
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, validation_params=None):
+        self.validation_mode=validation_params is not None
+        self._calibrated_params=None
         self.root = root
         self.root.title(
             "Phần mềm Thủy văn NAM - Tự động Hiệu chỉnh Thông số (Nash-Sutcliffe)"
@@ -398,6 +400,11 @@ class NAMDesktopApp:
         self._setup_style()
         self._build_ui()
         self._busy=False;self._worker_queue=queue.Queue();self._result_signature=None;self._stop_event=threading.Event()
+        if self.validation_mode:
+            self.best_params=validation_params.copy()
+            self.root.title('NAM — Kiểm định độc lập với bộ thông số cố định')
+            self.ent_split.delete(0,'end');self.ent_split.insert(0,'100');self.ent_split.config(state='readonly')
+            self.btn_edit.config(state=tk.DISABLED)
         self._update_parameter_display()
         self.root.after(300,self._watch)
 
@@ -455,6 +462,7 @@ class NAMDesktopApp:
             ('ent_warm','Khởi động (giờ):','0'),('ent_split','Hiệu chỉnh (% chuỗi sau khởi động):','70'),
             ('ent_u','Độ đầy bể mặt đầu (0–1):','0.2'),('ent_l','Độ đầy bể rễ đầu (0–1):','0.5'),
             ('ent_base','Dòng ngầm ban đầu (m³/s):','0')],2):
+            if self.validation_mode and attr=='ent_split':label='Kiểm định (% sau khởi động):'
             ttk.Label(f_basin,text=label).grid(row=row,column=0,sticky='w',padx=3,pady=2)
             entry=ttk.Entry(f_basin,width=10);entry.insert(0,default);entry.grid(row=row,column=1,padx=3)
             setattr(self,attr,entry);self.setting_entries.append(entry)
@@ -492,45 +500,47 @@ class NAMDesktopApp:
             fill=tk.X, pady=10
         )
 
+        calib_frame=ttk.Frame(left_frame)
+        if not self.validation_mode:calib_frame.pack(fill='x')
         # 3. Tự động dò thông số (Auto-Calibrate)
         lbl_sec3 = ttk.Label(
-            left_frame,
+            calib_frame,
             text="3. Hiệu chỉnh theo Nash–Sutcliffe",
             style="Header.TLabel",
         )
         lbl_sec3.pack(anchor="w", pady=(0, 5))
 
-        f_iter = ttk.Frame(left_frame)
+        f_iter = ttk.Frame(calib_frame)
         f_iter.pack(fill=tk.X, pady=2)
         ttk.Label(f_iter, text="Số thế hệ tối ưu:").pack(side=tk.LEFT)
         self.ent_maxiter = ttk.Entry(f_iter, width=6)
         self.ent_maxiter.insert(0, "20")
         self.ent_maxiter.pack(side=tk.LEFT, padx=6)
-        runs_row=ttk.Frame(left_frame);runs_row.pack(fill=tk.X,pady=2)
+        runs_row=ttk.Frame(calib_frame);runs_row.pack(fill=tk.X,pady=2)
         ttk.Label(runs_row,text='Số lần chạy hiệu chỉnh:').pack(side=tk.LEFT)
         self.ent_runs=ttk.Entry(runs_row,width=6);self.ent_runs.insert(0,'3');self.ent_runs.pack(side=tk.LEFT,padx=6)
-        ttk.Label(left_frame,text='Mỗi lần tự tìm thông số; giữ NSE cao nhất.\nSố thế hệ × số lần chạy quyết định thời gian tìm kiếm.',wraplength=350).pack(anchor='w')
+        ttk.Label(calib_frame,text='Mỗi lần tự tìm thông số; giữ NSE cao nhất.\nSố thế hệ × số lần chạy quyết định thời gian tìm kiếm.',wraplength=350).pack(anchor='w')
 
 
         self.btn_calibrate = ttk.Button(
-            left_frame,
+            calib_frame,
             text="🚀 BẮT ĐẦU DÒ THÔNG SỐ (MAX NSE)",
             style="Accent.TButton",
             command=self._start_calibration_thread,
         )
         self.btn_calibrate.pack(fill=tk.X, pady=6)
-        self.btn_stop=ttk.Button(left_frame,text="DỪNG TÍNH TOÁN",command=self._stop_calibration,state=tk.DISABLED)
+        self.btn_stop=ttk.Button(calib_frame,text="DỪNG TÍNH TOÁN",command=self._stop_calibration,state=tk.DISABLED)
         self.btn_stop.pack(fill=tk.X,pady=2)
 
-        self.progress_bar = ttk.Progressbar(left_frame, mode="indeterminate")
+        self.progress_bar = ttk.Progressbar(calib_frame, mode="indeterminate")
         self.progress_bar.pack(fill=tk.X, pady=2)
 
         self.lbl_calib_status = ttk.Label(
-            left_frame, text="Sẵn sàng", foreground="#007ACC", wraplength=350
+            calib_frame, text="Sẵn sàng", foreground="#007ACC", wraplength=350
         )
         self.lbl_calib_status.pack(anchor="w", pady=2)
 
-        ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
+        ttk.Separator(calib_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
         )
 
@@ -559,8 +569,14 @@ class NAMDesktopApp:
             lbl_v.grid(row=row, column=col + 1, sticky="w", padx=2, pady=1)
             self.param_labels[key] = lbl_v
 
-        ttk.Button(left_frame,text='Chỉnh thông số mô hình',command=self._edit_parameters).pack(fill=tk.X,pady=2)
-        ttk.Button(left_frame,text='Chạy mô phỏng',command=self._run_manual).pack(fill=tk.X,pady=2)
+        self.btn_edit=ttk.Button(left_frame,text='Chỉnh thông số mô hình',command=self._edit_parameters)
+        self.btn_edit.pack(fill=tk.X,pady=2)
+        ttk.Button(left_frame,text='Chạy kiểm định' if self.validation_mode else 'Chạy mô phỏng',command=self._run_manual).pack(fill=tk.X,pady=2)
+
+        if not self.validation_mode:
+            ttk.Button(left_frame,text='KIỂM ĐỊNH VỚI DỮ LIỆU MỚI',command=self._open_validation).pack(fill='x',pady=5)
+        else:
+            ttk.Label(left_frame,text='Nhập bộ số liệu mới để kiểm định.\nThông số được giữ nguyên, không dò lại.\nTrạng thái đầu và thời gian khởi động đặt riêng.\nNSE tính trên toàn bộ giai đoạn sau khởi động.',wraplength=350).pack(anchor='w',pady=5)
 
         # 5. Xuất kết quả
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
@@ -619,6 +635,8 @@ class NAMDesktopApp:
     # ==========================================================================
 
     def _load_synthetic_data(self):
+        if self.validation_mode:
+            messagebox.showinfo("Kiểm định","Nhập số liệu độc lập của bạn bằng các nút nhập mưa, bốc hơi và Q thực đo.");return
         """Sinh chuỗi mưa rào mẫu và lưu lượng thực đo giả lập 72 giờ."""
         n_hours = 72
         rain = np.zeros(n_hours)
@@ -706,7 +724,18 @@ class NAMDesktopApp:
             messagebox.showwarning('Dữ liệu',self.lbl_data_status.cget('text'));return
         self._recompute_and_plot()
 
+    def _open_validation(self):
+        if self._busy:
+            messagebox.showinfo("Kiểm định","Dừng hoặc hoàn tất hiệu chỉnh trước khi mở kiểm định.");return
+        if self._calibrated_params is None:
+            messagebox.showwarning("Kiểm định","Hãy hiệu chỉnh để có bộ thông số trước khi kiểm định dữ liệu mới.");return
+        window=tk.Toplevel(self.root)
+        app=NAMDesktopApp(window,validation_params=self._calibrated_params)
+        app.ent_area.delete(0,"end");app.ent_area.insert(0,str(self._calibrated_area));app.ent_area.config(state="readonly")
+        window._nam_app=app
+
     def _edit_parameters(self):
+        if self.validation_mode:return
         window=tk.Toplevel(self.root);window.title('Thông số mô hình và đơn vị')
         entries={}
         descriptions=['Dung tích mặt (mm)','Dung tích rễ (mm)','Hệ số dòng tràn (0–1)',
@@ -853,6 +882,7 @@ class NAMDesktopApp:
         ttk.Label(window,text='Có ngày giờ: ghép theo thời gian. Một cột: ghép theo thứ tự bước, cùng thời điểm bắt đầu.').pack(pady=5)
 
     def _start_calibration_thread(self):
+        if self.validation_mode:return
         if self._busy:return
         self._refresh_inputs()
         if self.df_data is None:
@@ -934,7 +964,10 @@ class NAMDesktopApp:
         _,signature,params,nse,success,reason=result
         if signature!=self._signature():
             self.lbl_calib_status.config(text='Đầu vào đã thay đổi: bỏ kết quả hiệu chỉnh cũ.');return
-        self.best_params=params;self._update_parameter_display();self._recompute_and_plot()
+        self.best_params=params
+        if np.isfinite(nse):
+            self._calibrated_params=params.copy();self._calibrated_area=self._settings()[0]
+        self._update_parameter_display();self._recompute_and_plot()
         self.lbl_calib_status.config(text=f'NSE hiệu chỉnh = {nse:.3f}; '+reason,foreground='green' if success else '#b05b00')
 
     def _recompute_and_plot(self):
@@ -947,6 +980,8 @@ class NAMDesktopApp:
             df=merge_series(self.input_series,dt,*self._period()) if self.input_series else validate_data(self.df_data,dt)
             if warm>=len(df):raise ValueError('Thời gian khởi động phải ngắn hơn chuỗi dữ liệu.')
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();q_obs=df['Q_ThucDo_m3s'].to_numpy()
+            if self.validation_mode and not np.isfinite(compute_nse(q_obs[warm:],np.zeros(len(q_obs)-warm))):
+                raise ValueError('Kiểm định cần ít nhất 2 Q thực đo sau khởi động và phương sai khác 0.')
             res=run_nam(self.best_params,area,rain,pet,dt,initial)
         except Exception as exc:messagebox.showerror('Mô phỏng',str(exc));return
         self.current_sim=res;self._result_signature=self._signature()
@@ -956,6 +991,7 @@ class NAMDesktopApp:
         metric=compute_metrics(q_obs[warm:],q_sim[warm:])
         fmt=lambda v:f'{v:.3f}' if np.isfinite(v) else 'không xác định'
         self.lbl_metric_nse.config(text=f'NSE hiệu chỉnh: {fmt(train["nse"])} | kiểm định: {fmt(validation["nse"])}')
+        if self.validation_mode:self.lbl_metric_nse.config(text=f'NSE kiểm định độc lập: {fmt(metric["nse"])} — {metric["n"]} điểm thực đo')
         self.lbl_metric_peak.config(text=f'Đỉnh Q đo/mô phỏng: {fmt(metric["observed_peak"])}/{fmt(metric["simulated_peak"])} m³/s')
         self.lbl_metric_pbias.config(text=f'PBIAS (đo−mô phỏng): {fmt(metric["pbias"])}%')
         self.lbl_calib_status.config(text=f'Sai số cân bằng lớn nhất: {np.max(np.abs(res["Balance_error_mm"])):.2e} mm; loại {warm} bước khởi động.')
@@ -993,7 +1029,7 @@ class NAMDesktopApp:
             out['Gio']=np.arange(len(out))*dt
             for column,key in [('Q_MoPhong_m3s','Q_sim'),('Q_TranMat_m3s','Q_surf'),('Q_SatMat_m3s','Q_inter'),('Q_Ngam_m3s','Q_base'),('BocHoiThuc_mm','Evap_actual_mm'),('TruLuong_mm','Storage_mm'),('SaiSoCanBang_mm','Balance_error_mm')]:out[column]=res[key]
             end=settings['warm']+int((len(out)-settings['warm'])*settings['split'])
-            out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
+            out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Kiem_dinh_doc_lap' if self.validation_mode else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
             out['DienTich_km2']=settings['area'];out['BuocGio']=dt
             out['TruLuongDau_mm']=res['Initial_storage_mm']
             out['BatDauYeuCau'],out['KetThucYeuCau']=self._period()
