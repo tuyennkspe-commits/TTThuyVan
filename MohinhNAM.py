@@ -2,7 +2,7 @@
 PHẦN MỀM THỦY VĂN NAM DESKTOP - CHẠY TRỰC TIẾP TRÊN MÁY TÍNH
 NAM khái niệm: không tuyết/tưới; điều tiết tuyến tính CK_12 cố định.
 Không khẳng định tương đương bộ giải MIKE NAM của DHI.
-Cài đặt: python -m pip install numpy pandas scipy matplotlib
+Cài đặt: python -m pip install numpy pandas scipy matplotlib openpyxl
 P/PET tổng mm mỗi bước; Q trung bình bước m³/s. Hiệu chỉnh cần kiểm định độc lập.
 """
 
@@ -10,7 +10,7 @@ import os
 import threading
 import queue
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
 from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg,
     NavigationToolbar2Tk,
@@ -78,9 +78,56 @@ def validate_data(df, dt_hours):
         raise ValueError('Lưu lượng thực đo không được âm hoặc vô hạn; có thể để trống.')
     if 'ThoiGian' in df:
         times=pd.to_datetime(df['ThoiGian'],errors='raise')
-        if times.isna().any() or not np.allclose(np.diff(times.astype('int64'))/3.6e12,dt_hours,rtol=0,atol=1e-6):
+        if times.isna().any() or not np.allclose(times.diff().dropna().dt.total_seconds().to_numpy()/3600,dt_hours,rtol=0,atol=1e-6):
             raise ValueError('ThoiGian phải tăng đều đúng bước tính; không chấp nhận ngày thiếu/trùng.')
     return df
+
+
+SERIES_NAMES={'Mua_mm':'Mưa (mm/bước)','BocHoi_mm':'Bốc hơi tiềm năng (mm/bước)','Q_ThucDo_m3s':'Lưu lượng thực đo (m³/s)'}
+
+
+def prepare_series(df,key):
+    """Một tệp cho một đại lượng: ThoiGian + cột giá trị."""
+    df=df.copy();df.columns=[str(c).strip() for c in df.columns]
+    if 'ThoiGian' not in df:raise ValueError('Cần cột ThoiGian, ví dụ 2026-01-01 01:00. Mỗi dòng ứng với cuối một bước tính.')
+    value_col=key if key in df else 'GiaTri' if 'GiaTri' in df else None
+    if value_col is None:raise ValueError(f'Cần cột {key} hoặc GiaTri; mỗi tệp chỉ nhập một đại lượng.')
+    times=pd.to_datetime(df['ThoiGian'],errors='raise')
+    if times.isna().any() or times.duplicated().any():raise ValueError('Thời gian bị thiếu hoặc trùng.')
+    if times.dt.tz is not None:raise ValueError('Dùng giờ địa phương thống nhất, không kèm múi giờ trong cột ThoiGian.')
+    values=pd.to_numeric(df[value_col],errors='raise')
+    if np.isinf(values).any() or (values.dropna()<0).any():raise ValueError('Giá trị phải không âm và không vô hạn.')
+    if key!='Q_ThucDo_m3s' and values.isna().any():raise ValueError('Không được thiếu mưa/bốc hơi; không tự thay bằng 0.')
+    if len(df)<1:raise ValueError('Tệp không có số liệu.')
+    return pd.DataFrame({'ThoiGian':times,key:values}).sort_values('ThoiGian').reset_index(drop=True)
+
+
+def weighted_rainfall(stations):
+    if not stations:raise ValueError('Chưa nhập trạm mưa.')
+    weights=[finite_number(v['weight'],'Trọng số') for v in stations.values()]
+    if any(w<0 or w>1 for w in weights) or not np.isclose(sum(weights),1,rtol=0,atol=1e-8):
+        raise ValueError(f'Tổng trọng số trạm mưa phải bằng 1 (hiện tại {sum(weights):.6f}); mỗi trọng số thuộc [0;1].')
+    result=None
+    for item in stations.values():
+        if item['weight']==0:continue
+        series=item['data'].set_index('ThoiGian')['Mua_mm']
+        if result is None:result=series*item['weight']
+        else:
+            if not series.index.equals(result.index):raise ValueError('Các trạm mưa có trọng số >0 phải cùng thời gian; không tự điền mưa thiếu bằng 0.')
+            result=result+series*item['weight']
+    return result.rename('Mua_mm').reset_index()
+
+
+def merge_series(series,dt):
+    if not all(k in series for k in ['Mua_mm','BocHoi_mm']):raise ValueError('Nhập riêng đủ chuỗi mưa và bốc hơi trước khi mô phỏng.')
+    rain=series['Mua_mm'].set_index('ThoiGian');pet=series['BocHoi_mm'].set_index('ThoiGian')
+    if not rain.index.equals(pet.index):raise ValueError('Thời gian mưa và bốc hơi chưa khớp: kiểm tra thời kỳ, bước giờ và các dòng thiếu. Không tự cắt chuỗi hoặc điền 0.')
+    df=rain.join(pet)
+    if 'Q_ThucDo_m3s' in series:
+        q=series['Q_ThucDo_m3s'].set_index('ThoiGian')
+        if not q.index.isin(df.index).all():raise ValueError('Có thời điểm Q thực đo ngoài chuỗi mưa/bốc hơi hoặc lệch bước giờ; chọn lại thời kỳ phù hợp.')
+        df=df.join(q)
+    return validate_data(df.reset_index(),dt)
 
 
 def route_linear(storage, inflow, dt, k):
@@ -199,6 +246,9 @@ class NAMDesktopApp:
 
         # Dữ liệu nội bộ
         self.df_data = None
+        self.input_series={}
+        self.rain_stations={}
+        self._is_demo=False
         self.best_params = {
             "U_max": 15.0,
             "L_max": 100.0,
@@ -274,7 +324,7 @@ class NAMDesktopApp:
             ttk.Label(f_basin,text=label).grid(row=row,column=0,sticky='w',padx=3,pady=2)
             entry=ttk.Entry(f_basin,width=10);entry.insert(0,default);entry.grid(row=row,column=1,padx=3)
             setattr(self,attr,entry);self.setting_entries.append(entry)
-        ttk.Label(left_frame,text='NAM khái niệm: CK_12 cố định; không tuyết/tưới.\nMưa/PET: tổng mm mỗi bước. Q thực đo có thể để trống.\nCSV: Mua_mm; BocHoi_mm; Q_ThucDo_m3s (tùy chọn).\nThoiGian tùy chọn để kiểm tra bước giờ.',wraplength=350).pack(anchor='w',pady=4)
+        ttk.Label(left_frame,text='NAM khái niệm: CK_12 cố định; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV hoặc Excel.\nMỗi tệp: ThoiGian + giá trị; giờ cuối bước tính.\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
         )
@@ -285,23 +335,18 @@ class NAMDesktopApp:
         )
         lbl_sec2.pack(anchor="w", pady=(0, 5))
 
-        f_data_btn = ttk.Frame(left_frame)
-        f_data_btn.pack(fill=tk.X, pady=2)
-
-        btn_load_csv = ttk.Button(
-            f_data_btn, text="📂 Nạp file CSV", command=self._on_load_csv
-        )
-        btn_load_csv.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-        btn_sample = ttk.Button(
-            f_data_btn, text="Dữ liệu giả lập", command=self._load_synthetic_data
-        )
-        btn_sample.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-        self.lbl_data_status = ttk.Label(
-            left_frame, text="Chưa nạp dữ liệu", foreground="gray"
-        )
-        self.lbl_data_status.pack(anchor="w", pady=4)
+        self.series_labels={}
+        for key,name in SERIES_NAMES.items():
+            row=ttk.Frame(left_frame);row.pack(fill=tk.X,pady=2)
+            ttk.Button(row,text='Nhập '+name,command=lambda k=key:self._import_series(k)).pack(side='left',fill='x',expand=True)
+            ttk.Button(row,text='Trạm & trọng số' if key=='Mua_mm' else 'Xem bảng',command=self._manage_rain if key=='Mua_mm' else lambda k=key:self._view_series(k)).pack(side='right',padx=2)
+            label=ttk.Label(left_frame,text='Chưa nhập',wraplength=350,foreground='gray');label.pack(anchor='w')
+            self.series_labels[key]=label
+        row=ttk.Frame(left_frame);row.pack(fill='x',pady=4)
+        ttk.Button(row,text='Bỏ Q thực đo',command=self._clear_observed).pack(side='left')
+        ttk.Button(row,text='Dữ liệu giả lập',command=self._load_synthetic_data).pack(side='right')
+        self.lbl_data_status=ttk.Label(left_frame,text='Nhập mưa và bốc hơi để mô phỏng.',wraplength=350)
+        self.lbl_data_status.pack(anchor='w',pady=4)
 
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
@@ -477,9 +522,13 @@ class NAMDesktopApp:
         self.df_data = pd.DataFrame(
             {"Mua_mm": rain, "BocHoi_mm": pet, "Q_ThucDo_m3s": q_obs}
         )
-        self.lbl_data_status.config(
-            text="DỮ LIỆU GIẢ LẬP (72 giờ), không phải quan trắc", foreground="green"
-        )
+        times=pd.date_range('2000-01-01 01:00',periods=n_hours,freq='h')
+        self.df_data.insert(0,'ThoiGian',times)
+        self.input_series={k:self.df_data[['ThoiGian',k]].copy() for k in SERIES_NAMES}
+        self.rain_stations={'Trạm giả lập':dict(data=self.input_series['Mua_mm'].copy(),weight=1.,source='Dữ liệu giả lập')}
+        self._is_demo=True
+        for key,label in self.series_labels.items():label.config(text='Giả lập: 72 bước giờ',foreground='green')
+        self.lbl_data_status.config(text='DỮ LIỆU GIẢ LẬP, không phải quan trắc',foreground='green')
         self._update_parameter_display()
         self._recompute_and_plot()
 
@@ -499,7 +548,7 @@ class NAMDesktopApp:
         return area,dt,int(np.ceil(warm/dt)),split/100,initial
 
     def _signature(self):
-        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get())+tuple(self.best_params.items())+(id(self.df_data),)
+        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get())+tuple(self.best_params.items())+(id(self.df_data),)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
 
     def _watch(self):
         if self.current_sim is not None and self._result_signature!=self._signature():
@@ -510,6 +559,9 @@ class NAMDesktopApp:
         self.root.after(300,self._watch)
 
     def _run_manual(self):
+        self._refresh_inputs()
+        if self.df_data is None:
+            messagebox.showwarning('Dữ liệu',self.lbl_data_status.cget('text'));return
         self._recompute_and_plot()
 
     def _edit_parameters(self):
@@ -531,21 +583,115 @@ class NAMDesktopApp:
         ttk.Button(window,text='Áp dụng và mô phỏng',command=save).grid(row=9,column=0,columnspan=2,pady=8)
         window.transient(self.root);window.grab_set()
 
-    def _on_load_csv(self):
-        path=filedialog.askopenfilename(title='Mưa/PET tổng mm mỗi bước; Q thực đo tùy chọn',filetypes=[('CSV','*.csv')])
+    def _import_rain_station(self):
+        path=filedialog.askopenfilename(title='Nhập mưa một trạm: ThoiGian + Mua_mm',filetypes=[('CSV / Excel','*.csv *.xlsx')])
         if not path:return
         try:
+            df=pd.read_excel(path) if path.lower().endswith('.xlsx') else pd.read_csv(path,sep=None,engine='python',encoding='utf-8-sig')
+            data=prepare_series(df,'Mua_mm')
+            name=simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
+            if name is None:return
+            name=name.strip()
+            if not name:raise ValueError('Tên trạm không được trống.')
+            if name in self.rain_stations and not self._is_demo:raise ValueError('Trạm đã có. Xóa trạm cũ trong bảng Trạm & trọng số trước khi nhập lại.')
+            weight=simpledialog.askfloat('Trọng số trạm','Trọng số từ 0 đến 1; tổng các trạm phải bằng 1:',initialvalue=1 if not self.rain_stations or self._is_demo else 0,minvalue=0,maxvalue=1,parent=self.root)
+            if weight is None:return
+            if not np.isfinite(weight):raise ValueError('Trọng số phải hữu hạn.')
+            if self._is_demo:
+                self.input_series={};self.rain_stations={};self._is_demo=False
+                for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
+            self.rain_stations[name]=dict(data=data,weight=weight,source=os.path.basename(path))
+            self._update_rain_label();self._refresh_inputs()
+        except Exception as exc:messagebox.showerror('Nhập trạm mưa',str(exc))
+
+    def _update_rain_label(self):
+        self.series_labels['Mua_mm'].config(text=f'{len(self.rain_stations)} trạm; tổng trọng số = {sum(v["weight"] for v in self.rain_stations.values()):.6f}',foreground='blue')
+
+    def _manage_rain(self):
+        window=tk.Toplevel(self.root);window.title('Trạm mưa và trọng số lưu vực');window.geometry('750x420')
+        frame=ttk.Frame(window);frame.pack(fill='both',expand=True)
+        tree=ttk.Treeview(frame,columns=('name','weight','count','source'),show='headings',selectmode='browse')
+        for col,title in [('name','Tên trạm'),('weight','Trọng số'),('count','Số dòng'),('source','Tệp nguồn')]:tree.heading(col,text=title);tree.column(col,width=150)
+        scroll=ttk.Scrollbar(frame,orient='vertical',command=tree.yview);tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right',fill='y');tree.pack(fill='both',expand=True)
+        total=ttk.Label(window);total.pack(pady=4)
+        def refresh():
+            tree.delete(*tree.get_children())
+            for i,(name,item) in enumerate(self.rain_stations.items()):tree.insert('', 'end',iid=str(i),values=(name,f'{item["weight"]:.8g}',len(item['data']),item['source']))
+            total.config(text=f'Tổng trọng số = {sum(v["weight"] for v in self.rain_stations.values()):.8g} (bắt buộc bằng 1)')
+        def selected():
+            return tree.item(tree.selection()[0],'values')[0] if tree.selection() else None
+        def edit(event=None):
+            name=selected()
+            if name is None:return
+            weight=simpledialog.askfloat('Trọng số',name+':',initialvalue=self.rain_stations[name]['weight'],minvalue=0,maxvalue=1,parent=window)
+            if weight is not None and np.isfinite(weight):
+                self.rain_stations[name]['weight']=weight;refresh();self._update_rain_label();self._refresh_inputs()
+        def delete():
+            name=selected()
+            if name is not None:del self.rain_stations[name];refresh();self._update_rain_label();self._refresh_inputs()
+        def view():
+            name=selected()
+            if name is not None:self._view_series('Mua_mm',self.rain_stations[name]['data'])
+        row=ttk.Frame(window);row.pack(fill='x',pady=5)
+        for text,command in [('Sửa trọng số',edit),('Xóa trạm',delete),('Xem mưa trạm',view),('Xem mưa bình quân',lambda:self._view_series('Mua_mm'))]:ttk.Button(row,text=text,command=command).pack(side='left',padx=3)
+        tree.bind('<Double-1>',edit);refresh()
+
+    def _import_series(self,key):
+        if key=='Mua_mm':self._import_rain_station();return
+        path=filedialog.askopenfilename(title='Nhập riêng '+SERIES_NAMES[key],filetypes=[('CSV / Excel','*.csv *.xlsx'),('CSV','*.csv'),('Excel','*.xlsx')])
+        if not path:return
+        try:
+            df=pd.read_excel(path) if path.lower().endswith('.xlsx') else pd.read_csv(path,sep=None,engine='python',encoding='utf-8-sig')
+            prepared=prepare_series(df,key)
+            if self._is_demo:
+                self.input_series={};self.rain_stations={};self._is_demo=False
+                for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
+            self.input_series[key]=prepared
+            self.series_labels[key].config(text=f'{os.path.basename(path)} — {len(prepared)} dòng',foreground='blue')
+            self._refresh_inputs()
+        except Exception as exc:messagebox.showerror('Nhập '+SERIES_NAMES[key],str(exc))
+
+    def _refresh_inputs(self):
+        self.df_data=None;self.current_sim=None;self.ax_rain.clear();self.ax_flow.clear();self.canvas.draw()
+        for label in [self.lbl_metric_nse,self.lbl_metric_peak,self.lbl_metric_pbias]:label.config(text='Chưa tính')
+        if self.rain_stations:
+            try:self.input_series['Mua_mm']=weighted_rainfall(self.rain_stations)
+            except Exception as exc:
+                self.input_series.pop('Mua_mm',None);self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
+        else:self.input_series.pop('Mua_mm',None)
+        if not all(k in self.input_series for k in ['Mua_mm','BocHoi_mm']):
+            self.lbl_data_status.config(text='Cần nhập đủ mưa và bốc hơi; Q thực đo tùy chọn.',foreground='gray');return
+        try:
             _,dt,_,_,_=self._settings()
-            df=validate_data(pd.read_csv(path,sep=None,engine='python',encoding='utf-8-sig'),dt)
-            self.df_data=df;self.current_sim=None
-            self.lbl_data_status.config(text=f'{os.path.basename(path)}: {len(df)} bước',foreground='blue')
-            self._recompute_and_plot()
-        except Exception as exc:messagebox.showerror('Nạp dữ liệu',str(exc))
+            self.df_data=merge_series(self.input_series,dt)
+            count=self.df_data['Q_ThucDo_m3s'].notna().sum()
+            self.lbl_data_status.config(text=f'Đã ghép theo thời gian: {len(self.df_data)} bước; {count} Q thực đo.',foreground='blue')
+        except Exception as exc:self.lbl_data_status.config(text=str(exc),foreground='#b00020')
+
+    def _clear_observed(self):
+        self.input_series.pop('Q_ThucDo_m3s',None)
+        self.series_labels['Q_ThucDo_m3s'].config(text='Chưa nhập (không bắt buộc)',foreground='gray')
+        self._refresh_inputs()
+
+    def _view_series(self,key,data=None):
+        if data is None and key not in self.input_series:
+            messagebox.showinfo('Bảng dữ liệu','Chưa nhập '+SERIES_NAMES[key]);return
+        window=tk.Toplevel(self.root);window.title(SERIES_NAMES[key]);window.geometry('650x450')
+        frame=ttk.Frame(window);frame.pack(fill='both',expand=True)
+        tree=ttk.Treeview(frame,columns=('time','value'),show='headings')
+        tree.heading('time',text='Thời gian (cuối bước tính)');tree.heading('value',text=SERIES_NAMES[key])
+        scroll=ttk.Scrollbar(frame,orient='vertical',command=tree.yview);tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right',fill='y');tree.pack(fill='both',expand=True)
+        for timestamp,value in (self.input_series[key] if data is None else data).itertuples(index=False,name=None):
+            tree.insert('', 'end',values=(str(timestamp),'—' if pd.isna(value) else f'{value:.3f}'))
+        ttk.Label(window,text='Ghép bằng thời gian, không ghép theo số thứ tự dòng.').pack(pady=5)
 
     def _start_calibration_thread(self):
         if self._busy:return
+        self._refresh_inputs()
         if self.df_data is None:
-            messagebox.showwarning('Dữ liệu','Nạp mưa và bốc hơi trước khi hiệu chỉnh.');return
+            messagebox.showwarning('Dữ liệu',self.lbl_data_status.cget('text'));return
         try:
             area,dt,warm,split,initial=self._settings()
             df=validate_data(self.df_data,dt)
@@ -622,7 +768,7 @@ class NAMDesktopApp:
         self.current_sim=None
         try:
             area,dt,warm,split,initial=self._settings()
-            df=validate_data(self.df_data,dt)
+            df=merge_series(self.input_series,dt) if self.input_series else validate_data(self.df_data,dt)
             if warm>=len(df):raise ValueError('Thời gian khởi động phải ngắn hơn chuỗi dữ liệu.')
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();q_obs=df['Q_ThucDo_m3s'].to_numpy()
             res=run_nam(self.best_params,area,rain,pet,dt,initial)
@@ -666,6 +812,9 @@ class NAMDesktopApp:
             out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
             out['DienTich_km2']=settings['area'];out['BuocGio']=dt
             out['TruLuongDau_mm']=res['Initial_storage_mm']
+            for i,(name,item) in enumerate(self.rain_stations.items(),1):
+                out[f'Tram_{i}_Ten']=name;out[f'Tram_{i}_TrongSo']=item['weight']
+                out[f'Tram_{i}_Mua_mm']=item['data'].set_index('ThoiGian')['Mua_mm'].reindex(pd.DatetimeIndex(out['ThoiGian'])).to_numpy()
             for key,value in settings['params'].items():out[key]=value
             for key,value in settings['initial'].items():out['BanDau_'+key]=value
             out.to_csv(path,index=False,encoding='utf-8-sig')
