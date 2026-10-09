@@ -433,6 +433,7 @@ class FullTCVNApp:
         self.rain_entries = {}
         self.cc_entries = {}
         self.ts_entries = {}
+        self.phi_hint_labels = {}
         self.phi_entries = {}
         self.ap_entries = {}
 
@@ -463,6 +464,8 @@ class FullTCVNApp:
             self.cc_entries[p_label] = ent_cc
             tk.Label(box,text='φ đã xác minh:',font=('Arial',7)).pack()
             ent_phi=tk.Entry(box,width=7,justify=tk.CENTER);ent_phi.pack();self.phi_entries[p_label]=ent_phi
+            hint=tk.Label(box,text='',font=('Arial',7),fg='#155e75',wraplength=125,justify=tk.CENTER)
+            hint.pack(pady=(2,3));self.phi_hint_labels[p_label]=hint
             tk.Label(box,text='ts (nếu cần, phút):',font=('Arial',7)).pack()
             ent_ts=tk.Entry(box,width=7,justify=tk.CENTER);ent_ts.pack();self.ts_entries[p_label]=ent_ts
             tk.Label(box,text='Ap (nếu cần):',font=('Arial',7)).pack()
@@ -498,7 +501,38 @@ class FullTCVNApp:
         tk.Button(btn_fr, text="📋 Sao chép ra Excel", font=("Arial", 9, "bold"), bg="#27ae60", fg="white", padx=10, pady=5, command=self.copy_table).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_fr, text="💾 Xuất file Excel (.xlsx)", font=("Arial", 9, "bold"), bg="#2980b9", fg="white", padx=10, pady=5, command=self.export_excel).pack(side=tk.RIGHT)
 
+        # Cập nhật gợi ý cả khi nhập tay và khi mở dự án/cập nhật Hp.
+        self._phi_hint_signature=None
+        self.refresh_phi_hints()
+        self.root.after(250,self.poll_phi_hints)
         # Chờ người dùng nhập/xác minh hệ số rồi bấm tính.
+
+    def refresh_phi_hints(self):
+        """Khoảng tham khảo A.1; không tự chọn hệ số thay người dùng."""
+        for label,hint in self.phi_hint_labels.items():
+            try:
+                soil=self.cbo_soil.get().strip().upper()
+                F=finite_number(self.txt_F.get(),'Diện tích')
+                H=finite_number(self.rain_entries[label].get(),'Hp')*finite_number(self.cc_entries[label].get(),'Hệ số biến đổi khí hậu')
+                if finite_number(self.cc_entries[label].get(),'Hệ số biến đổi khí hậu')<=0:raise ValueError('Hệ số phải dương')
+                values=phi_reference_values(soil,H,F)
+                row=min(int(np.searchsorted(SOIL_H_BOUNDS[soil],H,side='left')),len(SOIL_TABLES[soil])-1)
+                lo,hi,_,_=next(group for group in PHI_AREA_GROUPS if group[0]<=F<group[1])
+                context=f'Đất {soil}; mưa {SOIL_H_LABELS[soil][row]} mm\nF: {lo:g}–{hi:g} km²'
+                if max(values)-min(values)<1e-12:
+                    text=f'φ = {values[0]:.3f} (tự tra)\n'+context
+                else:
+                    text=f'Gợi ý φ: {min(values):.3f}–{max(values):.3f}\n'+context+'\nBạn chọn và nhập φ'
+                hint.configure(text=text,fg='#155e75')
+            except (ValueError,KeyError,StopIteration):
+                hint.configure(text='Nhập F, cấp đất, Hp\nvà hệ số khí hậu hợp lệ\nđể xem khoảng φ',fg='#8b4513')
+
+    def poll_phi_hints(self):
+        signature=(self.txt_F.get(),self.cbo_soil.get())+tuple(entry.get() for entry in self.rain_entries.values())+tuple(entry.get() for entry in self.cc_entries.values())
+        if signature!=self._phi_hint_signature:
+            self._phi_hint_signature=signature
+            self.refresh_phi_hints()
+        self.root.after(250,self.poll_phi_hints)
 
     # --- TÍNH NĂNG LƯU VÀ MỞ DỰ ÁN (SAVE / OPEN) ---
     def save_project(self):
@@ -897,6 +931,7 @@ class FullTCVNApp:
 
     # --- TÍNH TOÁN LŨ Qp ---
     def calculate_all(self):
+        self.refresh_phi_hints()
         self.tree.delete(*self.tree.get_children())
         self.calc_results=[];self._result_signature=None
         try:
