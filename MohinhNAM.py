@@ -155,7 +155,11 @@ def select_period(data,start='',end=''):
     if axis=='ThoiGian':
         def bound(text,is_end):
             if not str(text).strip():return None
-            value=pd.Timestamp(str(text).strip())
+            text=str(text).strip()
+            if '/' in text:
+                try:value=pd.Timestamp(datetime.strptime(text,'%d/%m/%Y %H:%M:%S' if len(text)>10 else '%d/%m/%Y'))
+                except ValueError:raise ValueError('Nhập ngày theo dd/mm/yyyy hh:mm:ss, ví dụ 01/10/1996 01:00:00.') from None
+            else:value=pd.Timestamp(text)
             if pd.isna(value) or value.tzinfo is not None:raise ValueError('Ngày giới hạn không hợp lệ hoặc có múi giờ.')
             if is_end and len(str(text).strip())==10:value+=pd.Timedelta(days=1)-pd.Timedelta(nanoseconds=1)
             return value
@@ -190,7 +194,7 @@ def detect_common_period(stations,inputs,dt):
     cuts=np.r_[0,np.flatnonzero(~np.isclose(gaps,expected,rtol=0,atol=1e-6))+1,len(common)]
     lengths=np.diff(cuts);chosen=int(np.argmax(lengths));lo,hi=cuts[chosen],cuts[chosen+1]
     if hi-lo<2:raise ValueError('Các thời điểm chung không liên tục theo bước tính đã nhập.')
-    fmt=lambda x:x.strftime('%Y-%m-%d %H:%M:%S') if axis=='ThoiGian' else str(int(x))
+    fmt=lambda x:x.strftime('%d/%m/%Y %H:%M:%S') if axis=='ThoiGian' else str(int(x))
     return fmt(common[lo]),fmt(common[hi-1]),len(lengths),int(hi-lo)
 
 
@@ -439,7 +443,7 @@ class NAMDesktopApp:
             ttk.Label(row,text=label).pack(side='left')
             entry=ttk.Entry(row,width=24);entry.pack(side='right');setattr(self,attr,entry);self.setting_entries.append(entry)
         ttk.Checkbutton(left_frame,text='Tự nhận khoảng đủ mưa, bốc hơi và Q',variable=self.auto_period,command=self._refresh_inputs).pack(anchor='w')
-        ttk.Label(left_frame,text='Có ngày giờ: YYYY-MM-DD [HH:MM].\nChuỗi một cột: nhập số bước đầu/cuối.\nCó khoảng đứt đoạn: chọn đoạn đủ dữ liệu dài nhất.\nBỏ chọn tự nhận để sửa khoảng bằng tay.',wraplength=350).pack(anchor='w')
+        ttk.Label(left_frame,text='Có ngày giờ: dd/mm/yyyy hh:mm:ss.\nChuỗi một cột: nhập số bước đầu/cuối.\nCó khoảng đứt đoạn: chọn đoạn đủ dữ liệu dài nhất.\nBỏ chọn tự nhận để sửa khoảng bằng tay.',wraplength=350).pack(anchor='w')
         ttk.Label(left_frame,text='NAM khái niệm: CK_12 cố định; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV hoặc Excel.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
