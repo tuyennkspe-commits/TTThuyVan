@@ -131,7 +131,7 @@ class FlowMasterApp:
 
         self.tabControl = ttk.Notebook(root)
         self.tab_irreg = ttk.Frame(self.tabControl)
-        
+
         self.tabControl.add(self.tab_irreg, text='Kênh hở — mặt cắt tự nhiên hoặc hình học')
         self.tabControl.pack(expand=1, fill="both")
 
@@ -159,7 +159,7 @@ class FlowMasterApp:
                 "mode":self.mode.get(),"stage":self.stage_entry.get(),"walls":self.walls.get()
             }
             filepath = filedialog.asksaveasfilename(
-                defaultextension=".fm", 
+                defaultextension=".fm",
                 filetypes=[("FlowMaster Files", "*.fm"), ("JSON Files", "*.json")],
                 title="Lưu file dự án"
             )
@@ -179,12 +179,12 @@ class FlowMasterApp:
             if filepath:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                
+
                 self.irreg_n.delete(0, tk.END); self.irreg_n.insert(0, data.get("n", ""))
                 self.irreg_S.delete(0, tk.END); self.irreg_S.insert(0, data.get("S", ""))
                 self.irreg_Q.delete(0, tk.END); self.irreg_Q.insert(0, data.get("Q", ""))
                 self.text_coords.delete("1.0", tk.END); self.text_coords.insert(tk.END, data.get("coords", ""))
-                
+
                 self.mode.set(data.get("mode","Tính mực nước từ lưu lượng"))
                 self.walls.set(bool(data.get("walls",False)))
                 self.stage_entry.delete(0,tk.END);self.stage_entry.insert(0,data.get("stage",""))
@@ -215,10 +215,10 @@ class FlowMasterApp:
         self.irreg_Q.grid(row=2, column=1, padx=5)
 
         tk.Label(input_frame, text="Mặt cắt: khoảng cách X, cao độ Z (m):", bg="white").grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=(10, 0))
-        
+
         self.text_coords = tk.Text(input_frame, width=35, height=8, font=("Courier", 10))
         self.text_coords.grid(row=4, column=0, columnspan=2, padx=5, pady=5)
-        
+
         default_coords = "0\t899.35\n1.41\t898.75\n8.94\t894.48\n19.02\t894.15\n21.41\t895.42\n41.41\t899.04\n45.03\t899.35"
         self.text_coords.insert(tk.END, default_coords.replace("\\t", "\t").replace("\\n", "\n"))
 
@@ -255,14 +255,14 @@ class FlowMasterApp:
             var_lbl.grid(row=row, column=col+1, padx=2)
             tk.Label(output_frame, text=unit, bg="white", font=("Arial", 9)).grid(row=row, column=col+2, sticky="w", padx=2)
             self.out_vars[p_name] = var_lbl
-            
+
         self.lbl_wse = tk.Label(output_frame, text="Cao độ mặt nước (WSE): --- m", bg="white", fg="blue", font=("Arial", 11, "bold"))
         self.lbl_wse.grid(row=6, column=0, columnspan=6, pady=10)
 
         ttk.Label(self.tab_irreg,text='Manning SI: Q = A·R^(2/3)·√S/n. Một hệ số nhám, dòng chảy đều, hệ số năng lượng α = 1. Không tính nước dềnh, cống hay ống có áp.',wraplength=1150).pack(padx=15,pady=5)
         self.graph_tabs = ttk.Notebook(self.tab_irreg)
         self.graph_tabs.pack(fill="both", expand=True, padx=10, pady=5)
-        
+
         self.tab_graphs = ttk.Frame(self.graph_tabs)
         self.graph_tabs.add(self.tab_graphs, text="Quan hệ thủy lực")
         self.fig_rep = plt.Figure(figsize=(10, 4), dpi=100)
@@ -271,7 +271,7 @@ class FlowMasterApp:
         self.fig_rep.tight_layout(pad=3.0)
         self.canvas_rep = FigureCanvasTkAgg(self.fig_rep, self.tab_graphs)
         self.canvas_rep.get_tk_widget().pack(fill="both", expand=True)
-        
+
         self.tab_xs = ttk.Frame(self.graph_tabs)
         self.graph_tabs.add(self.tab_xs, text="Mặt cắt ngang")
         self.fig_xs = plt.Figure(figsize=(10, 4), dpi=100)
