@@ -45,4 +45,3 @@ Tài liệu phương pháp/phần mềm:
 - https://mattbartos.com/pysheds/dem-conditioning.html
 - https://mattbartos.com/pysheds/flow-directions.html
 - https://rasterio.readthedocs.io/en/stable/topics/reproject.html
-
