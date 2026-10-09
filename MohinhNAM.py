@@ -174,6 +174,24 @@ def select_period(data,start='',end=''):
     return result.copy()
 
 
+def infer_time_step(stations,inputs):
+    frames=[v['data'] for v in stations.values() if v['weight']>0]
+    if 'BocHoi_mm' in inputs:frames.append(inputs['BocHoi_mm'])
+    intervals=[]
+    for frame in frames:
+        if series_axis(frame)!='ThoiGian' or len(frame)<2:continue
+        times=pd.to_datetime(frame['ThoiGian']).sort_values()
+        gaps=times.diff().dropna().dt.total_seconds().to_numpy()
+        gaps=gaps[gaps>0]
+        if not len(gaps):continue
+        # Khoảng phổ biến; khi bằng số lần xuất hiện chọn khoảng nhỏ hơn.
+        unique,counts=np.unique(np.round(gaps,6),return_counts=True)
+        intervals.append(float(unique[np.argmax(counts)])/3600)
+    if not intervals:return None
+    if not np.allclose(intervals,intervals[0],rtol=0,atol=1e-6):raise ValueError('Bước số liệu giữa các trạm mưa/bốc hơi khác nhau; cần thống nhất trước khi mô phỏng.')
+    return intervals[0]
+
+
 def detect_common_period(stations,inputs,dt):
     """Chọn đoạn liên tục dài nhất có đủ cả ba yếu tố; không bắc qua lỗ hổng."""
     if not all(k in inputs for k in ['BocHoi_mm','Q_ThucDo_m3s']):return None
@@ -363,6 +381,7 @@ class NAMDesktopApp:
         self.rain_stations={}
         self._is_demo=False
         self.auto_period=tk.BooleanVar(value=True)
+        self.auto_dt=tk.BooleanVar(value=True)
         self.best_params = {
             "U_max": 15.0,
             "L_max": 100.0,
@@ -430,6 +449,7 @@ class NAMDesktopApp:
         self.ent_dt.insert(0, "1.0")
         self.ent_dt.grid(row=1, column=1, sticky="w", padx=3, pady=3)
 
+        ttk.Checkbutton(left_frame,text='Tự nhận bước thời gian từ số liệu',variable=self.auto_dt,command=self._refresh_inputs).pack(anchor='w')
         self.setting_entries=[self.ent_area,self.ent_dt]
         for row,(attr,label,default) in enumerate([
             ('ent_warm','Khởi động (giờ):','0'),('ent_split','Hiệu chỉnh (% chuỗi sau khởi động):','70'),
@@ -670,7 +690,7 @@ class NAMDesktopApp:
         return area,dt,int(np.ceil(warm/dt)),split/100,initial
 
     def _signature(self):
-        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get())+tuple(self.best_params.items())+(id(self.df_data),)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
+        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get(),self.auto_dt.get())+tuple(self.best_params.items())+(id(self.df_data),)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
 
     def _watch(self):
         if self.current_sim is not None and self._result_signature!=self._signature():
@@ -782,6 +802,12 @@ class NAMDesktopApp:
         self.df_data=None;self.current_sim=None;self.ax_rain.clear();self.ax_flow.clear();self.canvas.draw()
         for label in [self.lbl_metric_nse,self.lbl_metric_peak,self.lbl_metric_pbias]:label.config(text='Chưa tính')
         auto_note=''
+        if self.auto_dt.get():
+            try:
+                inferred=infer_time_step(self.rain_stations,self.input_series)
+                if inferred is not None:
+                    self.ent_dt.delete(0,'end');self.ent_dt.insert(0,f'{inferred:g}')
+            except Exception as exc:self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
         if self.auto_period.get():
             try:
                 detected=detect_common_period(self.rain_stations,self.input_series,finite_number(self.ent_dt.get(),'Bước tính',True))
