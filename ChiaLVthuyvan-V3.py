@@ -144,6 +144,45 @@ def _catchment_d8(directions, valid, outlet_row, outlet_col):
                 result[nr,nc]=True;stack[size]=nr*cols+nc;size+=1
     return result
 
+from heapq import heappush, heappop
+
+@njit(cache=False)
+def _fill_depressions_without_generators(elevation, valid):
+    """Eight-neighbour priority flood; no generator/count compilation dependency."""
+    filled=elevation.copy()
+    rows,cols=filled.shape
+    visited=np.zeros((rows,cols),dtype=np.bool_)
+    heap=[(0.0,0,0)]
+    heap.pop()
+    for r in range(rows):
+        for c in range(cols):
+            if not valid[r,c]: continue
+            boundary=r==0 or c==0 or r==rows-1 or c==cols-1
+            if not boundary:
+                for dr in range(-1,2):
+                    for dc in range(-1,2):
+                        if not valid[r+dr,c+dc]: boundary=True
+            if boundary:
+                visited[r,c]=True
+                heappush(heap,(filled[r,c],r,c))
+    while len(heap)>0:
+        height,r,c=heappop(heap)
+        for dr in range(-1,2):
+            for dc in range(-1,2):
+                nr,nc=r+dr,c+dc
+                if 0<=nr<rows and 0<=nc<cols and valid[nr,nc] and not visited[nr,nc]:
+                    visited[nr,nc]=True
+                    filled[nr,nc]=max(filled[nr,nc],height)
+                    heappush(heap,(filled[nr,nc],nr,nc))
+    return filled
+
+def condition_depressions(dem):
+    """Fill pits and depressions together, preserving raster metadata and NoData."""
+    elevation,valid=valid_dem(dem)
+    filled=dem.astype(np.float64)
+    filled[:]=_fill_depressions_without_generators(elevation,valid)
+    return filled
+
 def catchment_d8(fdir,valid,outlet):
     """Reverse D8 including raster rim cells; do not silently remove boundary contributors."""
     if not valid[outlet]:raise ValueError('Cửa xả nằm trên NoData.')
@@ -360,11 +399,14 @@ class GeoCatchmentApp(ctk.CTk):
 
             self.xmin, self.xmax, self.ymin, self.ymax = xmin, xmax, ymin, ymax
 
-            pits_filled = self.grid_obj.fill_pits(self.dem)
-            flooded = self.grid_obj.fill_depressions(pits_filled)
+            self.update_status("Đang xử lý hố trũng bằng Priority-Flood tương thích...")
+            flooded = condition_depressions(self.dem)
+            self.update_status("Đang xử lý vùng địa hình bằng phẳng...")
             inflated = self.grid_obj.resolve_flats(flooded)
             self.dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
+            self.update_status("Đang xác định hướng dòng chảy D8...")
             self.fdir = self.grid_obj.flowdir(inflated, dirmap=self.dirmap)
+            self.update_status("Đang tính tích lũy dòng chảy...")
             self.acc = self.grid_obj.accumulation(self.fdir, dirmap=self.dirmap)
 
             self.ax.clear()
