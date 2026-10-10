@@ -7,6 +7,7 @@ Bài tổng quan có lỗi ký hiệu; áp dụng phương trình phù hợp th�
 Không khẳng định tương đương bộ giải MIKE NAM của DHI.
 Cài đặt: python -m pip install numpy pandas scipy matplotlib openpyxl
 Tăng tốc tùy chọn: python -m pip install numba
+Đọc MIKE DFS0: python -m pip install mikeio
 P/PET tổng mm mỗi bước; Q trung bình bước m³/s. Hiệu chỉnh cần kiểm định độc lập.
 """
 
@@ -100,7 +101,53 @@ def validate_data(df, dt_hours):
 SERIES_NAMES={'Mua_mm':'Mưa (mm/bước)','BocHoi_mm':'Bốc hơi tiềm năng (mm/bước)','Q_ThucDo_m3s':'Lưu lượng thực đo (m³/s)'}
 
 
-def read_series_file(path,key):
+class ImportCancelled(Exception):
+    pass
+
+
+def read_dfs0(path,key,item_selector=None):
+    try:import mikeio
+    except ImportError:raise ValueError('Đọc DFS0 cần thư viện MIKE IO. Cài bằng: python -m pip install mikeio') from None
+    source=mikeio.open(path);items=source.items
+    if not items:raise ValueError('DFS0 không có mục dữ liệu.')
+    index=0
+    if len(items)>1:
+        if item_selector is None:raise ValueError('DFS0 có nhiều mục; cần chọn chuỗi muốn nhập.')
+        index=item_selector(items)
+        if index is None:raise ImportCancelled()
+        if not isinstance(index,int) or not 0<=index<len(items):raise ValueError('Mục DFS0 không hợp lệ.')
+    data=source.read(items=[index]);item=items[index]
+    times=pd.DatetimeIndex(data.time)
+    values=np.asarray(data[0].to_numpy(),dtype=float)
+    if values.ndim!=1:raise ValueError('DFS0 phải là chuỗi thời gian một chiều.')
+    unit=item.unit.name;kind=item.data_value_type.name
+    if kind in ['Accumulated','MeanStepForward']:
+        raise ValueError(f'{item.name}: kiểu {kind} chưa phù hợp dữ liệu mỗi bước; chuyển sang StepAccumulated hoặc MeanStepBackward trong MIKE trước khi nhập.')
+    notes=[f'DFS0: {item.name}; đơn vị {item.unit}; kiểu {kind}.']
+    if key=='Q_ThucDo_m3s':
+        factors={'meter_pow_3_per_sec':1.,'meter_pow_3_per_min':1/60,'meter_pow_3_per_hour':1/3600,'meter_pow_3_per_day':1/86400,'liter_per_sec':.001,'liter_per_minute':.001/60,'feet_pow_3_per_sec':.028316846592}
+        if unit not in factors:raise ValueError(f'Đơn vị {item.unit} không phù hợp lưu lượng. Chọn mục lưu lượng (m³/s).')
+        if kind=='StepAccumulated':raise ValueError('Lưu lượng phải là tốc độ m³/s hoặc trung bình bước, không phải tổng tích lũy.')
+        values=values*factors[unit]
+    else:
+        depth={'millimeter':1.,'centimeter':10.,'meter':1000.,'inch':25.4,'feet':304.8}
+        rate={'mm_per_sec':3600.,'mm_per_hour':1.,'mm_per_day':1/24,'millimeter_per_day':1/24,'cm_per_hour':10.,'meter_per_sec':3600000.,'meter_per_day':1000/24,'inch_per_hour':25.4,'inch_per_day':25.4/24}
+        if unit in depth:values=values*depth[unit]
+        elif unit in rate:
+            if len(times)<2:raise ValueError('DFS0 tốc độ mưa/bốc hơi cần ít nhất 2 thời điểm để xác định bước.')
+            hours=times.to_series().diff().dropna().dt.total_seconds().to_numpy()/3600
+            if np.any(hours<=0) or not np.allclose(hours,hours[0],rtol=0,atol=1e-6):raise ValueError('DFS0 tốc độ mưa/bốc hơi cần bước thời gian đều.')
+            if kind=='StepAccumulated':raise ValueError('Kiểu StepAccumulated phải dùng đơn vị lớp nước, không phải tốc độ.')
+            values=values*rate[unit]*hours[0]
+            notes.append(f'Đổi tốc độ sang tổng mm mỗi bước {hours[0]:g} giờ; giá trị đại diện cho bước kết thúc tại thời điểm ghi.')
+        else:raise ValueError(f'Đơn vị {item.unit} không phù hợp mưa/bốc hơi; chọn lớp nước mm hoặc tốc độ mưa.')
+    result=pd.DataFrame({'ThoiGian':times,key:values})
+    result.attrs['dfs_notes']=notes
+    return result
+
+
+def read_series_file(path,key,item_selector=None):
+    if path.lower().endswith(".dfs0"):return read_dfs0(path,key,item_selector)
     if path.lower().endswith('.xlsx'):
         raw=pd.read_excel(path,header=None)
     else:
@@ -132,7 +179,7 @@ def prepare_series(df,key):
     if np.isinf(values).any() or (values.dropna()<0).any():raise ValueError('Giá trị phải không âm và không vô hạn.')
     if key!='Q_ThucDo_m3s' and values.isna().any():raise ValueError('Không được thiếu mưa/bốc hơi; không tự thay bằng 0.')
     if len(df)<1:raise ValueError('Tệp không có số liệu.')
-    import_notes=[]
+    import_notes=list(df.attrs.get('dfs_notes',[]))
     if 'ThoiGian' in df:
         axis='ThoiGian';coordinates=pd.to_datetime(df[axis],errors='raise')
         missing=coordinates.isna()
@@ -614,7 +661,7 @@ class NAMDesktopApp:
             entry=ttk.Entry(row,width=24);entry.pack(side='right');setattr(self,attr,entry);self.setting_entries.append(entry)
         ttk.Checkbutton(left_frame,text='Tự nhận khoảng đủ mưa, bốc hơi và Q',variable=self.auto_period,command=self._refresh_inputs).pack(anchor='w')
         ttk.Label(left_frame,text='Có ngày giờ: dd/mm/yyyy hh:mm:ss.\nChuỗi một cột: nhập số bước đầu/cuối.\nCó khoảng đứt đoạn: chọn đoạn đủ dữ liệu dài nhất.\nBỏ chọn tự nhận để sửa khoảng bằng tay.',wraplength=350).pack(anchor='w')
-        ttk.Label(left_frame,text='NAM 9 thông số: CK dòng tràn biến đổi; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV hoặc Excel.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
+        ttk.Label(left_frame,text='NAM 9 thông số: CK dòng tràn biến đổi; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV, Excel hoặc MIKE DFS0.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
         )
@@ -905,11 +952,16 @@ class NAMDesktopApp:
         ttk.Button(window,text='Áp dụng và mô phỏng',command=save).grid(row=10,column=0,columnspan=4,pady=8)
         window.transient(self.root);window.grab_set()
 
+    def _choose_dfs_item(self,items):
+        choices='\n'.join(f'{i+1}. {item.name} — {item.unit} ({item.data_value_type.name})' for i,item in enumerate(items))
+        number=simpledialog.askinteger('Chọn chuỗi trong DFS0',choices+'\nNhập số thứ tự mục muốn dùng:',minvalue=1,maxvalue=len(items),parent=self.root)
+        return None if number is None else number-1
+
     def _import_rain_station(self):
-        path=filedialog.askopenfilename(title='Nhập mưa một trạm: giá trị hoặc ThoiGian + Mua_mm',filetypes=[('CSV / Excel','*.csv *.xlsx')])
+        path=filedialog.askopenfilename(title='Nhập mưa một trạm: giá trị hoặc ThoiGian + Mua_mm',filetypes=[('CSV / Excel / MIKE DFS0','*.csv *.xlsx *.dfs0')])
         if not path:return
         try:
-            df=read_series_file(path,'Mua_mm')
+            df=read_series_file(path,'Mua_mm',self._choose_dfs_item)
             data=prepare_series(df,'Mua_mm')
             name=simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
             if name is None:return
@@ -924,6 +976,8 @@ class NAMDesktopApp:
                 for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
             self.rain_stations[name]=dict(data=data,weight=weight,source=os.path.basename(path))
             self._update_rain_label();self._refresh_inputs()
+            if data.attrs.get('import_notes'):messagebox.showinfo('Thông tin trạm mưa','\n'.join(data.attrs['import_notes']))
+        except ImportCancelled:return
         except Exception as exc:messagebox.showerror('Nhập trạm mưa',str(exc))
 
     def _update_rain_label(self):
@@ -961,18 +1015,19 @@ class NAMDesktopApp:
 
     def _import_series(self,key):
         if key=='Mua_mm':self._import_rain_station();return
-        path=filedialog.askopenfilename(title='Nhập riêng '+SERIES_NAMES[key],filetypes=[('CSV / Excel','*.csv *.xlsx'),('CSV','*.csv'),('Excel','*.xlsx')])
+        path=filedialog.askopenfilename(title='Nhập riêng '+SERIES_NAMES[key],filetypes=[('CSV / Excel / MIKE DFS0','*.csv *.xlsx *.dfs0'),('MIKE DFS0','*.dfs0'),('Excel','*.xlsx'),('CSV','*.csv')])
         if not path:return
         try:
-            df=read_series_file(path,key)
+            df=read_series_file(path,key,self._choose_dfs_item)
             prepared=prepare_series(df,key)
             if self._is_demo:
                 self.input_series={};self.rain_stations={};self._is_demo=False
                 for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
             self.input_series[key]=prepared
-            self.series_labels[key].config(text=f'{os.path.basename(path)} — {len(prepared)} dòng'+(' (có Q thiếu ngày bị loại)' if prepared.attrs.get('import_notes') else ''),foreground='blue')
+            self.series_labels[key].config(text=f'{os.path.basename(path)} — {len(prepared)} dòng'+(' (có Q thiếu ngày bị loại)' if any('thiếu ngày giờ' in n for n in prepared.attrs.get('import_notes',[])) else ''),foreground='blue')
             self._refresh_inputs()
-            if prepared.attrs.get('import_notes'):messagebox.showwarning('Dòng không đủ ngày giờ','\n'.join(prepared.attrs['import_notes'])+'\nCác dòng này không được ghép hoặc dùng tính NSE. Hãy kiểm tra ngày trong tệp gốc.')
+            if prepared.attrs.get('import_notes'):messagebox.showinfo('Thông tin nhập dữ liệu','\n'.join(prepared.attrs['import_notes']))
+        except ImportCancelled:return
         except Exception as exc:messagebox.showerror('Nhập '+SERIES_NAMES[key],str(exc))
 
     def _period(self):
@@ -1211,9 +1266,11 @@ class NAMDesktopApp:
             out['TruLuongDau_mm']=res['Initial_storage_mm']
             out['BatDauYeuCau'],out['KetThucYeuCau']=self._period()
             out['Q_NgoaiKhoang_KhongDung']=self.df_data.attrs.get('outside_Q_count',0)
+            out['GhiChuNhapBocHoi']='; '.join(self.input_series.get('BocHoi_mm',pd.DataFrame()).attrs.get('import_notes',[]))
             out['GhiChuNhapQ']='; '.join(self.input_series.get('Q_ThucDo_m3s',pd.DataFrame()).attrs.get('import_notes',[]))
             for i,(name,item) in enumerate(self.rain_stations.items(),1):
                 out[f'Tram_{i}_Ten']=name;out[f'Tram_{i}_TrongSo']=item['weight']
+                out[f'Tram_{i}_GhiChuNhap']='; '.join(item['data'].attrs.get('import_notes',[]))
                 out[f'Tram_{i}_Mua_mm']=item['data'].set_index(series_axis(item['data']))['Mua_mm'].reindex(out[series_axis(item['data'])]).to_numpy()
             for key,value in settings['params'].items():out[key]=value
             for key,value in settings['initial'].items():out['BanDau_'+key]=value
