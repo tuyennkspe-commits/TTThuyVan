@@ -170,7 +170,7 @@ def read_series_file(path,key,item_selector=None):
     return raw.iloc[1:].reset_index(drop=True)
 
 
-def prepare_series(df,key):
+def prepare_series(df,key,rain_blanks_are_zero=False,missing_rain_run_days=None):
     """Có ThoiGian: ghép theo ngày giờ; không có: ghép theo bước 1..n."""
     df=df.copy();df.columns=[str(c).strip() for c in df.columns]
     value_col=key if key in df else 'GiaTri' if 'GiaTri' in df else df.columns[0] if len(df.columns)==1 else None
@@ -197,6 +197,30 @@ def prepare_series(df,key):
         if not np.all(np.isfinite(coordinates)) or np.any(coordinates<1) or np.any(coordinates!=np.floor(coordinates)) or coordinates.duplicated().any():
             raise ValueError('Buoc phải là số nguyên dương, không trùng.')
     result=pd.DataFrame({axis:coordinates,key:values}).sort_values(axis).reset_index(drop=True)
+    if rain_blanks_are_zero:
+        if key!='Mua_mm':raise ValueError('Quy ước ô trống là 0 chỉ áp dụng cho mưa.')
+        missing=result[key].isna().to_numpy()
+        fill=missing.copy()
+        if missing_rain_run_days is not None:
+            threshold=finite_number(missing_rain_run_days,'Ngưỡng ngày thiếu liên tục',True)
+            if axis!='ThoiGian':raise ValueError('Phân biệt theo số ngày liên tục cần chuỗi có ngày giờ.')
+            times=result[axis]
+            deltas=times.diff().dropna().dt.total_seconds().to_numpy()
+            if not len(deltas):raise ValueError('Cần ít nhất 2 thời điểm để nhận diện bước mưa.')
+            unique,counts=np.unique(deltas[deltas>0],return_counts=True)
+            step=float(unique[np.argmax(counts)])
+            starts=np.r_[True,~np.isclose(deltas,step,rtol=0,atol=1e-6)]
+            i=0
+            while i<len(missing):
+                if not missing[i]:i+=1;continue
+                j=i+1
+                while j<len(missing) and missing[j] and not starts[j]:j+=1
+                if (j-i)*step/86400>=threshold-1e-9:fill[i:j]=False
+                i=j
+        count=int(fill.sum())
+        result.loc[fill,key]=0.0
+        rule='mọi ô mưa trống là không mưa' if missing_rain_run_days is None else f'đợt mưa trống ngắn hơn {threshold:g} ngày là không mưa; đợt từ ngưỡng trở lên là thiếu số liệu'
+        import_notes.append(f'Quy ước người dùng: {rule}. Đã chuyển {count} giá trị trống thành 0 mm, giữ nguyên ngày giờ; còn {int(result[key].isna().sum())} giá trị thiếu.')
     missing_values=result[key].isna()
     if key!='Q_ThucDo_m3s' and missing_values.any():
         coordinates=result.loc[missing_values,axis]
@@ -967,6 +991,16 @@ class NAMDesktopApp:
         try:
             df=read_series_file(path,'Mua_mm',self._choose_dfs_item)
             data=prepare_series(df,'Mua_mm')
+            count=int(data['Mua_mm'].isna().sum())
+            if count:
+                choice=messagebox.askyesnocancel('Quy ước số liệu mưa trống',f'Chuỗi đã chọn có {count} giá trị mưa trống.\n\nCó: phân biệt không mưa và thiếu số liệu theo độ dài đợt trống.\nKhông: ô trống là số liệu thiếu, giữ nguyên.\nHủy: không nhập trạm này.',parent=self.root)
+                if choice is None:return
+                if choice:
+                    threshold=None
+                    if 'ThoiGian' in data:
+                        threshold=simpledialog.askfloat('Ngưỡng thiếu số liệu mưa','Đợt trống liên tục từ bao nhiêu ngày được coi là thiếu số liệu?\nĐợt ngắn hơn ngưỡng được tính là 0 mm.\nVí dụ: ngưỡng 3 ngày sẽ giữ đợt trống từ 3 ngày trở lên.',initialvalue=3,minvalue=0.000001,parent=self.root)
+                        if threshold is None:return
+                    data=prepare_series(df,'Mua_mm',rain_blanks_are_zero=True,missing_rain_run_days=threshold)
             name=simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
             if name is None:return
             name=name.strip()
