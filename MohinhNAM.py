@@ -6,6 +6,7 @@ Razad et al. (2018), JEST 13(12), tr.4211–4214.
 Bài tổng quan có lỗi ký hiệu; áp dụng phương trình phù hợp thứ nguyên.
 Không khẳng định tương đương bộ giải MIKE NAM của DHI.
 Cài đặt: python -m pip install numpy pandas scipy matplotlib openpyxl
+Tăng tốc tùy chọn: python -m pip install numba
 P/PET tổng mm mỗi bước; Q trung bình bước m³/s. Hiệu chỉnh cần kiểm định độc lập.
 """
 
@@ -26,7 +27,12 @@ from matplotlib import dates as mdates
 from matplotlib.ticker import AutoLocator, ScalarFormatter
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution
+from scipy.optimize import differential_evolution, least_squares
+try:
+    from numba import njit
+    NUMBA_AVAILABLE=True
+except ImportError:
+    NUMBA_AVAILABLE=False
 
 # ==============================================================================
 # 1. THUẬT TOÁN MÔ HÌNH BỂ CHỨA NAM VÀ ĐÁNH GIÁ CHỈ SỐ NASH
@@ -313,7 +319,90 @@ class CalibrationStopped(Exception):
     pass
 
 
-def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1., cancel_event=None):
+
+
+def _kernel_route_linear(storage, inflow, dt, k):
+    """Bể tuyến tính: trữ lượng mm, inflow mm/giờ, out tổng mm trong dt."""
+    e=np.exp(-dt/k)
+    new=storage*e+inflow*k*(-np.expm1(-dt/k))
+    out=storage+inflow*dt-new
+    return max(new,0.), max(out,0.)
+
+def _kernel_route_cascade(storage, inflow, dt, k):
+    """Nghiệm chính xác hai bể tuyến tính nối tiếp, đầu vào đều trong dt."""
+    s1,s2=storage
+    e=np.exp(-dt/k);one=-np.expm1(-dt/k)
+    a=s1*e+inflow*k*one
+    b=s2*e+s1*(dt/k)*e+inflow*(k*one-dt*e)
+    out=s1+s2+inflow*dt-a-b
+    return (max(a,0.),max(b,0.)),max(out,0.)
+
+def _kernel_overland_time_constant(flow_mm_hour,ck12):
+    """IJISET tr.665: CK=CK12 khi OF≤0.4; nếu lớn hơn, CK12(OF/0.4)^−0.4."""
+    return ck12 if flow_mm_hour<=.4 else ck12*(flow_mm_hour/.4)**(-.4)
+
+def _kernel_overland_discharge(storage_mm,ck12):
+    """Giải q=S/CK(q); bảo đảm q mm/h và trữ lượng S mm."""
+    if storage_mm<=.4*ck12:return max(storage_mm,0.)/ck12
+    return (storage_mm/(ck12*.4**.4))**(1/.6)
+
+def _kernel_route_overland(storage,inflow,dt,ck12,max_step=.25):
+    """Hai bể nối tiếp, CK chung lấy từ dòng tràn ở bể thứ hai.
+
+    Tích phân chia bước, giữ CK trong từng bước nhỏ; nghiệm tuyến tính chính
+    xác tại mỗi bước. Đây là lựa chọn bộ giải của bản Python, không tuyên bố
+    trùng bộ giải nội bộ DHI. Lượng ra tính từ cân bằng trữ lượng.
+    """
+    remaining=dt;total=0.;minimum_k=ck12;iterations=0
+    while remaining>max(1e-12,dt*1e-12):
+        flow=_kernel_overland_discharge(storage[1],ck12);k=_kernel_overland_time_constant(flow,ck12)
+        h=min(remaining,max_step,k/8)
+        storage,out=_kernel_route_cascade(storage,inflow,h,k)
+        total+=out;remaining-=h;minimum_k=min(minimum_k,k);iterations+=1
+        if iterations>100000:raise ValueError('Điều tiết cần quá nhiều bước nhỏ; kiểm tra CK12 và lượng mưa.')
+    return storage,total,minimum_k
+
+def _nam_kernel(p,rain,pet,dt,sub,U,L,surf,inter,base):
+    n=len(rain);components=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n);ck_of=np.full(n,p[3])
+    steps=int(np.ceil(dt/sub));h=dt/steps
+    for t in range(n):
+        before=U+L+sum(surf)+sum(inter)+base
+        for _ in range(steps):
+            U+=rain[t]/steps
+            eu=min(U,pet[t]/steps);U-=eu
+            el=min(L,(pet[t]/steps-eu)*L/p[1]);L-=el
+            evap[t]+=eu+el
+            moisture=L/p[1]
+            threshold=lambda x:max((moisture-x)/(1-x),0.)
+            # IF rút nước bể mặt trước khi xác định Pn, theo cân bằng Pn
+            # có trừ IF tại IJISET tr.664. U dùng để sinh IF không vượt Umax.
+            surface_available=min(U,p[0])
+            inf_flow=surface_available*(-np.expm1(-threshold(p[5])*h/p[7]));U-=inf_flow
+            excess=max(U-p[0],0.);U-=excess
+            of=p[2]*threshold(p[4])*excess
+            infiltration=excess-of;recharge=infiltration*threshold(p[6])
+            L+=infiltration-recharge
+            # Bể rễ đầy: phần thấm vượt sức chứa bổ cập ngầm, không mất nước.
+            spill=max(L-p[1],0.);L-=spill;recharge+=spill
+            surf,qo,kmin=_kernel_route_overland(surf,of/h,h,p[3])
+            ck_of[t]=min(ck_of[t],kmin)
+            inter,qi=_kernel_route_cascade(inter,inf_flow/h,h,p[3])
+            base,qb=_kernel_route_linear(base,recharge/h,h,p[8])
+            components[t]+=np.array([qo,qi,qb])
+        stores[t]=U+L+sum(surf)+sum(inter)+base
+        residual[t]=before+rain[t]-evap[t]-components[t].sum()-stores[t]
+    return components,evap,stores,residual,ck_of,U,L,surf,inter,base
+
+if NUMBA_AVAILABLE:
+    _kernel_route_linear=njit(nogil=True)(_kernel_route_linear)
+    _kernel_route_cascade=njit(nogil=True)(_kernel_route_cascade)
+    _kernel_overland_time_constant=njit(nogil=True)(_kernel_overland_time_constant)
+    _kernel_overland_discharge=njit(nogil=True)(_kernel_overland_discharge)
+    _kernel_route_overland=njit(nogil=True)(_kernel_route_overland)
+    _nam_kernel=njit(nogil=True)(_nam_kernel)
+
+
+def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1., cancel_event=None, use_acceleration=True):
     """NAM 9 thông số: dòng tràn có CK biến đổi; sát mặt CK12 tuyến tính.
 
     Không tuyên bố tương đương bộ giải MIKE NAM. P/PET là mm mỗi bước;
@@ -342,6 +431,19 @@ def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hou
     inter=(qi*p['CK_12'],)*2
     base=init['Q_base_m3s']*3.6/area*p['CK_BF']
     initial_storage=U+L+sum(surf)+sum(inter)+base
+    if use_acceleration and NUMBA_AVAILABLE:
+        vector=np.array([p[k] for k in PARAM_KEYS],dtype=np.float64)
+        blocks=[]
+        for start in range(0,len(rain),64):
+            if cancel_event is not None and cancel_event.is_set():raise CalibrationStopped()
+            result=_nam_kernel(vector,np.ascontiguousarray(rain[start:start+64]),np.ascontiguousarray(pet[start:start+64]),dt,sub,U,L,surf,inter,base)
+            blocks.append(result[:5]);U,L,surf,inter,base=result[5:]
+        components,evap,stores,residual,ck_of=[np.concatenate([block[j] for block in blocks],axis=0) for j in range(5)]
+        conv=area/(3.6*dt)
+        return dict(Q_sim=components.sum(axis=1)*conv,Q_surf=components[:,0]*conv,Q_inter=components[:,1]*conv,Q_base=components[:,2]*conv,
+                    Evap_actual_mm=evap,Storage_mm=stores,Balance_error_mm=residual,CK_overland_min_hours=ck_of,Model_version=MODEL_VERSION,
+                    Initial_storage_mm=initial_storage,Initial_state=init,
+                    Final_state=dict(U_mm=U,L_mm=L,surface_mm=surf,interflow_mm=inter,base_mm=base),Engine='Numba')
     n=len(rain);components=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n);ck_of=np.full(n,p["CK_12"])
     steps=int(np.ceil(dt/sub));h=dt/steps
     for t in range(n):
@@ -375,7 +477,7 @@ def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hou
     return dict(Q_sim=components.sum(axis=1)*conv,Q_surf=components[:,0]*conv,
                 Q_inter=components[:,1]*conv,Q_base=components[:,2]*conv,
                 Evap_actual_mm=evap,Storage_mm=stores,Balance_error_mm=residual,CK_overland_min_hours=ck_of,Model_version=MODEL_VERSION,
-                Initial_storage_mm=initial_storage,Initial_state=init,
+                Initial_storage_mm=initial_storage,Initial_state=init,Engine='Python',
                 Final_state=dict(U_mm=U,L_mm=L,surface_mm=surf,interflow_mm=inter,base_mm=base))
 
 
@@ -713,7 +815,7 @@ class NAMDesktopApp:
             "CK_IF": 40.0,
             "CK_BF": 800.0,
         }
-        res_true = run_nam(target_p, 150.0, rain, pet, 1.0)["Q_sim"]
+        res_true = run_nam(target_p, 150.0, rain, pet, 1.0,use_acceleration=NUMBA_AVAILABLE and bool(_nam_kernel.signatures))["Q_sim"]
         rng=np.random.default_rng(42)
         q_obs=np.maximum(0,res_true+rng.normal(0,res_true*.08,n_hours))
         self.ent_area.delete(0,'end');self.ent_area.insert(0,'150')
@@ -795,8 +897,8 @@ class NAMDesktopApp:
                 params={k:finite_number(e.get(),k) for k,e in entries.items()}
                 new_bounds=[tuple(finite_number(e.get(),k+' giới hạn') for e in bound_entries[k]) for k in PARAM_KEYS]
                 if any(lo>=hi for lo,hi in new_bounds):raise ValueError('Cận dưới phải nhỏ hơn cận trên.')
-                for edge in [0,1]:run_nam(dict(zip(PARAM_KEYS,[b[edge] for b in new_bounds])),1.,[0.],[0.],1.)
-                run_nam(params,1.,[0.],[0.],1.)
+                for edge in [0,1]:run_nam(dict(zip(PARAM_KEYS,[b[edge] for b in new_bounds])),1.,[0.],[0.],1.,use_acceleration=False)
+                run_nam(params,1.,[0.],[0.],1.,use_acceleration=False)
                 self.param_bounds=new_bounds
                 self.best_params=params;self._update_parameter_display();window.destroy();self._recompute_and_plot()
             except Exception as exc:messagebox.showerror('Thông số',str(exc),parent=window)
@@ -952,7 +1054,7 @@ class NAMDesktopApp:
         except Exception as exc:messagebox.showerror('Hiệu chỉnh',str(exc));return
         self._stop_event.clear();self.btn_stop.config(state=tk.NORMAL)
         self._busy=True;self.btn_calibrate.config(state=tk.DISABLED);self.progress_bar.start(10)
-        self.lbl_calib_status.config(text='Đang hiệu chỉnh; dữ liệu đầu vào đã được chụp riêng.',foreground='#D9534F')
+        self.lbl_calib_status.config(text='Đang hiệu chỉnh; lần đầu Numba cần biên dịch để tăng tốc.' if NUMBA_AVAILABLE else 'Đang hiệu chỉnh bằng Python; cài numba để tăng tốc.',foreground='#D9534F')
         threading.Thread(target=self._run_optimization_worker,args=(snapshot,),daemon=True).start()
         self.root.after(100,self._poll_worker)
 
@@ -969,9 +1071,24 @@ class NAMDesktopApp:
             bounds=snapshot[10] if len(snapshot)>10 else PARAM_BOUNDS
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();obs=df['Q_ThucDo_m3s'].to_numpy()
             best_params=current.copy();best_nse=np.nan
-            def score(params):
+            cache={};evaluations=0;cache_hits=0
+            valid=np.isfinite(obs[warm:end]);observed=obs[warm:end][valid]
+            normalizer=np.sqrt(np.sum((observed-observed.mean())**2))
+            if len(observed)<3 or not np.isfinite(normalizer) or normalizer<=0:raise ValueError('Hiệu chỉnh cần ít nhất 3 Q thực đo và phương sai khác 0.')
+            cache_limit=max(1,min(5000,16_000_000//max(8,len(observed)*8)))
+            def residuals(params):
+                nonlocal evaluations,cache_hits
+                if self._stop_event.is_set():raise CalibrationStopped()
+                key=tuple(float(params[k]) for k in PARAM_KEYS)
+                if key in cache:cache_hits+=1;return cache[key]
                 sim=run_nam(params,area,rain[:end],pet[:end],dt,initial,cancel_event=self._stop_event)['Q_sim']
-                nse=compute_nse(obs[warm:end],sim[warm:end])
+                values=(sim[warm:end][valid]-observed)/normalizer
+                if not np.all(np.isfinite(values)):raise ValueError('Mô phỏng không hữu hạn.')
+                if len(cache)>=cache_limit:cache.clear()
+                cache[key]=values;evaluations+=1
+                return values
+            def score(params):
+                values=residuals(params);nse=1-float(np.dot(values,values))
                 if not np.isfinite(nse):raise ValueError('NSE không xác định; kiểm tra chuỗi thực đo và giai đoạn đánh giá.')
                 return nse
             best_params=current.copy();best_nse=score(best_params)
@@ -993,9 +1110,15 @@ class NAMDesktopApp:
                 result=differential_evolution(objective,bounds=bounds,maxiter=maxiter,popsize=10,tol=.005,
                     seed=42+run,polish=False,x0=candidate,callback=callback)
                 converged+=int(result.success)
+            self._worker_queue.put(('progress','Tinh chỉnh cục bộ bộ thông số tốt nhất bằng NAM...'))
+            lower=np.array(bounds)[:,0];upper=np.array(bounds)[:,1]
+            def local_residual(x):
+                objective(x)
+                return residuals(dict(zip(PARAM_KEYS,x)))
+            least_squares(local_residual,np.clip([best_params[k] for k in PARAM_KEYS],lower,upper),bounds=(lower,upper),max_nfev=30,x_scale='jac',ftol=1e-6,xtol=1e-6,gtol=1e-6)
             # Không bao giờ thay bộ hiện tại bằng bộ có NSE thấp hơn.
             self._worker_queue.put(('done',signature,best_params,float(best_nse),converged==runs,
-                f'Đã chạy {runs} lần; {converged} lần đạt điều kiện hội tụ, {runs-converged} lần hết giới hạn thế hệ.'))
+                f'{evaluations} phép mô phỏng, dùng lại {cache_hits} kết quả; đã chạy {runs} lần; {converged} lần đạt điều kiện hội tụ, {runs-converged} lần hết giới hạn thế hệ.'))
         except CalibrationStopped:
             self._worker_queue.put(('done',signature,best_params,float(best_nse),False,'Đã dừng theo yêu cầu; giữ bộ tốt nhất đã đánh giá.'))
         except Exception as exc:self._worker_queue.put(('error',str(exc)))
@@ -1034,7 +1157,7 @@ class NAMDesktopApp:
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();q_obs=df['Q_ThucDo_m3s'].to_numpy()
             if self.validation_mode and not np.isfinite(compute_nse(q_obs[warm:],np.zeros(len(q_obs)-warm))):
                 raise ValueError('Kiểm định cần ít nhất 2 Q thực đo sau khởi động và phương sai khác 0.')
-            res=run_nam(self.best_params,area,rain,pet,dt,initial)
+            res=run_nam(self.best_params,area,rain,pet,dt,initial,use_acceleration=NUMBA_AVAILABLE and bool(_nam_kernel.signatures))
         except Exception as exc:messagebox.showerror('Mô phỏng',str(exc));return
         self.current_sim=res;self._result_signature=self._signature()
         self._run_settings=dict(area=area,dt=dt,warm=warm,split=split,initial=initial,params=self.best_params.copy())
@@ -1084,6 +1207,7 @@ class NAMDesktopApp:
             out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Kiem_dinh_doc_lap' if self.validation_mode else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
             out['DienTich_km2']=settings['area'];out['BuocGio']=dt
             out['PhienBanMoHinh']=MODEL_VERSION
+            out['BoTinh']=res.get('Engine','Python')
             out['TruLuongDau_mm']=res['Initial_storage_mm']
             out['BatDauYeuCau'],out['KetThucYeuCau']=self._period()
             out['Q_NgoaiKhoang_KhongDung']=self.df_data.attrs.get('outside_Q_count',0)
