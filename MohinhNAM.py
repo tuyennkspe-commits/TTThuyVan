@@ -177,7 +177,6 @@ def prepare_series(df,key):
     if value_col is None:raise ValueError(f'Cần cột {key}, GiaTri, hoặc tệp một cột giá trị. ThoiGian là tùy chọn.')
     values=pd.to_numeric(df[value_col],errors='raise')
     if np.isinf(values).any() or (values.dropna()<0).any():raise ValueError('Giá trị phải không âm và không vô hạn.')
-    if key!='Q_ThucDo_m3s' and values.isna().any():raise ValueError('Không được thiếu mưa/bốc hơi; không tự thay bằng 0.')
     if len(df)<1:raise ValueError('Tệp không có số liệu.')
     import_notes=list(df.attrs.get('dfs_notes',[]))
     if 'ThoiGian' in df:
@@ -198,6 +197,11 @@ def prepare_series(df,key):
         if not np.all(np.isfinite(coordinates)) or np.any(coordinates<1) or np.any(coordinates!=np.floor(coordinates)) or coordinates.duplicated().any():
             raise ValueError('Buoc phải là số nguyên dương, không trùng.')
     result=pd.DataFrame({axis:coordinates,key:values}).sort_values(axis).reset_index(drop=True)
+    missing_values=result[key].isna()
+    if key!='Q_ThucDo_m3s' and missing_values.any():
+        coordinates=result.loc[missing_values,axis]
+        fmt=lambda v:v.strftime('%d/%m/%Y %H:%M:%S') if axis=='ThoiGian' else str(int(v))
+        import_notes.append(f'{SERIES_NAMES[key]}: thiếu {int(missing_values.sum())}/{len(result)} giá trị, từ {fmt(coordinates.iloc[0])} đến {fmt(coordinates.iloc[-1])}. Giữ nguyên giá trị thiếu, không thay bằng 0. Khi đủ mưa, bốc hơi và Q, chế độ tự nhận khoảng sẽ chọn đoạn liên tục đủ dữ liệu; nếu chọn khoảng bằng tay, khoảng đó phải đủ mưa/bốc hơi.')
     result.attrs['import_notes']=import_notes
     return result
 
