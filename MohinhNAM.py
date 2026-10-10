@@ -258,9 +258,50 @@ def select_period(data,start='',end=''):
     return result.copy()
 
 
+def distribute_evaporation(source,rain,dt):
+    """Phân bổ đều tổng PET theo phần thời gian giao nhau, giữ tổng mm."""
+    if series_axis(source)!='ThoiGian' or series_axis(rain)!='ThoiGian':return source
+    mode=source.attrs.get('pet_mode','step_total')
+    times=pd.DatetimeIndex(source['ThoiGian']).as_unit('ns')
+    target=pd.DatetimeIndex(rain['ThoiGian']).as_unit('ns')
+    if not len(times):return source
+    if mode in ['month_total','month_daily_mean']:
+        periods=times.to_period('M')
+        if periods.duplicated().any():raise ValueError('Bốc hơi tháng có nhiều giá trị trong cùng tháng.')
+        left=periods.start_time;right=(periods+1).start_time
+    elif mode=='day_total':
+        periods=times.to_period('D')
+        if periods.duplicated().any():raise ValueError('Bốc hơi ngày có nhiều giá trị trong cùng ngày.')
+        left=periods.start_time;right=(periods+1).start_time
+    else:
+        if len(times)==1:
+            if not times.equals(target):raise ValueError('Bốc hơi tổng mỗi bước cần ít nhất 2 thời điểm để biết độ dài bước.')
+            hours=dt
+        else:
+            gaps=np.diff(times.asi8)/3.6e12
+            unique,counts=np.unique(gaps,return_counts=True);hours=float(unique[np.argmax(counts)])
+            if hours<=0:raise ValueError('Bước bốc hơi phải dương.')
+        right=times;left=times-pd.to_timedelta(hours,unit='h')
+    bounds_left=left.as_unit('ns').asi8;bounds_right=right.as_unit('ns').asi8
+    ends=target.asi8;step=pd.to_timedelta(dt,unit='h').value;starts=ends-step
+    amount=np.zeros(len(target));covered=np.zeros(len(target))
+    values=source['BocHoi_mm'].to_numpy(dtype=float)
+    for lo,hi,value in zip(bounds_left,bounds_right,values):
+        if not np.isfinite(value):continue
+        first=np.searchsorted(ends,lo,side='right');last=np.searchsorted(starts,hi,side='left')
+        overlap=np.maximum(0,np.minimum(ends[first:last],hi)-np.maximum(starts[first:last],lo)).astype(float)
+        total=value*((hi-lo)/86400e9) if mode=='month_daily_mean' else value
+        amount[first:last]+=total*overlap/(hi-lo);covered[first:last]+=overlap
+    amount[~np.isclose(covered,step,rtol=0,atol=1e3)]=np.nan
+    result=pd.DataFrame({'ThoiGian':target,'BocHoi_mm':amount})
+    result.attrs=dict(source.attrs)
+    result.attrs['import_notes']=list(source.attrs.get('import_notes',[]))+[f'Bốc hơi phân bổ đều theo giao khoảng thời gian về bước {dt:g} giờ; không ngoại suy hoặc điền số liệu thiếu.']
+    return result
+
+
 def infer_time_step(stations,inputs):
     frames=[v['data'] for v in stations.values() if v['weight']>0]
-    if 'BocHoi_mm' in inputs:frames.append(inputs['BocHoi_mm'])
+    if not frames and 'BocHoi_mm' in inputs:frames.append(inputs['BocHoi_mm'])
     intervals=[]
     for frame in frames:
         if series_axis(frame)!='ThoiGian' or len(frame)<2:continue
@@ -283,7 +324,8 @@ def detect_common_period(stations,inputs,dt):
     if not active:return None
     weights=[finite_number(v['weight'],'Trọng số') for v in stations.values()]
     if any(not 0<=w<=1 for w in weights) or not np.isclose(sum(weights),1,rtol=0,atol=1e-8):raise ValueError('Tổng trọng số trạm mưa phải bằng 1 trước khi nhận diện khoảng chung.')
-    data=[(v['data'],'Mua_mm') for v in active]+[(inputs[k],k) for k in ['BocHoi_mm','Q_ThucDo_m3s']]
+    pet=distribute_evaporation(inputs['BocHoi_mm'],active[0]['data'],dt)
+    data=[(v['data'],'Mua_mm') for v in active]+[(pet,'BocHoi_mm'),(inputs['Q_ThucDo_m3s'],'Q_ThucDo_m3s')]
     axis=series_axis(data[0][0]);common=None
     for frame,key in data:
         if series_axis(frame)!=axis:raise ValueError('Các chuỗi phải cùng kiểu ngày giờ hoặc thứ tự bước.')
@@ -323,7 +365,8 @@ def merge_series(series,dt,start='',end=''):
     if not all(k in series for k in ['Mua_mm','BocHoi_mm']):raise ValueError('Nhập đủ mưa và bốc hơi trước khi mô phỏng.')
     axis=series_axis(series['Mua_mm'])
     if any(series_axis(data)!=axis for data in series.values()):raise ValueError('Dùng cùng kiểu cho các chuỗi: tất cả có ThoiGian hoặc tất cả theo thứ tự bước. Không tự ghép hai kiểu.')
-    rain=select_period(series['Mua_mm'],start,end).set_index(axis);pet=select_period(series['BocHoi_mm'],start,end).set_index(axis)
+    selected_rain=select_period(series['Mua_mm'],start,end)
+    rain=selected_rain.set_index(axis);pet=distribute_evaporation(series['BocHoi_mm'],selected_rain,dt).set_index(axis)
     if rain.empty:raise ValueError('Không có mưa trong khoảng mô phỏng đã chọn.')
     if not rain.index.equals(pet.index):raise ValueError('Mưa/bốc hơi phải khớp ngày giờ hoặc số bước; không tự cắt chuỗi hay điền 0.')
     if axis=='Buoc' and not np.array_equal(rain.index.to_numpy(),np.arange(rain.index[0],rain.index[0]+len(rain))):
@@ -689,7 +732,7 @@ class NAMDesktopApp:
             entry=ttk.Entry(row,width=24);entry.pack(side='right');setattr(self,attr,entry);self.setting_entries.append(entry)
         ttk.Checkbutton(left_frame,text='Tự nhận khoảng đủ mưa, bốc hơi và Q',variable=self.auto_period,command=self._refresh_inputs).pack(anchor='w')
         ttk.Label(left_frame,text='Có ngày giờ: dd/mm/yyyy hh:mm:ss.\nChuỗi một cột: nhập số bước đầu/cuối.\nCó khoảng đứt đoạn: chọn đoạn đủ dữ liệu dài nhất.\nBỏ chọn tự nhận để sửa khoảng bằng tay.',wraplength=350).pack(anchor='w')
-        ttk.Label(left_frame,text='NAM 9 thông số: CK dòng tràn biến đổi; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV, Excel hoặc MIKE DFS0.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa/PET tổng mm mỗi bước; Q m³/s, tùy chọn.',wraplength=350).pack(anchor='w',pady=4)
+        ttk.Label(left_frame,text='NAM 9 thông số: CK dòng tràn biến đổi; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV, Excel hoặc MIKE DFS0.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa: tổng mm/bước; Q: m³/s, tùy chọn.\nBốc hơi: tổng tháng/ngày/bước hoặc mm/ngày của tháng; tự phân bổ đều.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
         )
@@ -1058,6 +1101,11 @@ class NAMDesktopApp:
         try:
             df=read_series_file(path,key,self._choose_dfs_item)
             prepared=prepare_series(df,key)
+            if key=='BocHoi_mm' and 'ThoiGian' in prepared:
+                mode=simpledialog.askinteger('Cách biểu diễn bốc hơi','1. Tổng mm mỗi bước, thời gian là cuối bước (giờ/ngày/chu kỳ đều).\n2. Tổng mm/tháng, ngày ghi thuộc tháng tương ứng.\n3. Trung bình mm/ngày của tháng.\n4. Tổng mm/ngày, ngày ghi là ngày tương ứng.\nChọn cách biểu diễn trong tệp:',minvalue=1,maxvalue=4,initialvalue=1,parent=self.root)
+                if mode is None:return
+                prepared.attrs['pet_mode']={1:'step_total',2:'month_total',3:'month_daily_mean',4:'day_total'}[mode]
+                prepared.attrs['import_notes'].append('Bốc hơi: '+{1:'tổng mỗi bước, ghi cuối bước',2:'tổng tháng',3:'trung bình ngày của tháng',4:'tổng ngày theo lịch'}[mode]+'; phân bổ đều về bước mô phỏng, giữ tổng lượng.')
             if self._is_demo:
                 self.input_series={};self.rain_stations={};self._is_demo=False
                 for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
