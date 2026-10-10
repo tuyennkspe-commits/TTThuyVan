@@ -8,7 +8,8 @@ Không khẳng định tương đương bộ giải MIKE NAM của DHI.
 Cài đặt: python -m pip install numpy pandas scipy matplotlib openpyxl
 Tăng tốc tùy chọn: python -m pip install numba
 Đọc MIKE DFS0: python -m pip install mikeio
-P/PET tổng mm mỗi bước; Q trung bình bước m³/s. Hiệu chỉnh cần kiểm định độc lập.
+P/PET tổng mm mỗi bước; Q trung bình hoặc tức thời cuối bước m³/s, chọn theo quan trắc.
+Hiệu chỉnh cần kiểm định độc lập.
 """
 
 import os
@@ -379,7 +380,7 @@ def route_cascade(storage, inflow, dt, k):
     return (max(a,0.),max(b,0.)),max(out,0.)
 
 
-MODEL_VERSION='NAM9-nonlinear-2026-10'
+MODEL_VERSION='NAM9-mean-endpoint-2026-10'
 
 
 def overland_time_constant(flow_mm_hour,ck12):
@@ -459,7 +460,7 @@ def _kernel_route_overland(storage,inflow,dt,ck12,max_step=.25):
     return storage,total,minimum_k
 
 def _nam_kernel(p,rain,pet,dt,sub,U,L,surf,inter,base):
-    n=len(rain);components=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n);ck_of=np.full(n,p[3])
+    n=len(rain);components=np.zeros((n,3));endpoints=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n);ck_of=np.full(n,p[3])
     steps=int(np.ceil(dt/sub));h=dt/steps
     for t in range(n):
         before=U+L+sum(surf)+sum(inter)+base
@@ -485,9 +486,10 @@ def _nam_kernel(p,rain,pet,dt,sub,U,L,surf,inter,base):
             inter,qi=_kernel_route_cascade(inter,inf_flow/h,h,p[3])
             base,qb=_kernel_route_linear(base,recharge/h,h,p[8])
             components[t]+=np.array([qo,qi,qb])
+        endpoints[t]=np.array([_kernel_overland_discharge(surf[1],p[3]),inter[1]/p[3],base/p[8]])
         stores[t]=U+L+sum(surf)+sum(inter)+base
         residual[t]=before+rain[t]-evap[t]-components[t].sum()-stores[t]
-    return components,evap,stores,residual,ck_of,U,L,surf,inter,base
+    return components,evap,stores,residual,ck_of,U,L,surf,inter,base,endpoints
 
 if NUMBA_AVAILABLE:
     _kernel_route_linear=njit(nogil=True)(_kernel_route_linear)
@@ -498,7 +500,7 @@ if NUMBA_AVAILABLE:
     _nam_kernel=njit(nogil=True)(_nam_kernel)
 
 
-def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1., cancel_event=None, use_acceleration=True):
+def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1., cancel_event=None, use_acceleration=True, discharge_mode='mean'):
     """NAM 9 thông số: dòng tràn có CK biến đổi; sát mặt CK12 tuyến tính.
 
     Không tuyên bố tương đương bộ giải MIKE NAM. P/PET là mm mỗi bước;
@@ -506,6 +508,7 @@ def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hou
     nối tiếp cho dòng tràn/sát mặt và một bể dòng ngầm. Chia bước nội bộ
     ≤1 giờ; không nội suy trận mưa chưa quan trắc trong bước lớn.
     """
+    if discharge_mode not in ['mean','endpoint']:raise ValueError('Loại lưu lượng phải là mean hoặc endpoint.')
     p={k:finite_number(params[k],k) for k in PARAM_KEYS}
     for k in ['U_max','L_max','CK_12','CK_IF','CK_BF']:
         if p[k]<=0:raise ValueError(f'{k} phải lớn hơn 0.')
@@ -529,18 +532,18 @@ def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hou
     initial_storage=U+L+sum(surf)+sum(inter)+base
     if use_acceleration and NUMBA_AVAILABLE:
         vector=np.array([p[k] for k in PARAM_KEYS],dtype=np.float64)
-        blocks=[]
+        blocks=[];endpoint_blocks=[]
         for start in range(0,len(rain),64):
             if cancel_event is not None and cancel_event.is_set():raise CalibrationStopped()
             result=_nam_kernel(vector,np.ascontiguousarray(rain[start:start+64]),np.ascontiguousarray(pet[start:start+64]),dt,sub,U,L,surf,inter,base)
-            blocks.append(result[:5]);U,L,surf,inter,base=result[5:]
+            blocks.append(result[:5]);endpoint_blocks.append(result[-1]);U,L,surf,inter,base=result[5:10]
         components,evap,stores,residual,ck_of=[np.concatenate([block[j] for block in blocks],axis=0) for j in range(5)]
         conv=area/(3.6*dt)
-        return dict(Q_sim=components.sum(axis=1)*conv,Q_surf=components[:,0]*conv,Q_inter=components[:,1]*conv,Q_base=components[:,2]*conv,
+        return select_discharge(dict(Q_sim=components.sum(axis=1)*conv,Q_surf=components[:,0]*conv,Q_inter=components[:,1]*conv,Q_base=components[:,2]*conv,
                     Evap_actual_mm=evap,Storage_mm=stores,Balance_error_mm=residual,CK_overland_min_hours=ck_of,Model_version=MODEL_VERSION,
                     Initial_storage_mm=initial_storage,Initial_state=init,
-                    Final_state=dict(U_mm=U,L_mm=L,surface_mm=surf,interflow_mm=inter,base_mm=base),Engine='Numba')
-    n=len(rain);components=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n);ck_of=np.full(n,p["CK_12"])
+                    Final_state=dict(U_mm=U,L_mm=L,surface_mm=surf,interflow_mm=inter,base_mm=base),Engine='Numba'),np.concatenate(endpoint_blocks)*area/3.6,discharge_mode)
+    n=len(rain);components=np.zeros((n,3));endpoints=np.zeros((n,3));evap=np.zeros(n);stores=np.zeros(n);residual=np.zeros(n);ck_of=np.full(n,p["CK_12"])
     steps=int(np.ceil(dt/sub));h=dt/steps
     for t in range(n):
         if cancel_event is not None and cancel_event.is_set():raise CalibrationStopped()
@@ -567,14 +570,28 @@ def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hou
             inter,qi=route_cascade(inter,inf_flow/h,h,p['CK_12'])
             base,qb=route_linear(base,recharge/h,h,p['CK_BF'])
             components[t]+=np.array([qo,qi,qb])
+        endpoints[t]=np.array([overland_discharge(surf[1],p['CK_12']),inter[1]/p['CK_12'],base/p['CK_BF']])
         stores[t]=U+L+sum(surf)+sum(inter)+base
         residual[t]=before+rain[t]-evap[t]-components[t].sum()-stores[t]
     conv=area/(3.6*dt)
-    return dict(Q_sim=components.sum(axis=1)*conv,Q_surf=components[:,0]*conv,
+    return select_discharge(dict(Q_sim=components.sum(axis=1)*conv,Q_surf=components[:,0]*conv,
                 Q_inter=components[:,1]*conv,Q_base=components[:,2]*conv,
                 Evap_actual_mm=evap,Storage_mm=stores,Balance_error_mm=residual,CK_overland_min_hours=ck_of,Model_version=MODEL_VERSION,
                 Initial_storage_mm=initial_storage,Initial_state=init,Engine='Python',
-                Final_state=dict(U_mm=U,L_mm=L,surface_mm=surf,interflow_mm=inter,base_mm=base))
+                Final_state=dict(U_mm=U,L_mm=L,surface_mm=surf,interflow_mm=inter,base_mm=base)),endpoints*area/3.6,discharge_mode)
+
+
+def select_discharge(result,endpoints,mode):
+    """Trung bình bước bảo toàn thể tích; cuối bước lấy lưu lượng từ trạng thái bể."""
+    for index,key in enumerate(['Q_surf','Q_inter','Q_base']):
+        result[key+'_mean']=result[key].copy()
+        result[key+'_endpoint']=endpoints[:,index]
+        if mode=='endpoint':result[key]=result[key+'_endpoint']
+    result['Q_sim_mean']=result['Q_sim'].copy()
+    result['Q_sim_endpoint']=endpoints.sum(axis=1)
+    result['Q_sim']=result['Q_sim_'+mode]
+    result['Discharge_mode']=mode
+    return result
 
 
 def compute_nse(obs,sim):
@@ -695,6 +712,11 @@ class NAMDesktopApp:
         self.ent_dt.grid(row=1, column=1, sticky="w", padx=3, pady=3)
 
         ttk.Checkbutton(left_frame,text='Tự nhận bước thời gian từ số liệu',variable=self.auto_dt,command=self._refresh_inputs).pack(anchor='w')
+        ttk.Label(left_frame,text='Loại lưu lượng dùng đánh giá:').pack(anchor='w')
+        self.discharge_choice=ttk.Combobox(left_frame,state='readonly',values=['Trung bình bước (m³/s)','Cuối bước – tức thời (m³/s)'],width=35)
+        self.discharge_choice.current(0);self.discharge_choice.pack(anchor='w',pady=3)
+        self.discharge_choice.bind('<<ComboboxSelected>>',lambda event:self._refresh_inputs())
+        ttk.Label(left_frame,text='Chọn cùng loại với Q thực đo. Khi đối chiếu MIKE, kiểm tra loại đầu ra trước khi chọn.',wraplength=350).pack(anchor='w')
         self.setting_entries=[self.ent_area,self.ent_dt]
         for row,(attr,label,default) in enumerate([
             ('ent_warm','Khởi động (giờ):','0'),('ent_split','Hiệu chỉnh (% chuỗi sau khởi động):','70'),
@@ -946,8 +968,11 @@ class NAMDesktopApp:
             raise ValueError('Khởi động ≥0 giờ; hiệu chỉnh trong (0;100]%; độ đầy trong [0;1]; dòng ngầm ≥0.')
         return area,dt,int(np.ceil(warm/dt)),split/100,initial
 
+    def _discharge_mode(self):
+        return 'endpoint' if self.discharge_choice.current()==1 else 'mean'
+
     def _signature(self):
-        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get(),self.auto_dt.get())+tuple(self.best_params.items())+(id(self.df_data),)+tuple(self.param_bounds)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
+        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get(),self.auto_dt.get(),self._discharge_mode())+tuple(self.best_params.items())+(id(self.df_data),)+tuple(self.param_bounds)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
 
     def _watch(self):
         if self.current_sim is not None and self._result_signature!=self._signature():
@@ -970,6 +995,8 @@ class NAMDesktopApp:
             messagebox.showwarning("Kiểm định","Hãy hiệu chỉnh để có bộ thông số trước khi kiểm định dữ liệu mới.");return
         window=tk.Toplevel(self.root)
         app=NAMDesktopApp(window,validation_params=self._calibrated_params)
+        app.discharge_choice.current(1 if getattr(self,'_calibrated_discharge_mode','mean')=='endpoint' else 0)
+        app.discharge_choice.config(state='disabled')
         app.ent_area.delete(0,"end");app.ent_area.insert(0,str(self._calibrated_area));app.ent_area.config(state="readonly")
         window._nam_app=app
 
@@ -1166,7 +1193,7 @@ class NAMDesktopApp:
             obs=df['Q_ThucDo_m3s'].to_numpy()[warm:end]
             if np.count_nonzero(np.isfinite(obs))<3 or not np.isfinite(compute_nse(obs,np.zeros(len(obs)))):
                 raise ValueError('Sau khởi động, phần hiệu chỉnh cần ≥3 Q thực đo và phương sai khác 0.')
-            snapshot=(self._signature(),df.copy(deep=True),area,dt,warm,end,initial,maxiter,self.best_params.copy(),runs,self.param_bounds.copy())
+            snapshot=(self._signature(),df.copy(deep=True),area,dt,warm,end,initial,maxiter,self.best_params.copy(),runs,self.param_bounds.copy(),self._discharge_mode())
         except Exception as exc:messagebox.showerror('Hiệu chỉnh',str(exc));return
         self._stop_event.clear();self.btn_stop.config(state=tk.NORMAL)
         self._busy=True;self.btn_calibrate.config(state=tk.DISABLED);self.progress_bar.start(10)
@@ -1185,6 +1212,7 @@ class NAMDesktopApp:
             current=snapshot[8] if len(snapshot)>8 else dict(zip(PARAM_KEYS,[15,100,.5,15,.2,.2,.3,50,1000]))
             runs=snapshot[9] if len(snapshot)>9 else 1
             bounds=snapshot[10] if len(snapshot)>10 else PARAM_BOUNDS
+            discharge_mode=snapshot[11] if len(snapshot)>11 else 'mean'
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();obs=df['Q_ThucDo_m3s'].to_numpy()
             best_params=current.copy();best_nse=np.nan
             cache={};evaluations=0;cache_hits=0
@@ -1197,7 +1225,7 @@ class NAMDesktopApp:
                 if self._stop_event.is_set():raise CalibrationStopped()
                 key=tuple(float(params[k]) for k in PARAM_KEYS)
                 if key in cache:cache_hits+=1;return cache[key]
-                sim=run_nam(params,area,rain[:end],pet[:end],dt,initial,cancel_event=self._stop_event)['Q_sim']
+                sim=run_nam(params,area,rain[:end],pet[:end],dt,initial,cancel_event=self._stop_event,discharge_mode=discharge_mode)['Q_sim']
                 values=(sim[warm:end][valid]-observed)/normalizer
                 if not np.all(np.isfinite(values)):raise ValueError('Mô phỏng không hữu hạn.')
                 if len(cache)>=cache_limit:cache.clear()
@@ -1257,7 +1285,7 @@ class NAMDesktopApp:
             self.lbl_calib_status.config(text='Đầu vào đã thay đổi: bỏ kết quả hiệu chỉnh cũ.');return
         self.best_params=params
         if np.isfinite(nse):
-            self._calibrated_params=params.copy();self._calibrated_area=self._settings()[0]
+            self._calibrated_params=params.copy();self._calibrated_area=self._settings()[0];self._calibrated_discharge_mode=self._discharge_mode()
         self._update_parameter_display();self._recompute_and_plot()
         self.lbl_calib_status.config(text=f'NSE hiệu chỉnh = {nse:.3f}; '+reason,foreground='green' if success else '#b05b00')
 
@@ -1273,7 +1301,7 @@ class NAMDesktopApp:
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();q_obs=df['Q_ThucDo_m3s'].to_numpy()
             if self.validation_mode and not np.isfinite(compute_nse(q_obs[warm:],np.zeros(len(q_obs)-warm))):
                 raise ValueError('Kiểm định cần ít nhất 2 Q thực đo sau khởi động và phương sai khác 0.')
-            res=run_nam(self.best_params,area,rain,pet,dt,initial,use_acceleration=NUMBA_AVAILABLE and bool(_nam_kernel.signatures))
+            res=run_nam(self.best_params,area,rain,pet,dt,initial,use_acceleration=NUMBA_AVAILABLE and bool(_nam_kernel.signatures),discharge_mode=self._discharge_mode())
         except Exception as exc:messagebox.showerror('Mô phỏng',str(exc));return
         self.current_sim=res;self._result_signature=self._signature()
         self._run_settings=dict(area=area,dt=dt,warm=warm,split=split,initial=initial,params=self.best_params.copy())
@@ -1300,7 +1328,7 @@ class NAMDesktopApp:
         self.ax_rain.set_ylabel('Mưa (mm)');self.ax_rain.set_ylim(max(10.,rain.max()*1.3),0);self.ax_rain.legend(fontsize=8)
         self.ax_rain.set_title('MƯA – DÒNG CHẢY NAM (DÒNG TRÀN ĐIỀU TIẾT BIẾN ĐỔI)',fontsize=10)
         self.ax_flow.plot(time,q_obs,'k--',label='Lưu lượng thực đo')
-        self.ax_flow.plot(time,q_sim,'r-',label='Lưu lượng mô phỏng trung bình bước')
+        self.ax_flow.plot(time,q_sim,'r-',label='Lưu lượng mô phỏng '+('cuối bước' if res['Discharge_mode']=='endpoint' else 'trung bình bước'))
         self.ax_flow.stackplot(time,res['Q_base'],res['Q_inter'],res['Q_surf'],labels=['Dòng ngầm','Dòng sát mặt','Dòng tràn'],alpha=.25)
         if warm:self.ax_flow.axvspan(time[0],time[warm],color='gray',alpha=.2,label='Khởi động (không đánh giá)')
         if end<len(df):self.ax_flow.axvline(time[end],color='navy',linestyle=':',label='Bắt đầu kiểm định')
@@ -1322,6 +1350,12 @@ class NAMDesktopApp:
             end=settings['warm']+int((len(out)-settings['warm'])*settings['split'])
             out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Kiem_dinh_doc_lap' if self.validation_mode else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
             out['DienTich_km2']=settings['area'];out['BuocGio']=dt
+            out['LoaiLuuLuongDanhGia']=res['Discharge_mode']
+            out['Q_TrungBinhBuoc_m3s']=res['Q_sim_mean']
+            out['Q_CuoiBuoc_m3s']=res['Q_sim_endpoint']
+            for component,label in [('Q_surf','TranMat'),('Q_inter','SatMat'),('Q_base','Ngam')]:
+                out[f'Q_{label}_TrungBinhBuoc_m3s']=res[component+'_mean']
+                out[f'Q_{label}_CuoiBuoc_m3s']=res[component+'_endpoint']
             out['PhienBanMoHinh']=MODEL_VERSION
             out['BoTinh']=res.get('Engine','Python')
             out['TruLuongDau_mm']=res['Initial_storage_mm']
