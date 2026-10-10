@@ -170,7 +170,7 @@ def read_series_file(path,key,item_selector=None):
     return raw.iloc[1:].reset_index(drop=True)
 
 
-def prepare_series(df,key,rain_blanks_are_zero=False,missing_rain_run_days=None):
+def prepare_series(df,key):
     """Có ThoiGian: ghép theo ngày giờ; không có: ghép theo bước 1..n."""
     df=df.copy();df.columns=[str(c).strip() for c in df.columns]
     value_col=key if key in df else 'GiaTri' if 'GiaTri' in df else df.columns[0] if len(df.columns)==1 else None
@@ -197,35 +197,12 @@ def prepare_series(df,key,rain_blanks_are_zero=False,missing_rain_run_days=None)
         if not np.all(np.isfinite(coordinates)) or np.any(coordinates<1) or np.any(coordinates!=np.floor(coordinates)) or coordinates.duplicated().any():
             raise ValueError('Buoc phải là số nguyên dương, không trùng.')
     result=pd.DataFrame({axis:coordinates,key:values}).sort_values(axis).reset_index(drop=True)
-    if rain_blanks_are_zero:
-        if key!='Mua_mm':raise ValueError('Quy ước ô trống là 0 chỉ áp dụng cho mưa.')
-        missing=result[key].isna().to_numpy()
-        fill=missing.copy()
-        if missing_rain_run_days is not None:
-            threshold=finite_number(missing_rain_run_days,'Ngưỡng ngày thiếu liên tục',True)
-            if axis!='ThoiGian':raise ValueError('Phân biệt theo số ngày liên tục cần chuỗi có ngày giờ.')
-            times=result[axis]
-            deltas=times.diff().dropna().dt.total_seconds().to_numpy()
-            if not len(deltas):raise ValueError('Cần ít nhất 2 thời điểm để nhận diện bước mưa.')
-            unique,counts=np.unique(deltas[deltas>0],return_counts=True)
-            step=float(unique[np.argmax(counts)])
-            starts=np.r_[True,~np.isclose(deltas,step,rtol=0,atol=1e-6)]
-            i=0
-            while i<len(missing):
-                if not missing[i]:i+=1;continue
-                j=i+1
-                while j<len(missing) and missing[j] and not starts[j]:j+=1
-                if (j-i)*step/86400>=threshold-1e-9:fill[i:j]=False
-                i=j
-        count=int(fill.sum())
-        result.loc[fill,key]=0.0
-        rule='mọi ô mưa trống là không mưa' if missing_rain_run_days is None else f'đợt mưa trống ngắn hơn {threshold:g} ngày là không mưa; đợt từ ngưỡng trở lên là thiếu số liệu'
-        import_notes.append(f'Quy ước người dùng: {rule}. Đã chuyển {count} giá trị trống thành 0 mm, giữ nguyên ngày giờ; còn {int(result[key].isna().sum())} giá trị thiếu.')
     missing_values=result[key].isna()
     if key!='Q_ThucDo_m3s' and missing_values.any():
         coordinates=result.loc[missing_values,axis]
         fmt=lambda v:v.strftime('%d/%m/%Y %H:%M:%S') if axis=='ThoiGian' else str(int(v))
-        import_notes.append(f'{SERIES_NAMES[key]}: thiếu {int(missing_values.sum())}/{len(result)} giá trị, từ {fmt(coordinates.iloc[0])} đến {fmt(coordinates.iloc[-1])}. Giữ nguyên giá trị thiếu, không thay bằng 0. Khi đủ mưa, bốc hơi và Q, chế độ tự nhận khoảng sẽ chọn đoạn liên tục đủ dữ liệu; nếu chọn khoảng bằng tay, khoảng đó phải đủ mưa/bốc hơi.')
+        rule='Ô mưa trống được giữ nguyên trong tệp nhập và tính là 0 mm trong khoảng mô phỏng người dùng chọn.' if key=='Mua_mm' else 'Giữ ô bốc hơi trống; khoảng mô phỏng phải có đủ bốc hơi.'
+        import_notes.append(f'{SERIES_NAMES[key]}: có {int(missing_values.sum())}/{len(result)} ô trống, từ {fmt(coordinates.iloc[0])} đến {fmt(coordinates.iloc[-1])}. '+rule)
     result.attrs['import_notes']=import_notes
     return result
 
@@ -329,7 +306,7 @@ def detect_common_period(stations,inputs,dt):
     axis=series_axis(data[0][0]);common=None
     for frame,key in data:
         if series_axis(frame)!=axis:raise ValueError('Các chuỗi phải cùng kiểu ngày giờ hoặc thứ tự bước.')
-        index=pd.Index(frame.loc[frame[key].notna(),axis])
+        index=pd.Index(frame[axis] if key=='Mua_mm' else frame.loc[frame[key].notna(),axis])
         common=index if common is None else common.intersection(index)
     common=common.sort_values()
     if len(common)<2:raise ValueError('Không có ít nhất 2 bước chung đủ mưa, bốc hơi và Q thực đo.')
@@ -352,7 +329,7 @@ def weighted_rainfall(stations,start='',end=''):
         if item['weight']==0:continue
         data=select_period(item['data'],start,end)
         if data.empty:raise ValueError('Trạm mưa không có số liệu trong khoảng mô phỏng.')
-        current_axis=series_axis(data);series=data.set_index(current_axis)['Mua_mm']
+        current_axis=series_axis(data);series=data.set_index(current_axis)['Mua_mm'].fillna(0.0)
         if result is None:result=series*item['weight'];axis=current_axis
         else:
             if current_axis!=axis or not series.index.equals(result.index):raise ValueError('Các trạm có trọng số >0 phải khớp ngày giờ hoặc cùng số bước; không trộn hai kiểu nhập.')
@@ -366,6 +343,7 @@ def merge_series(series,dt,start='',end=''):
     axis=series_axis(series['Mua_mm'])
     if any(series_axis(data)!=axis for data in series.values()):raise ValueError('Dùng cùng kiểu cho các chuỗi: tất cả có ThoiGian hoặc tất cả theo thứ tự bước. Không tự ghép hai kiểu.')
     selected_rain=select_period(series['Mua_mm'],start,end)
+    selected_rain=selected_rain.copy();selected_rain['Mua_mm']=selected_rain['Mua_mm'].fillna(0.0)
     rain=selected_rain.set_index(axis);pet=distribute_evaporation(series['BocHoi_mm'],selected_rain,dt).set_index(axis)
     if rain.empty:raise ValueError('Không có mưa trong khoảng mô phỏng đã chọn.')
     if not rain.index.equals(pet.index):raise ValueError('Mưa/bốc hơi phải khớp ngày giờ hoặc số bước; không tự cắt chuỗi hay điền 0.')
@@ -730,8 +708,9 @@ class NAMDesktopApp:
             row=ttk.Frame(left_frame);row.pack(fill='x',pady=2)
             ttk.Label(row,text=label).pack(side='left')
             entry=ttk.Entry(row,width=24);entry.pack(side='right');setattr(self,attr,entry);self.setting_entries.append(entry)
-        ttk.Checkbutton(left_frame,text='Tự nhận khoảng đủ mưa, bốc hơi và Q',variable=self.auto_period,command=self._refresh_inputs).pack(anchor='w')
-        ttk.Label(left_frame,text='Có ngày giờ: dd/mm/yyyy hh:mm:ss.\nChuỗi một cột: nhập số bước đầu/cuối.\nCó khoảng đứt đoạn: chọn đoạn đủ dữ liệu dài nhất.\nBỏ chọn tự nhận để sửa khoảng bằng tay.',wraplength=350).pack(anchor='w')
+            entry.bind('<KeyRelease>',lambda event:self.auto_period.set(False))
+        ttk.Checkbutton(left_frame,text='Gợi ý khoảng mô phỏng từ dữ liệu',variable=self.auto_period,command=self._request_period_suggestion).pack(anchor='w')
+        ttk.Label(left_frame,text='Có ngày giờ: dd/mm/yyyy hh:mm:ss.\nChuỗi một cột: nhập số bước đầu/cuối.\nThời gian gợi ý để tham khảo; có thể sửa trực tiếp.\nÔ mưa trống trong khoảng đã chọn được tính là 0 mm.',wraplength=350).pack(anchor='w')
         ttk.Label(left_frame,text='NAM 9 thông số: CK dòng tràn biến đổi; không tuyết/tưới.\nNhập 3 chuỗi riêng bằng CSV, Excel hoặc MIKE DFS0.\nMột cột giá trị: mỗi dòng = một bước Δt.\nHoặc ThoiGian + giá trị (giờ cuối bước).\nMưa: tổng mm/bước; Q: m³/s, tùy chọn.\nBốc hơi: tổng tháng/ngày/bước hoặc mm/ngày của tháng; tự phân bổ đều.',wraplength=350).pack(anchor='w',pady=4)
         ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=10
@@ -1034,16 +1013,6 @@ class NAMDesktopApp:
         try:
             df=read_series_file(path,'Mua_mm',self._choose_dfs_item)
             data=prepare_series(df,'Mua_mm')
-            count=int(data['Mua_mm'].isna().sum())
-            if count:
-                choice=messagebox.askyesnocancel('Quy ước số liệu mưa trống',f'Chuỗi đã chọn có {count} giá trị mưa trống.\n\nCó: phân biệt không mưa và thiếu số liệu theo độ dài đợt trống.\nKhông: ô trống là số liệu thiếu, giữ nguyên.\nHủy: không nhập trạm này.',parent=self.root)
-                if choice is None:return
-                if choice:
-                    threshold=None
-                    if 'ThoiGian' in data:
-                        threshold=simpledialog.askfloat('Ngưỡng thiếu số liệu mưa','Đợt trống liên tục từ bao nhiêu ngày được coi là thiếu số liệu?\nĐợt ngắn hơn ngưỡng được tính là 0 mm.\nVí dụ: ngưỡng 3 ngày sẽ giữ đợt trống từ 3 ngày trở lên.',initialvalue=3,minvalue=0.000001,parent=self.root)
-                        if threshold is None:return
-                    data=prepare_series(df,'Mua_mm',rain_blanks_are_zero=True,missing_rain_run_days=threshold)
             name=simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
             if name is None:return
             name=name.strip()
@@ -1116,6 +1085,10 @@ class NAMDesktopApp:
         except ImportCancelled:return
         except Exception as exc:messagebox.showerror('Nhập '+SERIES_NAMES[key],str(exc))
 
+    def _request_period_suggestion(self):
+        self._suggested_period=self._period()
+        self._refresh_inputs()
+
     def _period(self):
         return self.ent_period_start.get().strip(),self.ent_period_end.get().strip()
 
@@ -1129,17 +1102,19 @@ class NAMDesktopApp:
                 if inferred is not None:
                     self.ent_dt.delete(0,'end');self.ent_dt.insert(0,f'{inferred:g}')
             except Exception as exc:self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
+        current_period=self._period()
+        if any(current_period) and current_period!=getattr(self,'_suggested_period',('','')):self.auto_period.set(False)
         if self.auto_period.get():
             try:
                 detected=detect_common_period(self.rain_stations,self.input_series,finite_number(self.ent_dt.get(),'Bước tính',True))
-                for entry in [self.ent_period_start,self.ent_period_end]:entry.delete(0,'end')
                 if detected:
+                    for entry in [self.ent_period_start,self.ent_period_end]:entry.delete(0,'end')
                     start,end,segments,count=detected
                     self.ent_period_start.insert(0,start);self.ent_period_end.insert(0,end)
-                    auto_note=f' Tự nhận đủ 3 yếu tố: {count} bước.'+ (f' Có {segments} đoạn; chọn đoạn liên tục dài nhất.' if segments>1 else '')
+                    self._suggested_period=(start,end)
+                    auto_note=f' Khoảng tham khảo từ dữ liệu: {count} bước.'+ (f' Có {segments} đoạn; chọn đoạn liên tục dài nhất.' if segments>1 else '')
                 else:auto_note=' Chưa đủ 3 yếu tố để tự nhận khoảng; chỉ mô phỏng khi đã có mưa/bốc hơi.'
             except Exception as exc:
-                for entry in [self.ent_period_start,self.ent_period_end]:entry.delete(0,'end')
                 self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
         if self.rain_stations:
             try:self.input_series['Mua_mm']=weighted_rainfall(self.rain_stations,*self._period())
