@@ -1,0 +1,20 @@
+Nguồn: Phụ lục I Quyết định 289/QĐ-TTg ngày 08/04/2024, file Phu luc.doc do người dùng cung cấp. Chỉ lấy dấu x ở cột hiện có/đã có của chính nhóm trạm. Hệ tọa độ nguồn EPSG:3405 do người dùng xác nhận; chuyển sang WGS84 EPSG:4326. Không tự dịch điểm hoặc suy đoán tọa độ lỗi. Trạm lồng ghép có thể xuất hiện trong nhiều nhóm.
+
+                Nhom_tram  Tong_tram_trong_bang  Tram_hien_co  Diem_xuat_KMZ
+         Khí tượng bề mặt                   420           215            215
+           Đo mưa độc lập                  4333           871            869
+       Khí tượng trên cao                    26            13             13
+          Ra đa thời tiết                    39            10             10
+              Định vị sét                    26            18             18
+                 Thủy văn                   526           426            426
+                  Hải văn                    79            27             27
+               Ra đa biển                    21             3              3
+                Phao biển                    14             0              0
+          Bức xạ và ô-dôn                    25            16             16
+Thu ảnh vệ tinh khí tượng                     3             1              1
+                   Đo mặn                   180            95             95
+
+Các trạm chưa xuất vì tọa độ lỗi:
+     Nhom_tram  STT     Ten_tram    X_Bac_goc    Y_Dong_goc                                                       Ket_qua
+Đo mưa độc lập 2123   Hiền Chung 18858373.500 -17194650.119 Tọa độ mét ngoài khoảng sàng lọc Việt Nam; cần kiểm tra nguồn
+Đo mưa độc lập 3057 Cảng Vũng Rô 10065397.238   1706763.710 Tọa độ mét ngoài khoảng sàng lọc Việt Nam; cần kiểm tra nguồn
