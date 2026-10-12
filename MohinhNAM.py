@@ -22,6 +22,7 @@ from datetime import datetime, date
 from pathlib import Path
 import threading
 import queue
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 from matplotlib.backends.backend_tkagg import (
@@ -34,6 +35,7 @@ from matplotlib.ticker import AutoLocator, ScalarFormatter
 import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution, least_squares
+from scipy.stats import qmc
 try:
     from numba import njit
     NUMBA_AVAILABLE=True
@@ -516,12 +518,36 @@ def _nam_kernel(p,rain,pet,dt,sub,U,L,surf,inter,base):
     return components,evap,stores,residual,ck_of,U,L,surf,inter,base,endpoints
 
 if NUMBA_AVAILABLE:
-    _kernel_route_linear=njit(nogil=True)(_kernel_route_linear)
-    _kernel_route_cascade=njit(nogil=True)(_kernel_route_cascade)
-    _kernel_overland_time_constant=njit(nogil=True)(_kernel_overland_time_constant)
-    _kernel_overland_discharge=njit(nogil=True)(_kernel_overland_discharge)
-    _kernel_route_overland=njit(nogil=True)(_kernel_route_overland)
-    _nam_kernel=njit(nogil=True)(_nam_kernel)
+    def _compile_nam(function):
+        # Reuse compiled code across sessions; packaged apps may lack a cache locator.
+        try:return njit(nogil=True,cache=True)(function)
+        except RuntimeError:return njit(nogil=True)(function)
+    _kernel_route_linear=_compile_nam(_kernel_route_linear)
+    _kernel_route_cascade=_compile_nam(_kernel_route_cascade)
+    _kernel_overland_time_constant=_compile_nam(_kernel_overland_time_constant)
+    _kernel_overland_discharge=_compile_nam(_kernel_overland_discharge)
+    _kernel_route_overland=_compile_nam(_kernel_route_overland)
+    _nam_kernel=_compile_nam(_nam_kernel)
+
+
+def calibration_discharge(params,area,rain,pet,dt,initial,cancel_event,mode):
+    """Same NAM kernel as the full report, without constructing report arrays."""
+    if not NUMBA_AVAILABLE:
+        return run_nam(params,area,rain,pet,dt,initial,cancel_event=cancel_event,use_acceleration=False,discharge_mode=mode)['Q_sim']
+    area=float(area);dt=float(dt)
+    p=np.array([params[k] for k in PARAM_KEYS],dtype=float)
+    U=initial['U_fraction']*p[0];L=initial['L_fraction']*p[1]
+    qs=initial['Q_surf_m3s']*3.6/area;qi=initial['Q_inter_m3s']*3.6/area
+    surf=(qs*overland_time_constant(qs,p[3]),)*2;inter=(qi*p[3],)*2
+    base=initial['Q_base_m3s']*3.6/area*p[8]
+    flow=np.empty(len(rain))
+    for start in range(0,len(rain),256):
+        if cancel_event.is_set():raise CalibrationStopped()
+        stop=min(start+256,len(rain))
+        result=_nam_kernel(p,rain[start:stop],pet[start:stop],dt,1.,U,L,surf,inter,base)
+        flow[start:stop]=result[-1].sum(axis=1)*area/3.6 if mode=='endpoint' else result[0].sum(axis=1)*area/(3.6*dt)
+        U,L,surf,inter,base=result[5:10]
+    return flow
 
 
 def run_nam(params, area_km2, rain, pet, dt_hours, initial=None, max_substep_hours=1., cancel_event=None, use_acceleration=True, discharge_mode='mean'):
@@ -844,12 +870,27 @@ class NAMDesktopApp:
     def _setup_style(self):
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TButton", font=("Segoe UI", 10), padding=4)
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        self.root.configure(background='#eef2f7')
+        style.configure('.',background='#eef2f7',foreground='#20334d',font=('Segoe UI',10))
+        style.configure('TFrame',background='#eef2f7')
+        style.configure('TButton',font=('Segoe UI',10),padding=(10,7),background='white',bordercolor='#c5d2e0')
+        style.map('TButton',background=[('active','#dfebf7'),('disabled','#e5eaf0')])
+        style.configure('Treeview',background='white',fieldbackground='white',rowheight=28)
+        style.configure('Treeview.Heading',font=('Segoe UI',10,'bold'),padding=7)
+        style.map('Treeview',background=[('selected','#2367a0')],foreground=[('selected','white')])
+        style.configure('TNotebook.Tab',padding=(14,8),background='#e2eaf4')
+        style.map('TNotebook.Tab',background=[('selected','white')],foreground=[('selected','#174d7d')])
+        style.configure('TEntry',padding=4)
+        style.configure('TProgressbar',background='#2367a0')
+        style.configure('Accent.TButton',font=('Segoe UI',10,'bold'),background='#2367a0',foreground='white',padding=(12,9))
+        style.map('Accent.TButton',background=[('active','#174d7d'),('disabled','#ccd6e1')],foreground=[('disabled','#64748b')])
         style.configure("TLabel", font=("Segoe UI", 9))
-        style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"))
+        style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"),foreground="#174d7d",padding=(0,7))
 
     def _build_ui(self):
+        heading=ttk.Frame(self.root,padding=(16,10));heading.pack(fill='x')
+        ttk.Label(heading,text='NAM · Mưa và dòng chảy lưu vực',font=('Segoe UI',16,'bold'),foreground='#174d7d').pack(anchor='w')
+        ttk.Label(heading,text='Quản lý lưu vực và trạm · Hiệu chỉnh thông số · Kiểm định độc lập · Trích kết quả',foreground='#52657c').pack(anchor='w',pady=(3,0))
         project_bar=ttk.Frame(self.root,padding=(8,5))
         project_bar.pack(fill='x')
         for label,command in [('Tạo dự án mới',self._new_project),('Mở dự án',self._open_project),('Lưu dự án',self._save_project),('Lưu dự án thành…',lambda:self._save_project(save_as=True))]:
@@ -864,9 +905,9 @@ class NAMDesktopApp:
         main_paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # --- KHUNG BÊN TRÁI: ĐIỀU KHIỂN ---
-        left_outer=ttk.Frame(main_paned,width=390)
+        left_outer=ttk.Frame(main_paned,width=420)
         main_paned.add(left_outer,weight=0)
-        controls=tk.Canvas(left_outer,width=390,highlightthickness=0)
+        controls=tk.Canvas(left_outer,width=420,background="#eef2f7",highlightthickness=0)
         scroll=ttk.Scrollbar(left_outer,orient='vertical',command=controls.yview)
         controls.configure(yscrollcommand=scroll.set)
         scroll.pack(side='right',fill='y');controls.pack(side='left',fill='both',expand=True)
@@ -874,6 +915,13 @@ class NAMDesktopApp:
         item=controls.create_window((0,0),window=left_frame,anchor='nw')
         left_frame.bind('<Configure>',lambda event:controls.configure(scrollregion=controls.bbox('all')))
         controls.bind('<Configure>',lambda event:controls.itemconfigure(item,width=event.width))
+        def scroll_controls(event):
+            widget=event.widget
+            while widget is not None and widget is not controls:widget=getattr(widget,'master',None)
+            if widget is not controls:return
+            units=-1 if getattr(event,'num',None)==4 else 1 if getattr(event,'num',None)==5 else -int(event.delta/120) if abs(event.delta)>=120 else (-1 if event.delta>0 else 1)
+            controls.yview_scroll(units,'units');return 'break'
+        for sequence in ['<MouseWheel>','<Button-4>','<Button-5>']:self.root.bind(sequence,scroll_controls,add='+')
 
         ttk.Label(left_frame,text='Lưu vực mô phỏng NAM',style='Header.TLabel').pack(anchor='w')
         self.basin_choice=ttk.Combobox(left_frame,state='readonly',width=43)
@@ -960,7 +1008,7 @@ class NAMDesktopApp:
         # 3. Tự động dò thông số (Auto-Calibrate)
         lbl_sec3 = ttk.Label(
             calib_frame,
-            text="3. Hiệu chỉnh theo Nash–Sutcliffe",
+            text="3. Hiệu chỉnh thông số",
             style="Header.TLabel",
         )
         lbl_sec3.pack(anchor="w", pady=(0, 5))
@@ -974,20 +1022,20 @@ class NAMDesktopApp:
         runs_row=ttk.Frame(calib_frame);runs_row.pack(fill=tk.X,pady=2)
         ttk.Label(runs_row,text='Số lần chạy hiệu chỉnh:').pack(side=tk.LEFT)
         self.ent_runs=ttk.Entry(runs_row,width=6);self.ent_runs.insert(0,'3');self.ent_runs.pack(side=tk.LEFT,padx=6)
-        ttk.Label(calib_frame,text='Mỗi lần tự tìm thông số; giữ NSE cao nhất.\nSố thế hệ × số lần chạy quyết định thời gian tìm kiếm.',wraplength=350).pack(anchor='w')
+        ttk.Label(calib_frame,text='Tìm kiếm toàn cục, sau đó tinh chỉnh cục bộ; giữ NSE tốt nhất.\nThông số được chuẩn hóa; mỗi lần chạy khảo sát thêm vùng mới. Kiểm định độc lập để đánh giá khả năng áp dụng.',wraplength=350).pack(anchor='w')
 
 
         self.btn_calibrate = ttk.Button(
             calib_frame,
-            text="🚀 BẮT ĐẦU DÒ THÔNG SỐ (MAX NSE)",
+            text="Bắt đầu hiệu chỉnh thông số",
             style="Accent.TButton",
             command=self._start_calibration_thread,
         )
         self.btn_calibrate.pack(fill=tk.X, pady=6)
-        self.btn_stop=ttk.Button(calib_frame,text="DỪNG TÍNH TOÁN",command=self._stop_calibration,state=tk.DISABLED)
+        self.btn_stop=ttk.Button(calib_frame,text="Dừng hiệu chỉnh",command=self._stop_calibration,state=tk.DISABLED)
         self.btn_stop.pack(fill=tk.X,pady=2)
 
-        self.progress_bar = ttk.Progressbar(calib_frame, mode="indeterminate")
+        self.progress_bar = ttk.Progressbar(calib_frame, mode="determinate")
         self.progress_bar.pack(fill=tk.X, pady=2)
 
         self.lbl_calib_status = ttk.Label(
@@ -2292,7 +2340,7 @@ class NAMDesktopApp:
             snapshot=(self._signature(),df.copy(deep=True),area,dt,warm,end,initial,maxiter,self.best_params.copy(),runs,self.param_bounds.copy(),self._discharge_mode())
         except Exception as exc:messagebox.showerror('Hiệu chỉnh',str(exc));return
         self._stop_event.clear();self.btn_stop.config(state=tk.NORMAL)
-        self._busy=True;self.btn_calibrate.config(state=tk.DISABLED);self.progress_bar.start(10)
+        self._busy=True;self.btn_calibrate.config(state=tk.DISABLED);self.progress_bar.config(value=0,maximum=100)
         self.lbl_calib_status.config(text='Đang hiệu chỉnh; lần đầu Numba cần biên dịch để tăng tốc.' if NUMBA_AVAILABLE else 'Đang hiệu chỉnh bằng Python; cài numba để tăng tốc.',foreground='#D9534F')
         threading.Thread(target=self._run_optimization_worker,args=(snapshot,),daemon=True).start()
         self.root.after(100,self._poll_worker)
@@ -2309,7 +2357,8 @@ class NAMDesktopApp:
             runs=snapshot[9] if len(snapshot)>9 else 1
             bounds=snapshot[10] if len(snapshot)>10 else PARAM_BOUNDS
             discharge_mode=snapshot[11] if len(snapshot)>11 else 'mean'
-            rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();obs=df['Q_ThucDo_m3s'].to_numpy()
+            started=time.perf_counter()
+            rain=np.ascontiguousarray(df['Mua_mm'].to_numpy()[:end]);pet=np.ascontiguousarray(df['BocHoi_mm'].to_numpy()[:end]);obs=df['Q_ThucDo_m3s'].to_numpy()
             best_params=current.copy();best_nse=np.nan
             cache={};evaluations=0;cache_hits=0
             valid=np.isfinite(obs[warm:end]);observed=obs[warm:end][valid]
@@ -2321,7 +2370,7 @@ class NAMDesktopApp:
                 if self._stop_event.is_set():raise CalibrationStopped()
                 key=tuple(float(params[k]) for k in PARAM_KEYS)
                 if key in cache:cache_hits+=1;return cache[key]
-                sim=run_nam(params,area,rain[:end],pet[:end],dt,initial,cancel_event=self._stop_event,discharge_mode=discharge_mode)['Q_sim']
+                sim=calibration_discharge(params,area,rain,pet,dt,initial,self._stop_event,discharge_mode)
                 values=(sim[warm:end][valid]-observed)/normalizer
                 if not np.all(np.isfinite(values)):raise ValueError('Mô phỏng không hữu hạn.')
                 if len(cache)>=cache_limit:cache.clear()
@@ -2331,34 +2380,46 @@ class NAMDesktopApp:
                 values=residuals(params);nse=1-float(np.dot(values,values))
                 if not np.isfinite(nse):raise ValueError('NSE không xác định; kiểm tra chuỗi thực đo và giai đoạn đánh giá.')
                 return nse
+            # Positive storage/time constants span orders of magnitude: search in log space.
+            lower=np.array(bounds,dtype=float)[:,0];upper=np.array(bounds,dtype=float)[:,1]
+            logarithmic=np.array([k in ('U_max','L_max','CK_12','CK_IF','CK_BF') and lo>0 for k,lo in zip(PARAM_KEYS,lower)])
+            low=lower.copy();high=upper.copy();low[logarithmic]=np.log(lower[logarithmic]);high[logarithmic]=np.log(upper[logarithmic])
+            def decode(x):
+                values=low+np.asarray(x)*(high-low);values[logarithmic]=np.exp(values[logarithmic])
+                return dict(zip(PARAM_KEYS,np.clip(values,lower,upper)))
+            def encode(params):
+                values=np.array([params[k] for k in PARAM_KEYS]);values[logarithmic]=np.log(values[logarithmic])
+                return np.clip((values-low)/(high-low),0,1)
             best_params=current.copy();best_nse=score(best_params)
             def objective(x):
                 nonlocal best_params,best_nse
-                params=dict(zip(PARAM_KEYS,x));nse=score(params)
+                params=decode(x);nse=score(params)
                 if nse>best_nse:best_nse=nse;best_params=params.copy()
                 return 1-nse
             converged=0
             for run in range(runs):
                 generation=0
-                self._worker_queue.put(('progress',f'Lần {run+1}/{runs}: NSE tốt nhất = {best_nse:.4f}'))
                 def callback(xk,convergence):
                     nonlocal generation
                     generation+=1
-                    self._worker_queue.put(('progress',f'Lần {run+1}/{runs}, thế hệ {generation}/{maxiter}: NSE tốt nhất = {best_nse:.4f}'))
-                candidate=np.array([best_params[k] for k in PARAM_KEYS])
-                candidate=np.clip(candidate,np.array(bounds)[:,0],np.array(bounds)[:,1])
-                result=differential_evolution(objective,bounds=bounds,maxiter=maxiter,popsize=10,tol=.005,
-                    seed=42+run,polish=False,x0=candidate,callback=callback)
+                    elapsed=time.perf_counter()-started
+                    self._worker_queue.put(('progress',f'Lần {run+1}/{runs} · thế hệ {generation}/{maxiter}\nNSE tốt nhất: {best_nse:.4f} · {evaluations} mô phỏng · {elapsed:.1f} giây',90*(run+generation/maxiter)/runs))
+                    return self._stop_event.is_set()
+                candidate=encode(best_params)
+                population=qmc.LatinHypercube(d=len(PARAM_KEYS),seed=42+run).random(10*len(PARAM_KEYS))
+                population[:9]=np.clip(candidate+np.random.default_rng(42+run).normal(0,.08,(9,len(PARAM_KEYS))),0,1)
+                population[0]=candidate
+                result=differential_evolution(objective,bounds=[(0.,1.)]*len(PARAM_KEYS),maxiter=maxiter,tol=.005,
+                    seed=42+run,polish=False,init=population,callback=callback)
                 converged+=int(result.success)
-            self._worker_queue.put(('progress','Tinh chỉnh cục bộ bộ thông số tốt nhất bằng NAM...'))
-            lower=np.array(bounds)[:,0];upper=np.array(bounds)[:,1]
+            self._worker_queue.put(('progress','Tinh chỉnh cục bộ bộ thông số tốt nhất bằng NAM…',90))
             def local_residual(x):
                 objective(x)
-                return residuals(dict(zip(PARAM_KEYS,x)))
-            least_squares(local_residual,np.clip([best_params[k] for k in PARAM_KEYS],lower,upper),bounds=(lower,upper),max_nfev=30,x_scale='jac',ftol=1e-6,xtol=1e-6,gtol=1e-6)
+                return residuals(decode(x))
+            least_squares(local_residual,encode(best_params),bounds=(np.zeros(len(PARAM_KEYS)),np.ones(len(PARAM_KEYS))),max_nfev=60,x_scale='jac',ftol=1e-7,xtol=1e-7,gtol=1e-7)
             # Không bao giờ thay bộ hiện tại bằng bộ có NSE thấp hơn.
             self._worker_queue.put(('done',signature,best_params,float(best_nse),converged==runs,
-                f'{evaluations} phép mô phỏng, dùng lại {cache_hits} kết quả; đã chạy {runs} lần; {converged} lần đạt điều kiện hội tụ, {runs-converged} lần hết giới hạn thế hệ.'))
+                f'{time.perf_counter()-started:.1f} giây; {evaluations} phép mô phỏng, dùng lại {cache_hits} kết quả; đã chạy {runs} lần; {converged} lần đạt điều kiện hội tụ, {runs-converged} lần hết giới hạn thế hệ.'))
         except CalibrationStopped:
             self._worker_queue.put(('done',signature,best_params,float(best_nse),False,'Đã dừng theo yêu cầu; giữ bộ tốt nhất đã đánh giá.'))
         except Exception as exc:self._worker_queue.put(('error',str(exc)))
@@ -2371,8 +2432,10 @@ class NAMDesktopApp:
                 except queue.Empty:break
         except queue.Empty:self.root.after(100,self._poll_worker);return
         if result[0]=='progress':
-            self.lbl_calib_status.config(text=result[1]);self.root.after(100,self._poll_worker);return
-        self._busy=False;self.progress_bar.stop();self.btn_calibrate.config(state=tk.NORMAL);self.btn_stop.config(state=tk.DISABLED)
+            self.lbl_calib_status.config(text=result[1])
+            if len(result)>2:self.progress_bar.config(value=result[2])
+            self.root.after(100,self._poll_worker);return
+        self._busy=False;self.progress_bar.stop();self.progress_bar.config(value=self.progress_bar['value'] if self._stop_event.is_set() else 100 if result[0]=='done' else 0);self.btn_calibrate.config(state=tk.NORMAL);self.btn_stop.config(state=tk.DISABLED)
         if result[0]=='error':
             self.lbl_calib_status.config(text='Hiệu chỉnh thất bại.')
             messagebox.showerror('Hiệu chỉnh',result[1]);return
