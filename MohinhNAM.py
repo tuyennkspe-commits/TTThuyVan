@@ -8,6 +8,7 @@ Không khẳng định tương đương bộ giải MIKE NAM của DHI.
 Cài đặt: python -m pip install numpy pandas scipy matplotlib openpyxl
 Tăng tốc tùy chọn: python -m pip install numba
 Đọc MIKE DFS0: python -m pip install mikeio
+Bản đồ lưu vực/Thiessen: python -m pip install geopandas shapely pyproj
 P/PET tổng mm mỗi bước; Q trung bình hoặc tức thời cuối bước m³/s, chọn theo quan trắc.
 Hiệu chỉnh cần kiểm định độc lập.
 """
@@ -621,6 +622,69 @@ def compute_metrics(obs,sim):
 # ==============================================================================
 
 
+def _geo_modules():
+    try:
+        import geopandas as gpd
+        from shapely.geometry import shape, mapping, Polygon
+        from shapely.ops import transform, unary_union
+        from pyproj import CRS, Transformer
+    except ImportError as exc:
+        raise ValueError('Cần cài thư viện bản đồ: python -m pip install geopandas shapely pyproj') from exc
+    return gpd,shape,mapping,Polygon,transform,unary_union,CRS,Transformer
+
+
+def basin_metric_geometry(geojson):
+    _,shape,_,_,transform,_,CRS,Transformer=_geo_modules()
+    basin=shape(geojson)
+    if basin.geom_type not in ('Polygon','MultiPolygon') or basin.is_empty or not basin.is_valid:
+        raise ValueError('Ranh giới phải là Polygon/MultiPolygon hợp lệ, không rỗng.')
+    west,south,east,north=basin.bounds
+    if not (-180<=west<=east<=180 and -90<south<=north<90):raise ValueError('Tọa độ lưu vực WGS84 không hợp lệ.')
+    center=basin.centroid
+    crs=CRS.from_proj4(f'+proj=laea +lat_0={center.y} +lon_0={center.x} +datum=WGS84 +units=m +no_defs')
+    forward=Transformer.from_crs(4326,crs,always_xy=True)
+    metric=transform(forward.transform,basin)
+    if not metric.is_valid or not np.isfinite(metric.area) or metric.area<=0:
+        raise ValueError('Không tính được diện tích lưu vực.')
+    return metric,crs,forward
+
+
+def thiessen_basin_weights(geojson,positions):
+    """Giao các nửa mặt phẳng gần nhất với lưu vực; hỗ trợ 1, 2 trạm và trạm thẳng hàng."""
+    _,_,_,Polygon,_,_,_,_= _geo_modules()
+    basin,crs,forward=basin_metric_geometry(geojson)
+    names=list(positions)
+    if not names:raise ValueError('Chưa có vị trí trạm mưa.')
+    points=np.array([forward.transform(*positions[name]) for name in names],dtype=float)
+    if not np.isfinite(points).all():raise ValueError('Tọa độ trạm mưa không hợp lệ.')
+    origin=np.array(basin.centroid.coords[0]);points-=origin
+    xmin,ymin,xmax,ymax=basin.bounds;pad=max(xmax-xmin,ymax-ymin,1.)*.01+1.
+    box=[np.array([xmin-pad,ymin-pad])-origin,np.array([xmax+pad,ymin-pad])-origin,
+         np.array([xmax+pad,ymax+pad])-origin,np.array([xmin-pad,ymax+pad])-origin]
+    areas=[];cells=[]
+    for i,point in enumerate(points):
+        vertices=list(box)
+        for j,other in enumerate(points):
+            if i==j:continue
+            normal=other-point;distance=np.linalg.norm(normal)
+            if distance<.001:raise ValueError('Hai trạm có vị trí trùng nhau; không xác định được trọng số riêng.')
+            normal/=distance;boundary=float(np.dot(normal,(other+point)*.5))
+            clipped=[]
+            for a,b in zip(vertices,vertices[1:]+vertices[:1]):
+                da=float(np.dot(normal,a)-boundary);db=float(np.dot(normal,b)-boundary)
+                inside_a=da<=0;inside_b=db<=0
+                if inside_a:clipped.append(a)
+                if inside_a!=inside_b:clipped.append(a+(b-a)*da/(da-db))
+            vertices=clipped
+            if not vertices:break
+        cell=basin.intersection(Polygon(np.array(vertices)+origin)) if len(vertices)>=3 else Polygon()
+        cells.append(cell);areas.append(cell.area)
+    total=float(sum(areas))
+    if not np.isclose(total,basin.area,rtol=1e-8,atol=.01):raise ValueError('Diện tích các vùng Thiessen chưa khớp lưu vực.')
+    return dict(weights=dict(zip(names,np.array(areas)/total)),areas_km2=dict(zip(names,np.array(areas)/1e6)),
+                cells=dict(zip(names,cells)),basin=basin,crs=crs,forward=forward,area_km2=basin.area/1e6)
+
+
 def cumulative_water_volume(observed,simulated_mean,dt_hours,discharge_mode='mean'):
     """Tổng lượng nước m³; chỉ cộng các khoảng có đủ quan trắc.
 
@@ -661,6 +725,8 @@ class NAMDesktopApp:
         self.df_data = None
         self.input_series={}
         self.rain_stations={}
+        self._basin_geojson=None;self._basin_source='';self._station_positions={}
+        self._thiessen_result=None;self._map_pick=False
         self._is_demo=False
         self.auto_period=tk.BooleanVar(value=True)
         self.auto_dt=tk.BooleanVar(value=True)
@@ -894,6 +960,12 @@ class NAMDesktopApp:
         right_frame = ttk.Frame(main_paned)
         main_paned.add(right_frame, weight=1)
 
+        self.results_tabs=ttk.Notebook(right_frame);self.results_tabs.pack(fill='both',expand=True)
+        plot_frame=ttk.Frame(self.results_tabs);map_frame=ttk.Frame(self.results_tabs)
+        self.results_tabs.add(plot_frame,text='Mô phỏng và kết quả')
+        self.results_tabs.add(map_frame,text='Bản đồ lưu vực')
+        self._build_basin_map(map_frame)
+        right_frame=plot_frame
         # Thanh hiển thị chỉ số thống kê (NSE, Qmax, PBIAS)
         metrics_bar = ttk.Frame(right_frame, padding=5)
         metrics_bar.pack(fill=tk.X)
@@ -936,6 +1008,158 @@ class NAMDesktopApp:
     # CÁC HÀM XỬ LÝ SỰ KIỆN VÀ DỮ LIỆU
     # ==========================================================================
 
+    def _build_basin_map(self,parent):
+        row=ttk.Frame(parent,padding=5);row.pack(fill='x')
+        for label,command in [('Nhập lưu vực (.shp)',self._import_basin),('Vị trí trạm mưa',self._station_coordinate_dialog),('Tính trọng số Thiessen',self._calculate_thiessen)]:
+            ttk.Button(row,text=label,command=command).pack(side='left',padx=3)
+        row=ttk.Frame(parent,padding=5);row.pack(fill='x')
+        ttk.Label(row,text='Trạm để đặt trên bản đồ:').pack(side='left')
+        self.map_station_choice=ttk.Combobox(row,state='readonly',width=25);self.map_station_choice.pack(side='left',padx=3)
+        ttk.Button(row,text='Chọn vị trí bằng chuột',command=self._enable_map_pick).pack(side='left',padx=3)
+        ttk.Button(row,text='Xóa vị trí trạm',command=self._remove_station_position).pack(side='left',padx=3)
+        self.lbl_map_status=ttk.Label(parent,text='Nhập SHP cùng các tệp .shx, .dbf, .prj. Trạm mưa có thể nằm ngoài lưu vực.',wraplength=850)
+        self.lbl_map_status.pack(fill='x',padx=8,pady=4)
+        self.map_fig=Figure(figsize=(8,5),dpi=100);self.map_ax=self.map_fig.add_subplot(111)
+        self.map_canvas=FigureCanvasTkAgg(self.map_fig,master=parent);self.map_canvas.get_tk_widget().pack(fill='both',expand=True)
+        self.map_canvas.mpl_connect('button_press_event',self._map_clicked)
+        NavigationToolbar2Tk(self.map_canvas,parent).pack(fill='x')
+        self.map_tree=ttk.Treeview(parent,columns=('name','lon','lat','area','weight'),show='headings',height=5)
+        for key,label in [('name','Trạm mưa'),('lon','Kinh độ'),('lat','Vĩ độ'),('area','Vùng Thiessen (km²)'),('weight','Trọng số')]:
+            self.map_tree.heading(key,text=label);self.map_tree.column(key,width=145,stretch=True)
+        self.map_tree.pack(fill='x',padx=5,pady=5)
+        self._draw_basin_map()
+
+    def _sync_map_stations(self):
+        names=list(self.rain_stations)
+        self.map_station_choice.config(values=names)
+        if self.map_station_choice.get() not in names:self.map_station_choice.set(names[0] if names else '')
+
+    def _import_basin(self):
+        if not self._project_idle():return
+        if self.validation_mode:
+            messagebox.showinfo('Kiểm định','Diện tích lưu vực kiểm định phải giữ như khi hiệu chỉnh. Nhập lưu vực ở cửa sổ chính.',parent=self.root);return
+        path=filedialog.askopenfilename(parent=self.root,title='Nhập ranh giới lưu vực',filetypes=[('Shapefile','*.shp')])
+        if not path:return
+        try:
+            gpd,_,mapping,_,_,union,_,_=_geo_modules()
+            frame=gpd.read_file(path)
+            if frame.crs is None:
+                code=simpledialog.askstring('Hệ tọa độ SHP','Tệp thiếu hệ tọa độ (.prj). Nhập EPSG hoặc định nghĩa CRS đúng của dữ liệu (không tự đoán):',parent=self.root)
+                if not code:return
+                frame=frame.set_crs(code)
+            if frame.empty or frame.geometry.isna().any() or frame.geometry.is_empty.any():raise ValueError('SHP rỗng hoặc chứa đối tượng không có hình học.')
+            if not frame.geom_type.isin(['Polygon','MultiPolygon']).all() or not frame.geometry.is_valid.all():
+                raise ValueError('SHP lưu vực phải gồm các polygon hợp lệ. Kiểm tra lại hình học trong phần mềm GIS.')
+            if len(frame)>1 and not messagebox.askyesno('Nhiều polygon',f'SHP có {len(frame)} đối tượng. Hợp nhất tất cả thành một lưu vực (phần chồng chỉ tính một lần)?',parent=self.root):return
+            geometry=union(frame.to_crs(4326).geometry.tolist());geojson=mapping(geometry)
+            metric,_,_=basin_metric_geometry(geojson)
+            self._basin_geojson=geojson;self._basin_source=Path(path).name;self._thiessen_result=None
+            self.ent_area.delete(0,'end');self.ent_area.insert(0,f'{metric.area/1e6:.12g}')
+            self._refresh_inputs();self._draw_basin_map()
+        except Exception as exc:messagebox.showerror('Nhập lưu vực',str(exc),parent=self.root)
+
+    def _station_coordinate_dialog(self):
+        self._sync_map_stations()
+        if not self.rain_stations:
+            messagebox.showinfo('Trạm mưa','Nhập chuỗi mưa của các trạm trước, sau đó đặt vị trí theo đúng tên trạm.',parent=self.root);return
+        window=tk.Toplevel(self.root);window.title('Tọa độ trạm mưa');window.transient(self.root)
+        fields={}
+        for r,(key,label,default) in enumerate([('name','Tên trạm',self.map_station_choice.get()),('crs','Hệ tọa độ EPSG','EPSG:4326'),('x','X / kinh độ / Easting',''),('y','Y / vĩ độ / Northing','')]):
+            ttk.Label(window,text=label).grid(row=r,column=0,padx=8,pady=5,sticky='w')
+            entry=ttk.Combobox(window,values=list(self.rain_stations),state='readonly') if key=='name' else ttk.Entry(window,width=28)
+            entry.set(default) if key=='name' else entry.insert(0,default)
+            entry.grid(row=r,column=1,padx=8,pady=5);fields[key]=entry
+        ttk.Label(window,text='WGS84: X=kinh độ, Y=vĩ độ. Tọa độ phẳng: X=Easting, Y=Northing (m).',wraplength=430).grid(row=4,column=0,columnspan=2,padx=8,pady=5)
+        def save():
+            try:
+                _,_,_,_,_,_,_,Transformer=_geo_modules()
+                x=finite_number(fields['x'].get(),'X');y=finite_number(fields['y'].get(),'Y')
+                lon,lat=Transformer.from_crs(fields['crs'].get(),4326,always_xy=True).transform(x,y,errcheck=True)
+                if not (-180<=lon<=180 and -90<lat<90):raise ValueError('Tọa độ không hợp lệ.')
+                self._station_positions[fields['name'].get()]=[lon,lat];self._thiessen_result=None
+                self._draw_basin_map();window.destroy()
+            except Exception as exc:messagebox.showerror('Tọa độ trạm',str(exc),parent=window)
+        ttk.Button(window,text='Lưu vị trí trạm',command=save).grid(row=5,column=0,columnspan=2,pady=8)
+
+    def _enable_map_pick(self):
+        self._sync_map_stations()
+        if self._basin_geojson is None or not self.map_station_choice.get():
+            messagebox.showinfo('Bản đồ','Nhập lưu vực và chuỗi mưa các trạm trước.',parent=self.root);return
+        self._map_pick=True
+        self.lbl_map_status.config(text='Bấm trên bản đồ để đặt trạm '+self.map_station_choice.get()+'. Có thể đặt bên ngoài lưu vực.')
+
+    def _map_clicked(self,event):
+        if not self._map_pick or event.inaxes!=self.map_ax or event.xdata is None:return
+        if self.map_canvas.toolbar.mode:return
+        try:
+            _,_,_,_,_,_,_,Transformer=_geo_modules()
+            _,crs,_=basin_metric_geometry(self._basin_geojson)
+            lon,lat=Transformer.from_crs(crs,4326,always_xy=True).transform(event.xdata,event.ydata,errcheck=True)
+            self._station_positions[self.map_station_choice.get()]=[lon,lat]
+            self._map_pick=False;self._thiessen_result=None;self._draw_basin_map()
+        except Exception as exc:messagebox.showerror('Đặt trạm',str(exc),parent=self.root)
+
+    def _remove_station_position(self):
+        self._station_positions.pop(self.map_station_choice.get(),None)
+        self._thiessen_result=None;self._draw_basin_map()
+
+    def _calculate_thiessen(self):
+        if not self._project_idle():return
+        try:
+            if self._basin_geojson is None:raise ValueError('Chưa nhập lưu vực.')
+            if not self.rain_stations:raise ValueError('Chưa nhập các chuỗi mưa.')
+            missing=[name for name in self.rain_stations if name not in self._station_positions]
+            if missing:raise ValueError('Chưa có tọa độ trạm: '+', '.join(missing))
+            positions={name:self._station_positions[name] for name in self.rain_stations}
+            result=thiessen_basin_weights(self._basin_geojson,positions)
+            for name,item in self.rain_stations.items():item['weight']=float(result['weights'][name])
+            self._thiessen_result=result
+            self._update_rain_label();self._thiessen_result=result;self._refresh_inputs();self._draw_basin_map()
+            self.lbl_map_status.config(text=f'Diện tích lưu vực: {result["area_km2"]:.3f} km². Tổng trọng số = {sum(result["weights"].values()):.8f}. Đã áp dụng vào mưa bình quân lưu vực.')
+        except Exception as exc:messagebox.showerror('Thiessen',str(exc),parent=self.root)
+
+    def _draw_basin_map(self):
+        self._sync_map_stations();self.map_ax.clear();self.map_tree.delete(*self.map_tree.get_children())
+        if self._basin_geojson is None:
+            self.map_ax.text(.5,.5,'Chưa nhập bản đồ lưu vực',transform=self.map_ax.transAxes,ha='center')
+            self.map_canvas.draw();return
+        try:
+            _,_,_,_,_,_,_,_= _geo_modules()
+            from matplotlib.path import Path as PlotPath
+            from matplotlib.patches import PathPatch
+            basin,crs,forward=basin_metric_geometry(self._basin_geojson)
+            def draw_polygon(geom,color,alpha):
+                if geom.is_empty:return
+                if geom.geom_type in ('MultiPolygon','GeometryCollection'):
+                    for part in geom.geoms:draw_polygon(part,color,alpha)
+                elif geom.geom_type=='Polygon':
+                    from shapely.geometry.polygon import orient
+                    geom=orient(geom,sign=1.)
+                    vertices=[];codes=[]
+                    for ring in [geom.exterior,*geom.interiors]:
+                        coords=list(ring.coords);vertices.extend(coords);codes.extend([PlotPath.MOVETO]+[PlotPath.LINETO]*(len(coords)-2)+[PlotPath.CLOSEPOLY])
+                    self.map_ax.add_patch(PathPatch(PlotPath(vertices,codes),facecolor=color,edgecolor='#28536b',alpha=alpha,lw=1.1))
+            draw_polygon(basin,'#dcebf3',1.)
+            result=self._thiessen_result
+            if result is not None:
+                colors=['#79c7c5','#f2b880','#a6c48a','#b5a7d4','#ef9c9c']
+                for i,cell in enumerate(result['cells'].values()):draw_polygon(cell,colors[i%len(colors)],.65)
+            for name in self.rain_stations:
+                point=self._station_positions.get(name)
+                if point is None:
+                    self.map_tree.insert('','end',values=(name,'Chưa đặt','','',''));continue
+                x,y=forward.transform(*point);self.map_ax.plot(x,y,'^',color='#c62828',markersize=8)
+                self.map_ax.annotate(name,(x,y),xytext=(5,5),textcoords='offset points',fontsize=9)
+                area='' if result is None else f'{result["areas_km2"][name]:.3f}'
+                weight='' if result is None else f'{result["weights"][name]:.6f}'
+                self.map_tree.insert('','end',values=(name,f'{point[0]:.7f}',f'{point[1]:.7f}',area,weight))
+            self.map_ax.autoscale_view();self.map_ax.margins(.1);self.map_ax.set_aspect('equal',adjustable='datalim')
+            self.map_ax.set(xlabel='Easting (m)',ylabel='Northing (m)',title='Lưu vực và trạm mưa — phép chiếu bảo toàn diện tích')
+            self.map_ax.ticklabel_format(style='plain',useOffset=False);self.map_ax.grid(alpha=.2)
+            self.lbl_map_status.config(text=f'{self._basin_source} — Diện tích: {basin.area/1e6:.3f} km². Đặt đủ vị trí trạm rồi bấm tính Thiessen để cập nhật trọng số.')
+            self.map_fig.tight_layout();self.map_canvas.draw()
+        except Exception as exc:self.lbl_map_status.config(text=str(exc))
+
     # Dự án JSON tự chứa dữ liệu, không phụ thuộc đường dẫn tệp nguồn.
     _PROJECT_ENTRIES=('ent_area','ent_dt','ent_warm','ent_split','ent_u','ent_l',
                       'ent_base','ent_surf','ent_inter','ent_period_start',
@@ -971,7 +1195,7 @@ class NAMDesktopApp:
                     auto_period=self.auto_period.get(),auto_dt=self.auto_dt.get(),
                     discharge_mode=self._discharge_mode(),params=self.best_params.copy(),
                     bounds=[list(pair) for pair in self.param_bounds],calibrated=calibrated,
-                    demo=self._is_demo,
+                    demo=self._is_demo,basin_map=dict(geometry=self._basin_geojson,source=self._basin_source,stations=self._station_positions,thiessen_computed=self._thiessen_result is not None),
                     rain_stations=[dict(name=name,weight=item['weight'],source=item['source'],
                         data=self._pack_series(item['data'])) for name,item in self.rain_stations.items()],
                     input_series={key:self._pack_series(frame) for key,frame in self.input_series.items() if key!='Mua_mm'})
@@ -1057,6 +1281,15 @@ class NAMDesktopApp:
         if calibrated is not None:
             calibrated=dict(params=parameters(calibrated['params']),area=finite_number(calibrated['area'],'Diện tích hiệu chỉnh',True),discharge_mode=calibrated['discharge_mode'])
             if calibrated['discharge_mode'] not in ('mean','endpoint'):raise ValueError('Loại lưu lượng hiệu chỉnh không hợp lệ.')
+        basin_map=payload.get('basin_map',{})
+        if basin_map.get('geometry') is not None:basin_metric_geometry(basin_map['geometry'])
+        for name,point in basin_map.get('stations',{}).items():
+            if not isinstance(name,str) or len(point)!=2 or not all(np.isfinite(v) for v in point) or not (-180<=point[0]<=180 and -90<point[1]<90):
+                raise ValueError('Vị trí trạm trong dự án không hợp lệ.')
+        if basin_map.get('thiessen_computed'):
+            if basin_map.get('geometry') is None or not stations or any(name not in basin_map.get('stations',{}) for name in stations):
+                raise ValueError('Dự án thiếu lưu vực hoặc tọa độ dùng tính Thiessen.')
+            thiessen_basin_weights(basin_map['geometry'],{name:basin_map['stations'][name] for name in stations})
         return params,bounds,stations,inputs,calibrated
 
     def _apply_project(self,payload,decoded):
@@ -1071,11 +1304,20 @@ class NAMDesktopApp:
         self._calibrated_params=None if calibrated is None else calibrated['params']
         if calibrated is not None:
             self._calibrated_area=calibrated['area'];self._calibrated_discharge_mode=calibrated['discharge_mode']
+        basin_map=payload.get('basin_map',{})
+        self._basin_geojson=basin_map.get('geometry');self._basin_source=basin_map.get('source','')
+        self._station_positions=basin_map.get('stations',{});self._thiessen_result=None
         self._suggested_period=self._period();self.current_sim=None;self._result_signature=None
         for key,label in self.series_labels.items():
             frame=inputs.get(key)
             label.config(text='Chưa nhập' if frame is None else f'Dữ liệu trong dự án — {len(frame)} dòng',foreground='gray' if frame is None else 'blue')
         self._update_rain_label();self._update_parameter_display();self._refresh_inputs()
+        if basin_map.get('thiessen_computed') and self._basin_geojson is not None:
+            positions={name:self._station_positions[name] for name in self.rain_stations}
+            result=thiessen_basin_weights(self._basin_geojson,positions)
+            if all(np.isclose(item['weight'],result['weights'][name],atol=1e-10) for name,item in self.rain_stations.items()):
+                self._thiessen_result=result
+        self._draw_basin_map()
         self.lbl_calib_status.config(text='Đã mở dự án. Bấm chạy mô phỏng để tính lại kết quả.' if stations else 'Sẵn sàng')
 
     def _open_project(self):
@@ -1155,7 +1397,7 @@ class NAMDesktopApp:
         self._is_demo=True
         for key,label in self.series_labels.items():label.config(text='Giả lập: 72 bước giờ',foreground='green')
         self.lbl_data_status.config(text='DỮ LIỆU GIẢ LẬP, không phải quan trắc',foreground='green')
-        self._update_parameter_display()
+        self._update_parameter_display();self._update_rain_label()
         self._recompute_and_plot()
 
     def _update_parameter_display(self):
@@ -1205,6 +1447,9 @@ class NAMDesktopApp:
         app.ent_area.delete(0,"end");app.ent_area.insert(0,str(self._calibrated_area));app.ent_area.config(state="readonly")
         app._project_defaults=app._project_payload();app._saved_project=app._project_text()
         app._update_project_title()
+        app._basin_geojson=self._basin_geojson;app._basin_source=self._basin_source
+        app._station_positions={name:list(point) for name,point in self._station_positions.items()}
+        app._project_defaults=app._project_payload();app._saved_project=app._project_text();app._draw_basin_map()
         window._nam_app=app
 
     def _edit_parameters(self):
@@ -1265,7 +1510,10 @@ class NAMDesktopApp:
         except Exception as exc:messagebox.showerror('Nhập trạm mưa',str(exc))
 
     def _update_rain_label(self):
+        self._thiessen_result=None
+        self._sync_map_stations()
         self.series_labels['Mua_mm'].config(text=f'{len(self.rain_stations)} trạm; tổng trọng số = {sum(v["weight"] for v in self.rain_stations.values()):.6f}',foreground='blue')
+        self._draw_basin_map()
 
     def _manage_rain(self):
         window=tk.Toplevel(self.root);window.title('Trạm mưa và trọng số lưu vực');window.geometry('750x420')
