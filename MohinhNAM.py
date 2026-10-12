@@ -1010,12 +1010,13 @@ class NAMDesktopApp:
 
     def _build_basin_map(self,parent):
         row=ttk.Frame(parent,padding=5);row.pack(fill='x')
-        for label,command in [('Nhập lưu vực (.shp)',self._import_basin),('Vị trí trạm mưa',self._station_coordinate_dialog),('Tính trọng số Thiessen',self._calculate_thiessen)]:
+        for label,command in [('Nhập lưu vực (.shp)',self._import_basin),('Thêm / sửa trạm mưa',self._station_coordinate_dialog),('Tính trọng số Thiessen',self._calculate_thiessen)]:
             ttk.Button(row,text=label,command=command).pack(side='left',padx=3)
         row=ttk.Frame(parent,padding=5);row.pack(fill='x')
         ttk.Label(row,text='Trạm để đặt trên bản đồ:').pack(side='left')
         self.map_station_choice=ttk.Combobox(row,state='readonly',width=25);self.map_station_choice.pack(side='left',padx=3)
         ttk.Button(row,text='Chọn vị trí bằng chuột',command=self._enable_map_pick).pack(side='left',padx=3)
+        ttk.Button(row,text='Chọn dữ liệu mưa',command=lambda:self._import_rain_station(self.map_station_choice.get())).pack(side='left',padx=3)
         ttk.Button(row,text='Xóa vị trí trạm',command=self._remove_station_position).pack(side='left',padx=3)
         self.lbl_map_status=ttk.Label(parent,text='Nhập SHP cùng các tệp .shx, .dbf, .prj. Trạm mưa có thể nằm ngoài lưu vực.',wraplength=850)
         self.lbl_map_status.pack(fill='x',padx=8,pady=4)
@@ -1023,14 +1024,14 @@ class NAMDesktopApp:
         self.map_canvas=FigureCanvasTkAgg(self.map_fig,master=parent);self.map_canvas.get_tk_widget().pack(fill='both',expand=True)
         self.map_canvas.mpl_connect('button_press_event',self._map_clicked)
         NavigationToolbar2Tk(self.map_canvas,parent).pack(fill='x')
-        self.map_tree=ttk.Treeview(parent,columns=('name','lon','lat','area','weight'),show='headings',height=5)
-        for key,label in [('name','Trạm mưa'),('lon','Kinh độ'),('lat','Vĩ độ'),('area','Vùng Thiessen (km²)'),('weight','Trọng số')]:
+        self.map_tree=ttk.Treeview(parent,columns=('name','lon','lat','area','weight','data'),show='headings',height=5)
+        for key,label in [('name','Trạm mưa'),('lon','Kinh độ'),('lat','Vĩ độ'),('area','Vùng Thiessen (km²)'),('weight','Trọng số'),('data','Dữ liệu mưa')]:
             self.map_tree.heading(key,text=label);self.map_tree.column(key,width=145,stretch=True)
         self.map_tree.pack(fill='x',padx=5,pady=5)
         self._draw_basin_map()
 
     def _sync_map_stations(self):
-        names=list(self.rain_stations)
+        names=list(dict.fromkeys([*self.rain_stations,*self._station_positions]))
         self.map_station_choice.config(values=names)
         if self.map_station_choice.get() not in names:self.map_station_choice.set(names[0] if names else '')
 
@@ -1058,33 +1059,70 @@ class NAMDesktopApp:
             self._refresh_inputs();self._draw_basin_map()
         except Exception as exc:messagebox.showerror('Nhập lưu vực',str(exc),parent=self.root)
 
+    @staticmethod
+    def _station_lonlat(first,second,crs_code,confirm_swap=None):
+        # Giao diện theo thứ tự vĩ độ/kinh độ hoặc X(Bắc)/Y(Đông).
+        _,_,_,_,_,_,CRS,Transformer=_geo_modules()
+        crs=CRS.from_user_input(crs_code)
+        first=finite_number(str(first).strip().replace(',','.'),'Vĩ độ / X Bắc');second=finite_number(str(second).strip().replace(',','.'),'Kinh độ / Y Đông')
+        if crs.is_geographic:
+            if abs(first)>90 and abs(second)<=90:
+                if confirm_swap is None or not confirm_swap():
+                    raise ValueError('Hai giá trị có vẻ nhập ngược. Ô thứ nhất là vĩ độ, ô thứ hai là kinh độ.')
+                first,second=second,first
+            if not (-90<first<90 and -180<=second<=180):
+                raise ValueError('Vĩ độ phải trong (-90;90), kinh độ trong [-180;180]. Ví dụ: vĩ độ 22.45235, kinh độ 105.72063.')
+        lon,lat=Transformer.from_crs(crs,4326,always_xy=True).transform(second,first,errcheck=True)
+        if not (-180<=lon<=180 and -90<lat<90):raise ValueError('Tọa độ sau chuyển đổi không hợp lệ; kiểm tra hệ tọa độ và thứ tự X Bắc/Y Đông.')
+        return [lon,lat]
+
     def _station_coordinate_dialog(self):
+        if not self._project_idle():return
         self._sync_map_stations()
-        if not self.rain_stations:
-            messagebox.showinfo('Trạm mưa','Nhập chuỗi mưa của các trạm trước, sau đó đặt vị trí theo đúng tên trạm.',parent=self.root);return
-        window=tk.Toplevel(self.root);window.title('Tọa độ trạm mưa');window.transient(self.root)
-        fields={}
-        for r,(key,label,default) in enumerate([('name','Tên trạm',self.map_station_choice.get()),('crs','Hệ tọa độ EPSG','EPSG:4326'),('x','X / kinh độ / Easting',''),('y','Y / vĩ độ / Northing','')]):
-            ttk.Label(window,text=label).grid(row=r,column=0,padx=8,pady=5,sticky='w')
-            entry=ttk.Combobox(window,values=list(self.rain_stations),state='readonly') if key=='name' else ttk.Entry(window,width=28)
+        window=tk.Toplevel(self.root);window.title('Thêm trạm mưa — vị trí và dữ liệu');window.transient(self.root)
+        fields={};labels={}
+        names=list(dict.fromkeys([*self.rain_stations,*self._station_positions]))
+        for r,(key,label,default) in enumerate([('name','Tên trạm (nhập mới hoặc chọn)',self.map_station_choice.get()),('crs','Hệ tọa độ EPSG','EPSG:4326'),('x','Vĩ độ (độ)',''),('y','Kinh độ (độ)','')]):
+            labels[key]=ttk.Label(window,text=label);labels[key].grid(row=r,column=0,padx=8,pady=5,sticky='w')
+            entry=ttk.Combobox(window,values=names,state='normal',width=28) if key=='name' else ttk.Entry(window,width=30)
             entry.set(default) if key=='name' else entry.insert(0,default)
             entry.grid(row=r,column=1,padx=8,pady=5);fields[key]=entry
-        ttk.Label(window,text='WGS84: X=kinh độ, Y=vĩ độ. Tọa độ phẳng: X=Easting, Y=Northing (m).',wraplength=430).grid(row=4,column=0,columnspan=2,padx=8,pady=5)
+        note=ttk.Label(window,wraplength=470);note.grid(row=4,column=0,columnspan=2,padx=8,pady=5)
+        def update_labels(event=None):
+            try:
+                _,_,_,_,_,_,CRS,_=_geo_modules();geographic=CRS.from_user_input(fields['crs'].get()).is_geographic
+            except Exception:return
+            labels['x'].config(text='Vĩ độ (độ)' if geographic else 'X — Northing / tọa độ Bắc (m)')
+            labels['y'].config(text='Kinh độ (độ)' if geographic else 'Y — Easting / tọa độ Đông (m)')
+            note.config(text='Ví dụ: vĩ độ 22.45235; kinh độ 105.72063. Sau khi lưu vị trí, chọn tệp mưa cho đúng trạm.' if geographic else 'Nhập X Bắc trước, Y Đông sau. Hệ tọa độ phải đúng với dữ liệu. Sau đó chọn tệp mưa cho trạm.')
+        def fill_existing(event=None):
+            point=self._station_positions.get(fields['name'].get().strip())
+            if point is not None:
+                for key,value in [('crs','EPSG:4326'),('x',f'{point[1]:.10f}'),('y',f'{point[0]:.10f}')]:
+                    fields[key].delete(0,'end');fields[key].insert(0,value)
+                update_labels()
+        fields['crs'].bind('<KeyRelease>',update_labels);fields['name'].bind('<<ComboboxSelected>>',fill_existing)
+        update_labels();fill_existing()
         def save():
             try:
-                _,_,_,_,_,_,_,Transformer=_geo_modules()
-                x=finite_number(fields['x'].get(),'X');y=finite_number(fields['y'].get(),'Y')
-                lon,lat=Transformer.from_crs(fields['crs'].get(),4326,always_xy=True).transform(x,y,errcheck=True)
-                if not (-180<=lon<=180 and -90<lat<90):raise ValueError('Tọa độ không hợp lệ.')
-                self._station_positions[fields['name'].get()]=[lon,lat];self._thiessen_result=None
-                self._draw_basin_map();window.destroy()
+                name=fields['name'].get().strip()
+                if not name:raise ValueError('Tên trạm không được để trống.')
+                point=self._station_lonlat(fields['x'].get(),fields['y'].get(),fields['crs'].get(),
+                    lambda:messagebox.askyesno('Thứ tự tọa độ','Hai giá trị có vẻ là kinh độ rồi vĩ độ. Đổi lại thứ tự cho đúng?',parent=window))
+                self._station_positions[name]=point;self._thiessen_result=None
+                self._draw_basin_map();self.map_station_choice.set(name);window.destroy()
+                self._import_rain_station(name)
             except Exception as exc:messagebox.showerror('Tọa độ trạm',str(exc),parent=window)
-        ttk.Button(window,text='Lưu vị trí trạm',command=save).grid(row=5,column=0,columnspan=2,pady=8)
+        ttk.Button(window,text='Lưu vị trí và chọn dữ liệu mưa',command=save).grid(row=5,column=0,columnspan=2,pady=8)
 
     def _enable_map_pick(self):
         self._sync_map_stations()
-        if self._basin_geojson is None or not self.map_station_choice.get():
-            messagebox.showinfo('Bản đồ','Nhập lưu vực và chuỗi mưa các trạm trước.',parent=self.root);return
+        if self._basin_geojson is None:
+            messagebox.showinfo('Bản đồ','Nhập lưu vực trước khi đặt trạm bằng chuột.',parent=self.root);return
+        if not self.map_station_choice.get():
+            name=simpledialog.askstring('Trạm mưa','Tên trạm muốn đặt trên bản đồ:',parent=self.root)
+            if not name or not name.strip():return
+            self.map_station_choice.set(name.strip())
         self._map_pick=True
         self.lbl_map_status.config(text='Bấm trên bản đồ để đặt trạm '+self.map_station_choice.get()+'. Có thể đặt bên ngoài lưu vực.')
 
@@ -1095,8 +1133,10 @@ class NAMDesktopApp:
             _,_,_,_,_,_,_,Transformer=_geo_modules()
             _,crs,_=basin_metric_geometry(self._basin_geojson)
             lon,lat=Transformer.from_crs(crs,4326,always_xy=True).transform(event.xdata,event.ydata,errcheck=True)
-            self._station_positions[self.map_station_choice.get()]=[lon,lat]
+            name=self.map_station_choice.get()
+            self._station_positions[name]=[lon,lat]
             self._map_pick=False;self._thiessen_result=None;self._draw_basin_map()
+            if name not in self.rain_stations:self._import_rain_station(name)
         except Exception as exc:messagebox.showerror('Đặt trạm',str(exc),parent=self.root)
 
     def _remove_station_position(self):
@@ -1107,6 +1147,8 @@ class NAMDesktopApp:
         if not self._project_idle():return
         try:
             if self._basin_geojson is None:raise ValueError('Chưa nhập lưu vực.')
+            pending=[name for name in self._station_positions if name not in self.rain_stations]
+            if pending:raise ValueError('Chưa chọn dữ liệu mưa cho trạm: '+', '.join(pending)+'. Chọn trạm rồi bấm Chọn dữ liệu mưa.')
             if not self.rain_stations:raise ValueError('Chưa nhập các chuỗi mưa.')
             missing=[name for name in self.rain_stations if name not in self._station_positions]
             if missing:raise ValueError('Chưa có tọa độ trạm: '+', '.join(missing))
@@ -1121,6 +1163,10 @@ class NAMDesktopApp:
     def _draw_basin_map(self):
         self._sync_map_stations();self.map_ax.clear();self.map_tree.delete(*self.map_tree.get_children())
         if self._basin_geojson is None:
+            for name in dict.fromkeys([*self.rain_stations,*self._station_positions]):
+                point=self._station_positions.get(name)
+                self.map_tree.insert('','end',values=(name,f'{point[0]:.7f}' if point else 'Chưa đặt',f'{point[1]:.7f}' if point else '',
+                    '','',self.rain_stations[name]['source'] if name in self.rain_stations else 'Chưa chọn dữ liệu'))
             self.map_ax.text(.5,.5,'Chưa nhập bản đồ lưu vực',transform=self.map_ax.transAxes,ha='center')
             self.map_canvas.draw();return
         try:
@@ -1144,15 +1190,15 @@ class NAMDesktopApp:
             if result is not None:
                 colors=['#79c7c5','#f2b880','#a6c48a','#b5a7d4','#ef9c9c']
                 for i,cell in enumerate(result['cells'].values()):draw_polygon(cell,colors[i%len(colors)],.65)
-            for name in self.rain_stations:
+            for name in dict.fromkeys([*self.rain_stations,*self._station_positions]):
                 point=self._station_positions.get(name)
                 if point is None:
-                    self.map_tree.insert('','end',values=(name,'Chưa đặt','','',''));continue
+                    self.map_tree.insert('','end',values=(name,'Chưa đặt','','','','Đã nhập' if name in self.rain_stations else 'Chưa nhập'));continue
                 x,y=forward.transform(*point);self.map_ax.plot(x,y,'^',color='#c62828',markersize=8)
                 self.map_ax.annotate(name,(x,y),xytext=(5,5),textcoords='offset points',fontsize=9)
-                area='' if result is None else f'{result["areas_km2"][name]:.3f}'
-                weight='' if result is None else f'{result["weights"][name]:.6f}'
-                self.map_tree.insert('','end',values=(name,f'{point[0]:.7f}',f'{point[1]:.7f}',area,weight))
+                area='' if result is None else f'{result["areas_km2"].get(name,0):.3f}'
+                weight='' if result is None else f'{result["weights"].get(name,0):.6f}'
+                self.map_tree.insert('','end',values=(name,f'{point[0]:.7f}',f'{point[1]:.7f}',area,weight,self.rain_stations[name]['source'] if name in self.rain_stations else 'Chưa chọn dữ liệu'))
             self.map_ax.autoscale_view();self.map_ax.margins(.1);self.map_ax.set_aspect('equal',adjustable='datalim')
             self.map_ax.set(xlabel='Easting (m)',ylabel='Northing (m)',title='Lưu vực và trạm mưa — phép chiếu bảo toàn diện tích')
             self.map_ax.ticklabel_format(style='plain',useOffset=False);self.map_ax.grid(alpha=.2)
@@ -1486,18 +1532,25 @@ class NAMDesktopApp:
         number=simpledialog.askinteger('Chọn chuỗi trong DFS0',choices+'\nNhập số thứ tự mục muốn dùng:',minvalue=1,maxvalue=len(items),parent=self.root)
         return None if number is None else number-1
 
-    def _import_rain_station(self):
+    def _import_rain_station(self,station_name=None):
+        if not self._project_idle():return
+        if station_name is not None and not station_name.strip():
+            messagebox.showinfo("Trạm mưa","Chọn hoặc tạo vị trí trạm trước.",parent=self.root);return
         path=filedialog.askopenfilename(title='Nhập mưa một trạm: giá trị hoặc ThoiGian + Mua_mm',filetypes=[('CSV / Excel / MIKE DFS0','*.csv *.xlsx *.dfs0')])
         if not path:return
         try:
             df=read_series_file(path,'Mua_mm',self._choose_dfs_item)
             data=prepare_series(df,'Mua_mm')
-            name=simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
+            name=station_name if station_name is not None else simpledialog.askstring('Tên trạm mưa','Tên trạm:',initialvalue=os.path.splitext(os.path.basename(path))[0],parent=self.root)
             if name is None:return
             name=name.strip()
             if not name:raise ValueError('Tên trạm không được trống.')
-            if name in self.rain_stations and not self._is_demo:raise ValueError('Trạm đã có. Xóa trạm cũ trong bảng Trạm & trọng số trước khi nhập lại.')
-            weight=simpledialog.askfloat('Trọng số trạm','Trọng số từ 0 đến 1; tổng các trạm phải bằng 1:',initialvalue=1 if not self.rain_stations or self._is_demo else 0,minvalue=0,maxvalue=1,parent=self.root)
+            if name in self.rain_stations and not self._is_demo:
+                if station_name is None:raise ValueError('Trạm đã có. Chọn trạm trong tab bản đồ để thay dữ liệu.')
+                if not messagebox.askyesno('Thay dữ liệu mưa','Thay chuỗi mưa hiện có của trạm '+name+' bằng tệp vừa chọn?',parent=self.root):return
+            if station_name is not None:
+                weight=self.rain_stations[name]['weight'] if name in self.rain_stations and not self._is_demo else 1. if not self.rain_stations or self._is_demo else 0.
+            else:weight=simpledialog.askfloat('Trọng số trạm','Trọng số từ 0 đến 1; tổng các trạm phải bằng 1:',initialvalue=1 if not self.rain_stations or self._is_demo else 0,minvalue=0,maxvalue=1,parent=self.root)
             if weight is None:return
             if not np.isfinite(weight):raise ValueError('Trọng số phải hữu hạn.')
             if self._is_demo:
@@ -1505,6 +1558,8 @@ class NAMDesktopApp:
                 for label in self.series_labels.values():label.config(text='Chưa nhập',foreground='gray')
             self.rain_stations[name]=dict(data=data,weight=weight,source=os.path.basename(path))
             self._update_rain_label();self._refresh_inputs()
+            if station_name is not None and self._basin_geojson is not None and set(self.rain_stations)==set(self._station_positions):
+                self._calculate_thiessen()
             if data.attrs.get('import_notes'):messagebox.showinfo('Thông tin trạm mưa','\n'.join(data.attrs['import_notes']))
         except ImportCancelled:return
         except Exception as exc:messagebox.showerror('Nhập trạm mưa',str(exc))
