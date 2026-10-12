@@ -13,6 +13,8 @@ Hiệu chỉnh cần kiểm định độc lập.
 """
 
 import os
+import json
+import tempfile
 import re
 from datetime import datetime, date
 from pathlib import Path
@@ -661,6 +663,11 @@ class NAMDesktopApp:
             self.ent_split.delete(0,'end');self.ent_split.insert(0,'100');self.ent_split.config(state='readonly')
             self.btn_edit.config(state=tk.DISABLED)
         self._update_parameter_display()
+        self._project_path=None
+        self._project_defaults=self._project_payload()
+        self._saved_project=self._project_text()
+        self._update_project_title()
+        self.root.protocol('WM_DELETE_WINDOW',self._close_project)
         self.root.after(300,self._watch)
 
     def _setup_style(self):
@@ -672,6 +679,15 @@ class NAMDesktopApp:
         style.configure("Header.TLabel", font=("Segoe UI", 11, "bold"))
 
     def _build_ui(self):
+        project_bar=ttk.Frame(self.root,padding=(8,5))
+        project_bar.pack(fill='x')
+        for label,command in [('Tạo dự án mới',self._new_project),('Mở dự án',self._open_project),('Lưu dự án',self._save_project),('Lưu dự án thành…',lambda:self._save_project(save_as=True))]:
+            ttk.Button(project_bar,text=label,command=command).pack(side='left',padx=3)
+        self.lbl_project=ttk.Label(project_bar,text='Dự án mới')
+        self.lbl_project.pack(side='right',padx=8)
+        self.root.bind('<Control-s>',lambda event:self._save_project())
+        self.root.bind('<Control-o>',lambda event:self._open_project())
+        self.root.bind('<Control-n>',lambda event:self._new_project())
         # Khung chính chia 2 cột: Trái (Điều khiển & Tham số), Phải (Đồ thị)
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -895,6 +911,170 @@ class NAMDesktopApp:
     # CÁC HÀM XỬ LÝ SỰ KIỆN VÀ DỮ LIỆU
     # ==========================================================================
 
+    # Dự án JSON tự chứa dữ liệu, không phụ thuộc đường dẫn tệp nguồn.
+    _PROJECT_ENTRIES=('ent_area','ent_dt','ent_warm','ent_split','ent_u','ent_l',
+                      'ent_base','ent_surf','ent_inter','ent_period_start',
+                      'ent_period_end','ent_maxiter','ent_runs')
+
+    @staticmethod
+    def _pack_series(frame):
+        data=json.loads(frame.to_json(orient='split',date_format='iso',date_unit='ns',double_precision=15))
+        data.pop('index',None)
+        data['attrs']=frame.attrs.copy()
+        return data
+
+    @staticmethod
+    def _unpack_series(data,key):
+        if not isinstance(data,dict):raise ValueError('Bảng dữ liệu dự án không hợp lệ.')
+        frame=pd.DataFrame(data['data'],columns=data['columns'])
+        result=prepare_series(frame,key)
+        attrs=data.get('attrs',{})
+        if not isinstance(attrs,dict):raise ValueError('Thông tin chuỗi không hợp lệ.')
+        result.attrs=attrs.copy()
+        if key=='BocHoi_mm' and attrs.get('pet_mode','step_total') not in ('step_total','month_total','month_daily_mean','day_total'):
+            raise ValueError('Cách biểu diễn bốc hơi không hợp lệ.')
+        return result
+
+    def _project_payload(self):
+        calibrated=None
+        if self._calibrated_params is not None:
+            calibrated=dict(params=self._calibrated_params,area=self._calibrated_area,
+                            discharge_mode=self._calibrated_discharge_mode)
+        return dict(format='NAM-project',version=1,model_version=MODEL_VERSION,
+                    validation_mode=self.validation_mode,
+                    settings={name:getattr(self,name).get() for name in self._PROJECT_ENTRIES},
+                    auto_period=self.auto_period.get(),auto_dt=self.auto_dt.get(),
+                    discharge_mode=self._discharge_mode(),params=self.best_params.copy(),
+                    bounds=[list(pair) for pair in self.param_bounds],calibrated=calibrated,
+                    demo=self._is_demo,
+                    rain_stations=[dict(name=name,weight=item['weight'],source=item['source'],
+                        data=self._pack_series(item['data'])) for name,item in self.rain_stations.items()],
+                    input_series={key:self._pack_series(frame) for key,frame in self.input_series.items() if key!='Mua_mm'})
+
+    def _project_text(self):
+        return json.dumps(self._project_payload(),ensure_ascii=False,sort_keys=True,allow_nan=False)
+
+    def _update_project_title(self):
+        name=Path(self._project_path).name if self._project_path else 'Dự án mới'
+        self.lbl_project.config(text=name)
+        self.root.title(('NAM — Kiểm định độc lập' if self.validation_mode else 'Phần mềm Thủy văn NAM')+' — '+name)
+
+    def _project_idle(self):
+        if self._busy:
+            messagebox.showinfo('Dự án','Hãy dừng hoặc hoàn tất hiệu chỉnh trước khi thao tác dự án.',parent=self.root)
+            return False
+        return True
+
+    def _confirm_project_change(self):
+        if not self._project_idle():return False
+        if self._project_text()==self._saved_project:return True
+        answer=messagebox.askyesnocancel('Lưu dự án','Dự án có thay đổi chưa lưu. Bạn muốn lưu trước khi tiếp tục?',parent=self.root)
+        return False if answer is None else self._save_project() if answer else True
+
+    def _save_project(self,save_as=False):
+        if not self._project_idle():return False
+        path=self._project_path
+        if save_as or not path:
+            path=filedialog.asksaveasfilename(parent=self.root,title='Lưu dự án NAM',
+                defaultextension='.namproj',filetypes=[('Dự án NAM','*.namproj')],
+                initialfile=Path(path).name if path else 'DuAnNAM.namproj')
+        if not path:return False
+        temporary=None
+        try:
+            content=self._project_text()
+            with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=Path(path).parent,
+                    prefix='.nam-',suffix='.tmp',delete=False) as stream:
+                temporary=stream.name;stream.write(content);stream.flush();os.fsync(stream.fileno())
+            os.replace(temporary,path)
+            self._project_path=str(path);self._saved_project=content;self._update_project_title()
+            self.lbl_calib_status.config(text='Đã lưu dự án: '+Path(path).name)
+            return True
+        except Exception as exc:
+            messagebox.showerror('Lưu dự án',str(exc),parent=self.root);return False
+        finally:
+            if temporary and os.path.exists(temporary):os.unlink(temporary)
+
+    def _decode_project(self,payload):
+        if payload.get('format')!='NAM-project' or payload.get('version')!=1:
+            raise ValueError('Tệp không phải dự án NAM được hỗ trợ.')
+        if payload.get('validation_mode')!=self.validation_mode:
+            raise ValueError('Mở dự án kiểm định trong cửa sổ kiểm định; mở dự án hiệu chỉnh trong cửa sổ chính.')
+        settings=payload['settings']
+        if set(settings)!=set(self._PROJECT_ENTRIES) or not all(isinstance(v,str) for v in settings.values()):
+            raise ValueError('Thiếu hoặc sai thông tin thiết lập dự án.')
+        def parameters(values):
+            if set(values)!=set(PARAM_KEYS):raise ValueError('Dự án không đủ 9 thông số NAM.')
+            result={key:float(values[key]) for key in PARAM_KEYS}
+            if not all(np.isfinite(v) for v in result.values()):raise ValueError('Thông số phải hữu hạn.')
+            for key,value in result.items():
+                if key in ('CQOF','TOF','TIF','TG'):
+                    if not 0<=value<=1 or (key!='CQOF' and value==1):raise ValueError('Thông số tỷ lệ/ngưỡng ngoài khoảng.')
+                elif value<=0:raise ValueError('Dung tích và thời gian điều tiết phải dương.')
+            return result
+        params=parameters(payload['params'])
+        bounds=[tuple(float(v) for v in pair) for pair in payload['bounds']]
+        if len(bounds)!=len(PARAM_KEYS) or any(len(pair)!=2 or not all(np.isfinite(v) for v in pair) or pair[0]>=pair[1] for pair in bounds):
+            raise ValueError('Giới hạn dò thông số không hợp lệ.')
+        if payload.get('discharge_mode') not in ('mean','endpoint'):raise ValueError('Loại lưu lượng không hợp lệ.')
+        for key in ('auto_period','auto_dt','demo'):
+            if not isinstance(payload.get(key),bool):raise ValueError('Thiết lập dự án không hợp lệ.')
+        stations={}
+        for item in payload['rain_stations']:
+            name=item['name'];weight=float(item['weight'])
+            if not isinstance(name,str) or not name.strip() or name in stations or not np.isfinite(weight) or not 0<=weight<=1:
+                raise ValueError('Tên hoặc trọng số trạm mưa không hợp lệ.')
+            stations[name]=dict(data=self._unpack_series(item['data'],'Mua_mm'),weight=weight,source=str(item['source']))
+        inputs={}
+        for key,data in payload['input_series'].items():
+            if key not in ('BocHoi_mm','Q_ThucDo_m3s'):raise ValueError('Loại dữ liệu dự án không hợp lệ.')
+            inputs[key]=self._unpack_series(data,key)
+        calibrated=payload.get('calibrated')
+        if calibrated is not None:
+            calibrated=dict(params=parameters(calibrated['params']),area=finite_number(calibrated['area'],'Diện tích hiệu chỉnh',True),discharge_mode=calibrated['discharge_mode'])
+            if calibrated['discharge_mode'] not in ('mean','endpoint'):raise ValueError('Loại lưu lượng hiệu chỉnh không hợp lệ.')
+        return params,bounds,stations,inputs,calibrated
+
+    def _apply_project(self,payload,decoded):
+        params,bounds,stations,inputs,calibrated=decoded
+        for name,value in payload['settings'].items():
+            entry=getattr(self,name);state=entry.cget('state');entry.config(state='normal')
+            entry.delete(0,'end');entry.insert(0,value);entry.config(state=state)
+        self.auto_dt.set(payload['auto_dt']);self.auto_period.set(payload['auto_period'])
+        self.discharge_choice.current(1 if payload['discharge_mode']=='endpoint' else 0)
+        self.best_params=params;self.param_bounds=bounds
+        self.rain_stations=stations;self.input_series=inputs;self._is_demo=payload['demo']
+        self._calibrated_params=None if calibrated is None else calibrated['params']
+        if calibrated is not None:
+            self._calibrated_area=calibrated['area'];self._calibrated_discharge_mode=calibrated['discharge_mode']
+        self._suggested_period=self._period();self.current_sim=None;self._result_signature=None
+        for key,label in self.series_labels.items():
+            frame=inputs.get(key)
+            label.config(text='Chưa nhập' if frame is None else f'Dữ liệu trong dự án — {len(frame)} dòng',foreground='gray' if frame is None else 'blue')
+        self._update_rain_label();self._update_parameter_display();self._refresh_inputs()
+        self.lbl_calib_status.config(text='Đã mở dự án. Bấm chạy mô phỏng để tính lại kết quả.' if stations else 'Sẵn sàng')
+
+    def _open_project(self):
+        if not self._project_idle():return
+        path=filedialog.askopenfilename(parent=self.root,title='Mở dự án NAM',filetypes=[('Dự án NAM','*.namproj')])
+        if not path:return
+        try:
+            payload=json.loads(Path(path).read_text(encoding='utf-8-sig'))
+            decoded=self._decode_project(payload)
+        except Exception as exc:
+            messagebox.showerror('Mở dự án','Không mở được dự án: '+str(exc),parent=self.root);return
+        if not self._confirm_project_change():return
+        self._apply_project(payload,decoded);self._project_path=str(path)
+        self._saved_project=self._project_text();self._update_project_title()
+
+    def _new_project(self):
+        if not self._confirm_project_change():return
+        payload=json.loads(json.dumps(self._project_defaults))
+        self._apply_project(payload,self._decode_project(payload))
+        self._project_path=None;self._saved_project=self._project_text();self._update_project_title()
+
+    def _close_project(self):
+        if self._confirm_project_change():self.root.destroy()
+
     def _load_synthetic_data(self):
         if self.validation_mode:
             messagebox.showinfo("Kiểm định","Nhập số liệu độc lập của bạn bằng các nút nhập mưa, bốc hơi và Q thực đo.");return
@@ -998,6 +1178,8 @@ class NAMDesktopApp:
         app.discharge_choice.current(1 if getattr(self,'_calibrated_discharge_mode','mean')=='endpoint' else 0)
         app.discharge_choice.config(state='disabled')
         app.ent_area.delete(0,"end");app.ent_area.insert(0,str(self._calibrated_area));app.ent_area.config(state="readonly")
+        app._project_defaults=app._project_payload();app._saved_project=app._project_text()
+        app._update_project_title()
         window._nam_app=app
 
     def _edit_parameters(self):
