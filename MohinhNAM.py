@@ -654,7 +654,59 @@ def _geo_modules():
     return gpd,shape,mapping,Polygon,transform,unary_union,CRS,Transformer
 
 
-def basin_metric_geometry(geojson):
+def resolve_horizontal_crs(value):
+    """EPSG/ESRI, WKT, PROJ hoặc nội dung tệp PRJ; không suy đoán datum/múi chiếu."""
+    _,_,_,_,_,_,CRS,_=_geo_modules()
+    text=str(value).strip()
+    if not text:raise ValueError('Cần khai báo hệ tọa độ nguồn.')
+    if text.isdigit():text='EPSG:'+text
+    if len(text)<250 and Path(text).suffix.lower() in ('.prj','.wkt') and Path(text).is_file():
+        text=Path(text).read_text(encoding='utf-8-sig')
+    try:crs=CRS.from_user_input(text)
+    except Exception as exc:raise ValueError('Không nhận diện được hệ tọa độ. Dùng mã EPSG/ESRI, WKT, PROJ hoặc đọc tệp .prj đúng của dữ liệu.') from exc
+    if not (crs.is_geographic or crs.is_projected or crs.is_geocentric):
+        raise ValueError('Cần hệ tọa độ ngang hoặc địa tâm, không dùng hệ cao độ riêng.')
+    return crs
+
+
+def vn2000_projected_crs(meridian,scale=.9999,false_east=500000.,false_north=0.,latitude_origin=0.):
+    """TM tùy chỉnh, giữ datum VN-2000 từ EPSG:3405, không giả định datum WGS84."""
+    _,_,_,_,_,_,CRS,_=_geo_modules()
+    meridian=finite_number(meridian,'Kinh tuyến trục');scale=finite_number(scale,'Hệ số tỷ lệ',True)
+    latitude_origin=finite_number(latitude_origin,'Vĩ độ gốc')
+    if not -180<=meridian<=180 or not -90<latitude_origin<90:raise ValueError('Kinh tuyến trục/vĩ độ gốc không hợp lệ.')
+    definition=CRS.from_epsg(3405).to_json_dict()
+    for key in ('id','scope','area','bbox'):definition.pop(key,None)
+    definition['name']=f'VN-2000 / TM {meridian} k={scale}'
+    conversion=definition['conversion'];conversion.pop('id',None);conversion['name']='Transverse Mercator tùy chỉnh'
+    values={'Latitude of natural origin':latitude_origin,'Longitude of natural origin':meridian,
+            'Scale factor at natural origin':scale,'False easting':finite_number(false_east,'Easting gốc'),
+            'False northing':finite_number(false_north,'Northing gốc')}
+    for parameter in conversion['parameters']:parameter['value']=values[parameter['name']]
+    return CRS.from_json_dict(definition)
+
+
+def horizontal_transformer(source,target):
+    _,_,_,_,_,_,_,Transformer=_geo_modules()
+    try:return Transformer.from_crs(source,target,always_xy=True,allow_ballpark=False)
+    except Exception as exc:
+        raise ValueError('Chưa có phép chuyển datum phù hợp giữa hai hệ tọa độ. Kiểm tra hệ nguồn hoặc dữ liệu chuyển đổi PROJ; không tự dịch điểm.') from exc
+
+
+def frame_to_wgs84(frame):
+    """SHP luôn đọc x/y theo Easting/Northing, kể cả khi tên trục EPSG đảo thứ tự."""
+    _,_,_,_,transform,_,_,_=_geo_modules()
+    if frame.crs is None:raise ValueError('Dữ liệu chưa có hệ tọa độ nguồn.')
+    source=frame.crs if frame.crs.is_geocentric else frame.crs.to_2d()
+    operation=horizontal_transformer(source,4326)
+    def convert(x,y,z=None):
+        values=operation.transform(x,y,z,errcheck=True) if source.is_geocentric and z is not None else operation.transform(x,y,errcheck=True)
+        return values[:2]
+    result=frame.copy();result.geometry=result.geometry.map(lambda geom:transform(convert,geom))
+    return result.set_crs(4326,allow_override=True)
+
+
+def basin_metric_geometry(geojson,target_crs=None):
     _,shape,_,_,transform,_,CRS,Transformer=_geo_modules()
     basin=shape(geojson)
     if basin.geom_type not in ('Polygon','MultiPolygon') or basin.is_empty or not basin.is_valid:
@@ -662,9 +714,12 @@ def basin_metric_geometry(geojson):
     west,south,east,north=basin.bounds
     if not (-180<=west<=east<=180 and -90<south<=north<90):raise ValueError('Tọa độ lưu vực WGS84 không hợp lệ.')
     center=basin.centroid
-    crs=CRS.from_proj4(f'+proj=laea +lat_0={center.y} +lon_0={center.x} +datum=WGS84 +units=m +no_defs')
-    forward=Transformer.from_crs(4326,crs,always_xy=True)
-    metric=transform(forward.transform,basin)
+    crs=resolve_horizontal_crs(target_crs) if target_crs is not None else CRS.from_proj4(f'+proj=laea +lat_0={center.y} +lon_0={center.x} +datum=WGS84 +units=m +no_defs')
+    if not crs.is_projected or any(not np.isclose(axis.unit_conversion_factor,1.) for axis in crs.axis_info[:2]):
+        raise ValueError('Hệ hiển thị/tính diện tích phải là hệ phẳng đơn vị mét.')
+    forward=horizontal_transformer(4326,crs)
+    def horizontal(x,y,z=None):return forward.transform(x,y,errcheck=True)
+    metric=transform(horizontal,basin)
     if not metric.is_valid or not np.isfinite(metric.area) or metric.area<=0:
         raise ValueError('Không tính được diện tích lưu vực.')
     return metric,crs,forward
@@ -747,7 +802,9 @@ class NAMDesktopApp:
         self.input_series={}
         self.rain_stations={}
         self._basin_geojson=None;self._basin_source='';self._station_positions={}
+        self._basin_input_crs=None;self._map_crs_wkt=None
         self._thiessen_result=None;self._map_pick=False
+        self.show_thiessen=tk.BooleanVar(value=False)
         self._shape_basins=[];self._basins={};self._active_basin_id=None
         self._evap_stations={};self._evap_positions={};self._evap_thiessen=None
         self._spatial_signature=None;self._parameter_source=None;self._independent_metrics=None
@@ -1286,6 +1343,8 @@ class NAMDesktopApp:
         app._basins[bid]['parameter_source']=source_id
         app._basins[bid]['discharge_mode']=fitted['discharge_mode']
         app._basins[bid]['calibration_period']=record.get('calibration_period') if source_id==bid else None
+        app.show_thiessen.set(self.show_thiessen.get())
+        app._map_crs_wkt=self._map_crs_wkt;app._basin_input_crs=self._basin_input_crs
         app._station_positions=copy.deepcopy(self._station_positions);app._evap_positions=copy.deepcopy(self._evap_positions)
         app.rain_stations={name:dict(item,data=item['data'].copy()) for name,item in self.rain_stations.items()}
         app._evap_stations={name:dict(item,data=item['data'].copy()) for name,item in self._evap_stations.items()}
@@ -1307,6 +1366,17 @@ class NAMDesktopApp:
         app.lbl_calib_status.config(text='Kiểm định '+record['name']+' với thông số từ '+source['name']+'. Chọn thời đoạn / số liệu kiểm định; thông số giữ cố định.')
         app._project_defaults=app._project_payload();app._saved_project=app._project_text();window._nam_app=app
 
+    def _common_map_crs(self):
+        if self._map_crs_wkt is None and self._basin_geojson is not None:
+            if self._basin_input_crs:
+                source=resolve_horizontal_crs(self._basin_input_crs)
+                if source.is_projected and all(np.isclose(axis.unit_conversion_factor,1.) for axis in source.axis_info[:2]):
+                    self._map_crs_wkt=source.to_2d().to_wkt();return self._map_crs_wkt
+            _,shape,mapping,_,_,union,_,_=_geo_modules()
+            extent=mapping(union([shape(feature['geometry']) for feature in self._shape_basins])) if self._shape_basins else self._basin_geojson
+            self._map_crs_wkt=basin_metric_geometry(extent)[1].to_wkt()
+        return self._map_crs_wkt
+
     def _build_basin_map(self,parent):
         row=ttk.Frame(parent,padding=5);row.pack(fill='x')
         for label,command in [('Nhập lưu vực (.shp)',self._import_basin),('Thêm / sửa trạm mưa',self._station_coordinate_dialog),('Tính trọng số Thiessen',self._calculate_thiessen)]:
@@ -1321,6 +1391,7 @@ class NAMDesktopApp:
         ttk.Button(row,text='Chọn vị trí bằng chuột',command=self._enable_map_pick).pack(side='left',padx=3)
         ttk.Button(row,text='Chọn dữ liệu mưa',command=lambda:self._import_rain_station(self.map_station_choice.get())).pack(side='left',padx=3)
         ttk.Button(row,text='Xóa vị trí trạm',command=self._remove_station_position).pack(side='left',padx=3)
+        ttk.Checkbutton(parent,text='Hiển thị đa giác Thiessen',variable=self.show_thiessen,command=self._draw_basin_map).pack(anchor='w',padx=8,pady=3)
         self.lbl_map_status=ttk.Label(parent,text='Nhập SHP cùng các tệp .shx, .dbf, .prj. Trạm mưa có thể nằm ngoài lưu vực.',wraplength=850)
         self.lbl_map_status.pack(fill='x',padx=8,pady=4)
         self.map_fig=Figure(figsize=(8,5),dpi=100);self.map_ax=self.map_fig.add_subplot(111)
@@ -1349,13 +1420,13 @@ class NAMDesktopApp:
             if frame.crs is None:
                 code=simpledialog.askstring('Hệ tọa độ SHP','SHP thiếu .prj. Nhập hệ tọa độ đúng (EPSG hoặc CRS):',parent=self.root)
                 if not code:return
-                frame=frame.set_crs(code)
+                frame=frame.set_crs(resolve_horizontal_crs(code))
             if frame.empty or frame.geometry.isna().any() or frame.geometry.is_empty.any():raise ValueError('SHP rỗng hoặc có hình học trống.')
             if not frame.geom_type.isin(['Polygon','MultiPolygon']).all() or not frame.geometry.is_valid.all():raise ValueError('Mỗi đối tượng phải là Polygon/MultiPolygon hợp lệ.')
             if self._basins and not messagebox.askyesno('Thay bản đồ','Thay danh sách lưu vực đang làm? Hãy lưu dự án hiện tại nếu cần giữ.',parent=self.root):return
             fields=[column for column in frame.columns if column!=frame.geometry.name]
             preferred=next((c for c in fields if str(c).casefold() in ('name','ten','ten_lv','ten_luuvuc','basin_name','id')),None)
-            converted=frame.to_crs(4326);features=[]
+            converted=frame_to_wgs84(frame);features=[]
             for i,(_,row) in enumerate(converted.iterrows(),1):
                 geometry=mapping(row.geometry);metric,_,_=basin_metric_geometry(geometry)
                 value=row[preferred] if preferred else None
@@ -1365,6 +1436,8 @@ class NAMDesktopApp:
             self._shape_basins=features;self._basins={};self._active_basin_id=None
             self._parameter_source=None;self._independent_metrics=None;self._calibration_period=None;self._calibrated_params=None
             self._basin_geojson=mapping(union(converted.geometry.tolist())) # Chỉ làm khung hiển thị, không gộp các lưu vực NAM.
+            self._basin_input_crs=frame.crs.to_wkt();self._map_crs_wkt=None
+            self._common_map_crs()
             self._basin_source=Path(path).name;self._thiessen_result=None;self._evap_thiessen=None;self._spatial_signature=None
             self.ent_area.config(state='normal')
             self._refresh_inputs();self._update_basins_table();self._draw_basin_map()
@@ -1372,20 +1445,26 @@ class NAMDesktopApp:
         except Exception as exc:messagebox.showerror('Nhập lưu vực',str(exc),parent=self.root)
 
     @staticmethod
-    def _station_lonlat(first,second,crs_code,confirm_swap=None):
-        # Giao diện theo thứ tự vĩ độ/kinh độ hoặc X(Bắc)/Y(Đông).
-        _,_,_,_,_,_,CRS,Transformer=_geo_modules()
-        crs=CRS.from_user_input(crs_code)
-        first=finite_number(str(first).strip().replace(',','.'),'Vĩ độ / X Bắc');second=finite_number(str(second).strip().replace(',','.'),'Kinh độ / Y Đông')
-        if crs.is_geographic:
-            if abs(first)>90 and abs(second)<=90:
-                if confirm_swap is None or not confirm_swap():
-                    raise ValueError('Hai giá trị có vẻ nhập ngược. Ô thứ nhất là vĩ độ, ô thứ hai là kinh độ.')
-                first,second=second,first
-            if not (-90<first<90 and -180<=second<=180):
-                raise ValueError('Vĩ độ phải trong (-90;90), kinh độ trong [-180;180]. Ví dụ: vĩ độ 22.45235, kinh độ 105.72063.')
-        lon,lat=Transformer.from_crs(crs,4326,always_xy=True).transform(second,first,errcheck=True)
-        if not (-180<=lon<=180 and -90<lat<90):raise ValueError('Tọa độ sau chuyển đổi không hợp lệ; kiểm tra hệ tọa độ và thứ tự X Bắc/Y Đông.')
+    def _station_lonlat(first,second,crs_code,confirm_swap=None,order='north_east',third=None):
+        crs=resolve_horizontal_crs(crs_code)
+        def number(value):return finite_number(str(value).strip().replace(',','.'),'Tọa độ')
+        first=number(first);second=number(second)
+        if order not in ('north_east','east_north'):raise ValueError('Thứ tự tọa độ không hợp lệ.')
+        if crs.is_geocentric:
+            if third is None or not str(third).strip():raise ValueError('Hệ địa tâm cần đủ X, Y và Z.')
+            lon,lat,*_=horizontal_transformer(crs,4326).transform(first,second,number(third),errcheck=True)
+        else:
+            north,east=(first,second) if order=='north_east' else (second,first)
+            if crs.is_geographic:
+                factor=crs.axis_info[0].unit_conversion_factor
+                lat_limit=np.pi/2/factor;lon_limit=np.pi/factor
+                if abs(north)>lat_limit and abs(east)<=lat_limit:
+                    if confirm_swap is None or not confirm_swap():raise ValueError('Hai giá trị có vẻ nhập ngược. Chọn đúng thứ tự vĩ độ/kinh độ.')
+                    north,east=east,north
+                if not (-lat_limit<=north<=lat_limit and -lon_limit<=east<=lon_limit):raise ValueError('Tọa độ vượt phạm vi vĩ độ/kinh độ của hệ nguồn; kiểm tra thứ tự và đơn vị.')
+            lon,lat,*_=horizontal_transformer(crs,4326).transform(east,north,errcheck=True)
+        if not (np.isfinite(lon) and np.isfinite(lat) and -180<=lon<=180 and -90<lat<90):
+            raise ValueError('Tọa độ sau chuyển đổi không hợp lệ; kiểm tra hệ nguồn, đơn vị và thứ tự trục.')
         return [lon,lat]
 
     def _station_coordinate_dialog(self,kind='rain'):
@@ -1402,17 +1481,45 @@ class NAMDesktopApp:
             entry=ttk.Combobox(window,values=names,state='normal',width=28) if key=='name' else ttk.Entry(window,width=30)
             entry.set(default) if key=='name' else entry.insert(0,default)
             entry.grid(row=r,column=1,padx=8,pady=5);fields[key]=entry
-        note=ttk.Label(window,wraplength=470);note.grid(row=4,column=0,columnspan=2,padx=8,pady=5)
+        presets={'WGS84 — vĩ độ/kinh độ':'EPSG:4326','WGS84 / UTM 48N':'EPSG:32648',
+                 'WGS84 / UTM 49N':'EPSG:32649','VN-2000 / UTM 48N':'EPSG:3405',
+                 'VN-2000 / UTM 49N':'EPSG:3406','Web Mercator':'EPSG:3857'}
+        if self._basin_input_crs:presets['Giống SHP lưu vực']=self._basin_input_crs
+        preset=ttk.Combobox(window,values=list(presets),state='readonly',width=27)
+        preset.grid(row=1,column=2,padx=6,pady=5);preset.set('WGS84 — vĩ độ/kinh độ')
+        ttk.Label(window,text='Thứ tự hai tọa độ:').grid(row=4,column=0,padx=8,pady=4,sticky='w')
+        coordinate_order=ttk.Combobox(window,values=['Vĩ độ / X Bắc → Kinh độ / Y Đông','Kinh độ / Easting → Vĩ độ / Northing'],state='readonly',width=39)
+        coordinate_order.current(0);coordinate_order.grid(row=4,column=1,columnspan=2,padx=8,pady=4)
+        ttk.Label(window,text='Z (chỉ bắt buộc cho hệ địa tâm):').grid(row=5,column=0,padx=8,pady=4,sticky='w')
+        fields['z']=ttk.Entry(window,width=30);fields['z'].grid(row=5,column=1,padx=8,pady=4)
+        note=ttk.Label(window,wraplength=620);note.grid(row=6,column=0,columnspan=3,padx=8,pady=5)
         def update_labels(event=None):
-            try:
-                _,_,_,_,_,_,CRS,_=_geo_modules();geographic=CRS.from_user_input(fields['crs'].get()).is_geographic
+            try:crs=resolve_horizontal_crs(fields['crs'].get())
             except Exception:return
-            labels['x'].config(text='Vĩ độ (độ)' if geographic else 'X — Northing / tọa độ Bắc (m)')
-            labels['y'].config(text='Kinh độ (độ)' if geographic else 'Y — Easting / tọa độ Đông (m)')
-            note.config(text='Ví dụ: vĩ độ 22.45235; kinh độ 105.72063. Sau khi lưu vị trí, chọn tệp '+station_label+' cho đúng trạm.' if geographic else 'Nhập X Bắc trước, Y Đông sau. Hệ tọa độ phải đúng với dữ liệu. Sau đó chọn tệp '+station_label+' cho trạm.')
+            order=coordinate_order.current()
+            if crs.is_geocentric:
+                labels['x'].config(text='X địa tâm');labels['y'].config(text='Y địa tâm')
+                note.config(text='Nhập đủ X, Y, Z theo đơn vị của hệ địa tâm nguồn. Phần mềm tự chuyển về WGS84 và hệ bản đồ chung.')
+            else:
+                unit=crs.axis_info[0].unit_name
+                unit={'degree':'độ','metre':'m','meter':'m'}.get(unit,unit)
+                north='Vĩ độ' if crs.is_geographic else 'Northing / X Bắc'
+                east='Kinh độ' if crs.is_geographic else 'Easting / Y Đông'
+                labels['x'].config(text=f'{north if order==0 else east} ({unit})')
+                labels['y'].config(text=f'{east if order==0 else north} ({unit})')
+                note.config(text='Tự chuyển hệ nguồn về WGS84, rồi về cùng hệ phẳng hiển thị với lưu vực. EPSG/ESRI, WKT, PROJ đều được hỗ trợ. VN-2000 phải đúng múi/kinh tuyến trục; không chọn múi khác để thử dịch điểm.')
+        def select_preset(event=None):
+            value=presets.get(preset.get())
+            if value:
+                fields['crs'].delete(0,'end');fields['crs'].insert(0,value)
+                coordinate_order.current(1 if preset.get()=='Giống SHP lưu vực' or resolve_horizontal_crs(value).is_projected else 0)
+                update_labels()
+        preset.bind('<<ComboboxSelected>>',select_preset)
+        coordinate_order.bind('<<ComboboxSelected>>',update_labels)
         def fill_existing(event=None):
             point=positions.get(fields['name'].get().strip())
             if point is not None:
+                coordinate_order.current(0);preset.set('WGS84 — vĩ độ/kinh độ')
                 for key,value in [('crs','EPSG:4326'),('x',f'{point[1]:.10f}'),('y',f'{point[0]:.10f}')]:
                     fields[key].delete(0,'end');fields[key].insert(0,value)
                 update_labels()
@@ -1424,12 +1531,35 @@ class NAMDesktopApp:
                 name=fields['name'].get().strip()
                 if not name:raise ValueError('Tên trạm không được để trống.')
                 point=self._station_lonlat(fields['x'].get(),fields['y'].get(),fields['crs'].get(),
-                    lambda:messagebox.askyesno('Thứ tự tọa độ','Hai giá trị có vẻ là kinh độ rồi vĩ độ. Đổi lại thứ tự cho đúng?',parent=window))
+                    lambda:messagebox.askyesno('Thứ tự tọa độ','Hai giá trị có vẻ bị nhập ngược so với thứ tự đã chọn. Đổi lại?',parent=window),
+                    order='east_north' if coordinate_order.current()==1 else 'north_east',third=fields['z'].get())
                 positions[name]=point;self._thiessen_result=None;self._evap_thiessen=None;self._spatial_signature=None
                 self._draw_basin_map();self.map_station_choice.set(name);window.destroy()
                 self._import_rain_station(name) if kind=='rain' else self._import_evap_station(name)
             except Exception as exc:messagebox.showerror('Tọa độ trạm',str(exc),parent=window)
-        ttk.Button(window,text='Lưu vị trí và chọn dữ liệu '+station_label,command=save).grid(row=5,column=0,columnspan=2,pady=8)
+        ttk.Button(window,text='Lưu vị trí và chọn dữ liệu '+station_label,command=save).grid(row=7,column=0,columnspan=2,pady=8)
+        def read_prj():
+            path=filedialog.askopenfilename(parent=window,title='Đọc định nghĩa hệ tọa độ nguồn',filetypes=[('Hệ tọa độ','*.prj *.wkt'),('Tất cả tệp','*.*')])
+            if not path:return
+            try:
+                crs=resolve_horizontal_crs(path);fields['crs'].delete(0,'end');fields['crs'].insert(0,crs.to_wkt());preset.set('Đọc từ .prj / WKT');update_labels()
+            except Exception as exc:messagebox.showerror('Hệ tọa độ',str(exc),parent=window)
+        ttk.Button(window,text='Đọc hệ tọa độ từ .prj',command=read_prj).grid(row=7,column=2,padx=6,pady=8)
+        def custom_vn2000():
+            dialog=tk.Toplevel(window);dialog.title('VN-2000 theo kinh tuyến trục');dialog.transient(window)
+            inputs={}
+            for r,(key,label,default) in enumerate([('meridian','Kinh tuyến trục (độ)','105'),('scale','Hệ số tỷ lệ k₀','0.9999'),('false_east','Easting gốc (m)','500000'),('false_north','Northing gốc (m)','0'),('latitude_origin','Vĩ độ gốc (độ)','0')]):
+                ttk.Label(dialog,text=label).grid(row=r,column=0,padx=8,pady=4,sticky='w')
+                entry=ttk.Entry(dialog);entry.insert(0,default);entry.grid(row=r,column=1,padx=8,pady=4);inputs[key]=entry
+            ttk.Label(dialog,text='Dùng đúng thông số ghi trong hồ sơ: TM3 thường k₀=0.9999; UTM/TM6 thường k₀=0.9996. Datum giữ VN-2000.',wraplength=420).grid(row=5,column=0,columnspan=2,padx=8,pady=5)
+            def choose():
+                try:
+                    crs=vn2000_projected_crs(**{key:entry.get().replace(',','.') for key,entry in inputs.items()})
+                    fields['crs'].delete(0,'end');fields['crs'].insert(0,crs.to_wkt());preset.set(crs.name);update_labels();dialog.destroy()
+                except Exception as exc:messagebox.showerror('VN-2000',str(exc),parent=dialog)
+            ttk.Button(dialog,text='Dùng hệ tọa độ này',command=choose).grid(row=6,column=0,columnspan=2,pady=8)
+        ttk.Button(window,text='VN-2000 theo kinh tuyến trục…',command=custom_vn2000).grid(row=8,column=0,columnspan=3,padx=6,pady=5)
+
 
     def _enable_map_pick(self):
         self._sync_map_stations()
@@ -1448,7 +1578,7 @@ class NAMDesktopApp:
         if not self._project_idle():return
         try:
             _,_,_,_,_,_,_,Transformer=_geo_modules()
-            _,crs,_=basin_metric_geometry(self._basin_geojson)
+            _,crs,_=basin_metric_geometry(self._basin_geojson,self._common_map_crs())
             lon,lat=Transformer.from_crs(crs,4326,always_xy=True).transform(event.xdata,event.ydata,errcheck=True)
             name=self.map_station_choice.get()
             self._station_positions[name]=[lon,lat]
@@ -1493,7 +1623,8 @@ class NAMDesktopApp:
             self._spatial_signature=None;self._assign_spatial_weights()
             self.series_labels['Mua_mm'].config(text=f'{len(self.rain_stations)} trạm; trọng số Thiessen riêng cho lưu vực đang chọn.',foreground='blue')
             self._refresh_inputs();self._draw_basin_map();self._capture_active_basin();self._update_basins_table()
-            self.lbl_map_status.config(text='Đã tính riêng Thiessen mưa và bốc hơi cho lưu vực đang chọn; mỗi mạng có tổng trọng số = 1.')
+            networks='mưa và bốc hơi' if self._evap_stations else 'mưa (chưa có mạng trạm bốc hơi)'
+            self.lbl_map_status.config(text='Đã tính Thiessen '+networks+' riêng cho lưu vực đang chọn. Tổng trọng số mỗi mạng đã nhập = 1.')
         except Exception as exc:messagebox.showerror('Thiessen',str(exc),parent=self.root)
 
     def _draw_basin_map(self):
@@ -1509,7 +1640,7 @@ class NAMDesktopApp:
             _,_,_,_,_,_,_,_= _geo_modules()
             from matplotlib.path import Path as PlotPath
             from matplotlib.patches import PathPatch
-            basin,crs,forward=basin_metric_geometry(self._basin_geojson)
+            basin,crs,forward=basin_metric_geometry(self._basin_geojson,self._common_map_crs())
             def draw_polygon(geom,color,alpha):
                 if geom.is_empty:return
                 if geom.geom_type in ('MultiPolygon','GeometryCollection'):
@@ -1519,24 +1650,27 @@ class NAMDesktopApp:
                     geom=orient(geom,sign=1.)
                     vertices=[];codes=[]
                     for ring in [geom.exterior,*geom.interiors]:
-                        coords=list(ring.coords);vertices.extend(coords);codes.extend([PlotPath.MOVETO]+[PlotPath.LINETO]*(len(coords)-2)+[PlotPath.CLOSEPOLY])
+                        coords=[(coordinate[0],coordinate[1]) for coordinate in ring.coords];vertices.extend(coords);codes.extend([PlotPath.MOVETO]+[PlotPath.LINETO]*(len(coords)-2)+[PlotPath.CLOSEPOLY])
                     self.map_ax.add_patch(PathPatch(PlotPath(vertices,codes),facecolor=color,edgecolor='#28536b',alpha=alpha,lw=1.1))
-            draw_polygon(basin,'#dcebf3',1.)
+            draw_polygon(basin,'none',1.)
             if self._shape_basins:
                 _,shape,_,_,transform,_,_,_=_geo_modules()
                 for feature in self._shape_basins:
-                    part=transform(forward.transform,shape(feature['geometry']))
+                    part=transform(lambda x,y,z=None:forward.transform(x,y,errcheck=True),shape(feature['geometry']))
                     draw_polygon(part,'none',1.)
                     center=part.representative_point();self.map_ax.annotate(feature['name'],(center.x,center.y),fontsize=8,color='#315779')
             result=self._thiessen_result
-            if result is not None:
+            if result is not None and self.show_thiessen.get():
                 colors=['#79c7c5','#f2b880','#a6c48a','#b5a7d4','#ef9c9c']
-                for i,cell in enumerate(result['cells'].values()):draw_polygon(cell,colors[i%len(colors)],.65)
+                for i,cell in enumerate(result['cells'].values()):
+                    _,_,_,_,transform,_,_,_=_geo_modules()
+                    convert=horizontal_transformer(result['crs'],crs)
+                    draw_polygon(transform(convert.transform,cell),colors[i%len(colors)],.65)
             for name in dict.fromkeys([*self.rain_stations,*self._station_positions]):
                 point=self._station_positions.get(name)
                 if point is None:
                     self.map_tree.insert('','end',values=(name,'Chưa đặt','','','','Đã nhập' if name in self.rain_stations else 'Chưa nhập'));continue
-                x,y=forward.transform(*point);self.map_ax.plot(x,y,'^',color='#c62828',markersize=8)
+                x,y=forward.transform(*point);self.map_ax.plot(x,y,'+',color='#228b22',markersize=11,markeredgewidth=1.5)
                 self.map_ax.annotate(name,(x,y),xytext=(5,5),textcoords='offset points',fontsize=9)
                 area='' if result is None else f'{result["areas_km2"].get(name,0):.3f}'
                 weight='' if result is None else f'{result["weights"].get(name,0):.6f}'
@@ -1549,11 +1683,15 @@ class NAMDesktopApp:
                 weight='' if result_pet is None else f"{result_pet['weights'].get(name,0):.6f}"
                 self.map_tree.insert('','end',values=('BH: '+name,f'{point[0]:.7f}',f'{point[1]:.7f}',area,weight,self._evap_stations[name]['source'] if name in self._evap_stations else 'Chưa chọn dữ liệu'))
             self.map_ax.autoscale_view();self.map_ax.margins(.1);self.map_ax.set_aspect('equal',adjustable='datalim')
-            self.map_ax.set(xlabel='Easting (m)',ylabel='Northing (m)',title='Lưu vực và trạm mưa — phép chiếu bảo toàn diện tích')
-            self.map_ax.ticklabel_format(style='plain',useOffset=False);self.map_ax.grid(alpha=.2)
-            self.lbl_map_status.config(text=f'{self._basin_source} — Diện tích đang chọn: {basin.area/1e6:.3f} km². Thiessen được tính riêng cho lưu vực NAM đang chọn.')
+            self.map_ax.set(xlabel='Easting (m)',ylabel='Northing (m)',title='Lưu vực và trạm — cùng hệ tọa độ phẳng hiển thị')
+            self.map_ax.ticklabel_format(style='plain',useOffset=False);self.map_ax.grid(color='#5ca9df',linestyle='--',alpha=.65)
+            authority=crs.to_authority();crs_label=':'.join(authority) if authority else crs.name
+            self.lbl_map_status.config(text=f'{self._basin_source} — Diện tích NAM: {basin_metric_geometry(self._basin_geojson)[0].area/1e6:.3f} km². Hệ hiển thị: {crs_label}.')
             self.map_fig.tight_layout();self.map_canvas.draw()
-        except Exception as exc:self.lbl_map_status.config(text=str(exc))
+        except Exception as exc:
+            self.lbl_map_status.config(text=str(exc));self.map_ax.clear()
+            self.map_ax.text(.5,.5,'Không hiển thị được bản đồ: '+str(exc),transform=self.map_ax.transAxes,ha='center',wrap=True)
+            self.map_canvas.draw()
 
     # Dự án JSON tự chứa dữ liệu, không phụ thuộc đường dẫn tệp nguồn.
     _PROJECT_ENTRIES=('ent_area','ent_dt','ent_warm','ent_split','ent_u','ent_l',
@@ -1591,7 +1729,7 @@ class NAMDesktopApp:
                     auto_period=self.auto_period.get(),auto_dt=self.auto_dt.get(),
                     discharge_mode=self._discharge_mode(),params=self.best_params.copy(),
                     bounds=[list(pair) for pair in self.param_bounds],calibrated=calibrated,
-                    multi_basins=dict(features=self._shape_basins,basins=self._basins,active=self._active_basin_id,
+                    multi_basins=dict(show_thiessen=self.show_thiessen.get(),map_crs=self._map_crs_wkt,basin_input_crs=self._basin_input_crs,features=self._shape_basins,basins=self._basins,active=self._active_basin_id,
                         evap_positions=self._evap_positions,evap_stations={name:dict(weight=item['weight'],source=item['source'],data=self._pack_series(item['data'])) for name,item in self._evap_stations.items()}),
                     demo=self._is_demo,basin_map=dict(geometry=self._basin_geojson,source=self._basin_source,stations=self._station_positions,thiessen_computed=self._thiessen_result is not None),
                     rain_stations=[dict(name=name,weight=item['weight'],source=item['source'],
@@ -1689,6 +1827,10 @@ class NAMDesktopApp:
                 raise ValueError('Dự án thiếu lưu vực hoặc tọa độ dùng tính Thiessen.')
             thiessen_basin_weights(basin_map['geometry'],{name:basin_map['stations'][name] for name in stations})
         multi=payload.get('multi_basins',{})
+        if multi.get('map_crs') is not None:
+            crs=resolve_horizontal_crs(multi['map_crs'])
+            if not crs.is_projected or any(not np.isclose(axis.unit_conversion_factor,1.) for axis in crs.axis_info[:2]):raise ValueError('Hệ bản đồ chung phải là hệ phẳng đơn vị mét.')
+        if multi.get('basin_input_crs') is not None:resolve_horizontal_crs(multi['basin_input_crs'])
         features=multi.get('features',[]);basins=multi.get('basins',{})
         ids=set()
         for feature in features:
@@ -1723,6 +1865,8 @@ class NAMDesktopApp:
     def _apply_project(self,payload,decoded):
         params,bounds,stations,inputs,calibrated=decoded
         multi=payload.get('multi_basins',{})
+        self.show_thiessen.set(multi.get('show_thiessen',False))
+        self._map_crs_wkt=multi.get('map_crs');self._basin_input_crs=multi.get('basin_input_crs')
         self._shape_basins=multi.get('features',[]);self._basins=multi.get('basins',{});self._active_basin_id=multi.get('active')
         self._evap_positions=multi.get('evap_positions',{})
         self._evap_stations={name:dict(weight=item['weight'],source=item['source'],data=self._unpack_series(item['data'],'BocHoi_mm')) for name,item in multi.get('evap_stations',{}).items()}
