@@ -1100,7 +1100,7 @@ class NAMDesktopApp:
 
     def _build_basins_tab(self,parent):
         bar=ttk.Frame(parent,padding=6);bar.pack(fill='x')
-        for i,(label,command) in enumerate([('Chuyển tất cả từ bản đồ',self._transfer_shape_basins),('Chọn lưu vực mô phỏng / hiệu chỉnh',self._select_basin_from_table),('Kiểm định lưu vực được chọn',self._validate_selected_basin),('Áp dụng bộ thông số…',self._parameter_transfer_dialog)]):
+        for i,(label,command) in enumerate([('Chuyển tất cả từ bản đồ',self._transfer_shape_basins),('Chọn lưu vực mô phỏng / hiệu chỉnh',self._select_basin_from_table),('Kiểm định lưu vực được chọn',self._validate_selected_basin),('Áp dụng bộ thông số…',self._parameter_transfer_dialog),('Đổi tên lưu vực',self._rename_basin)]):
             ttk.Button(bar,text=label,command=command).grid(row=i//2,column=i%2,sticky='ew',padx=3,pady=3)
         bar.columnconfigure(0,weight=1);bar.columnconfigure(1,weight=1)
         self.basins_tree=ttk.Treeview(parent,columns=('name','area','rain','evap','q','source','validation'),show='headings',selectmode='browse')
@@ -1115,6 +1115,27 @@ class NAMDesktopApp:
         self.basins_tree.bind('<<TreeviewSelect>>',lambda event:self._show_basin_detail())
         self.basins_tree.bind('<Double-1>',lambda event:self._select_basin_from_table())
         ttk.Label(parent,text='SHP giữ nguyên từng đối tượng, kể cả lưu vực lồng nhau. Chọn lưu vực trước khi nhập Q thực đo, hiệu chỉnh hoặc kiểm định. Thông số chuyển sang lưu vực khác cần được kiểm tra tại lưu vực nhận.',wraplength=900).pack(fill='x',padx=8,pady=6)
+
+    def _rename_basin(self):
+        if not self._project_idle():return
+        selected=self.basins_tree.selection()
+        basin_id=selected[0] if selected else self._active_basin_id
+        feature=next((item for item in self._shape_basins if item['id']==basin_id),None)
+        if feature is None:
+            messagebox.showinfo('Đổi tên lưu vực','Chọn lưu vực trong danh sách trước khi đổi tên.',parent=self.root);return
+        name=simpledialog.askstring('Đổi tên lưu vực','Tên lưu vực:',initialvalue=feature['name'],parent=self.root)
+        if name is None:return
+        name=name.strip()
+        if not name:
+            messagebox.showerror('Đổi tên lưu vực','Tên lưu vực không được để trống.',parent=self.root);return
+        feature['name']=name
+        if basin_id in self._basins:self._basins[basin_id]['name']=name
+        if basin_id==self._active_basin_id:
+            label='Q riêng: ' if 'Q_ThucDo_m3s' in self.input_series else 'Chưa nhập Q cho '
+            self.series_labels['Q_ThucDo_m3s'].config(text=label+name)
+        self._update_basins_table()
+        self.basins_tree.selection_set(basin_id);self.basins_tree.see(basin_id)
+        self._show_basin_detail();self._draw_basin_map()
 
     def _show_basin_detail(self):
         selected=self.basins_tree.selection()
