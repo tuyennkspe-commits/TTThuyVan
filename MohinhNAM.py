@@ -621,6 +621,30 @@ def compute_metrics(obs,sim):
 # ==============================================================================
 
 
+def cumulative_water_volume(observed,simulated_mean,dt_hours,discharge_mode='mean'):
+    """Tổng lượng nước m³; chỉ cộng các khoảng có đủ quan trắc.
+
+    Q trung bình: W=Q*Δt. Q tức thời: quan trắc tích phân hình thang
+    giữa hai điểm liền kề; không nối qua khoảng thiếu, không suy đoán
+    Q đầu chuỗi. Mô phỏng luôn dùng Q trung bình bước để giữ cân bằng nước.
+    """
+    obs=np.asarray(observed,dtype=float);sim=np.asarray(simulated_mean,dtype=float)
+    if obs.ndim!=1 or obs.shape!=sim.shape:raise ValueError('Hai chuỗi tổng lượng phải cùng kích thước.')
+    dt=finite_number(dt_hours,'Bước tính tổng lượng',True)*3600.
+    if discharge_mode not in ('mean','endpoint'):raise ValueError('Loại lưu lượng không hợp lệ.')
+    observed_mean=obs.copy()
+    if discharge_mode=='endpoint':
+        observed_mean[:]=np.nan
+        observed_mean[1:]=(obs[:-1]+obs[1:])*.5
+    valid=np.isfinite(observed_mean)&np.isfinite(sim)
+    observed_total=np.cumsum(np.where(valid,observed_mean*dt,0.))
+    simulated_total=np.cumsum(np.where(valid,sim*dt,0.))
+    return dict(observed_m3=np.where(valid,observed_total,np.nan),
+                simulated_m3=np.where(valid,simulated_total,np.nan),valid=valid,
+                observed_total_m3=float(observed_total[-1]) if len(obs) else 0.,
+                simulated_total_m3=float(simulated_total[-1]) if len(obs) else 0.)
+
+
 class NAMDesktopApp:
 
     def __init__(self, root: tk.Tk, validation_params=None):
@@ -896,8 +920,9 @@ class NAMDesktopApp:
 
         # Nhúng Matplotlib Canvas
         self.fig = Figure(figsize=(8, 6), dpi=100)
-        self.ax_rain = self.fig.add_subplot(2, 1, 1)
-        self.ax_flow = self.fig.add_subplot(2, 1, 2, sharex=self.ax_rain)
+        self.ax_rain = self.fig.add_subplot(3, 1, 1)
+        self.ax_flow = self.fig.add_subplot(3, 1, 2, sharex=self.ax_rain)
+        self.ax_volume=self.fig.add_subplot(3,1,3,sharex=self.ax_rain)
         self.fig.subplots_adjust(hspace=0.15)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
@@ -1158,7 +1183,7 @@ class NAMDesktopApp:
         if self.current_sim is not None and self._result_signature!=self._signature():
             self.current_sim=None
             self.lbl_calib_status.config(text='Đầu vào đã đổi: chạy mô phỏng lại trước khi xuất.')
-            self.ax_flow.clear();self.canvas.draw()
+            self.ax_flow.clear();self.ax_volume.clear();self.canvas.draw()
             for label in [self.lbl_metric_nse,self.lbl_metric_peak,self.lbl_metric_pbias]:label.config(text='Cần tính lại')
         self.root.after(300,self._watch)
 
@@ -1302,7 +1327,7 @@ class NAMDesktopApp:
         return self.ent_period_start.get().strip(),self.ent_period_end.get().strip()
 
     def _refresh_inputs(self):
-        self.df_data=None;self.current_sim=None;self.ax_rain.clear();self.ax_flow.clear();self.canvas.draw()
+        self.df_data=None;self.current_sim=None;self.ax_rain.clear();self.ax_flow.clear();self.ax_volume.clear();self.canvas.draw()
         for label in [self.lbl_metric_nse,self.lbl_metric_peak,self.lbl_metric_pbias]:label.config(text='Chưa tính')
         auto_note=''
         if self.auto_dt.get():
@@ -1496,7 +1521,7 @@ class NAMDesktopApp:
         self.lbl_metric_peak.config(text=f'Đỉnh Q đo/mô phỏng: {fmt(metric["observed_peak"])}/{fmt(metric["simulated_peak"])} m³/s')
         self.lbl_metric_pbias.config(text=f'PBIAS (đo−mô phỏng): {fmt(metric["pbias"])}%')
         self.lbl_calib_status.config(text=f'Sai số cân bằng lớn nhất: {np.max(np.abs(res["Balance_error_mm"])):.2e} mm; loại {warm} bước khởi động.')
-        self.ax_rain.clear();self.ax_flow.clear()
+        self.ax_rain.clear();self.ax_flow.clear();self.ax_volume.clear()
         dated='ThoiGian' in df
         time=mdates.date2num(pd.to_datetime(df['ThoiGian']).to_numpy()) if dated else np.arange(len(rain))*dt
         step=dt/24 if dated else dt
@@ -1506,6 +1531,7 @@ class NAMDesktopApp:
         else:
             self.ax_flow.xaxis.set_major_locator(AutoLocator());self.ax_flow.xaxis.set_major_formatter(ScalarFormatter())
         self.ax_rain.tick_params(axis='x',labelbottom=False)
+        self.ax_flow.tick_params(axis='x',labelbottom=False)
         self.ax_rain.bar(time,rain,width=step*.8,color='#1f77b4',label='Mưa tổng mỗi bước (mm)')
         self.ax_rain.set_ylabel('Mưa (mm)');self.ax_rain.set_ylim(max(10.,rain.max()*1.3),0);self.ax_rain.legend(fontsize=8)
         self.ax_rain.set_title('MƯA – DÒNG CHẢY NAM (DÒNG TRÀN ĐIỀU TIẾT BIẾN ĐỔI)',fontsize=10)
@@ -1514,8 +1540,26 @@ class NAMDesktopApp:
         self.ax_flow.stackplot(time,res['Q_base'],res['Q_inter'],res['Q_surf'],labels=['Dòng ngầm','Dòng sát mặt','Dòng tràn'],alpha=.25)
         if warm:self.ax_flow.axvspan(time[0],time[warm],color='gray',alpha=.2,label='Khởi động (không đánh giá)')
         if end<len(df):self.ax_flow.axvline(time[end],color='navy',linestyle=':',label='Bắt đầu kiểm định')
-        self.ax_flow.set(xlabel='Ngày/tháng/năm – giờ:phút' if dated else 'Thời gian từ bước đầu (giờ)',ylabel='Lưu lượng (m³/s)',xlim=(time[0]-step*.5,time[-1]+step*.5))
+        self.ax_flow.set(ylabel='Lưu lượng (m³/s)',xlim=(time[0]-step*.5,time[-1]+step*.5))
         self.ax_flow.set_ylim(bottom=0);self.ax_flow.grid(alpha=.3);self.ax_flow.legend(fontsize=8)
+        volume=cumulative_water_volume(q_obs,res['Q_sim_mean'],dt,res['Discharge_mode'])
+        if volume['valid'].any():
+            self.ax_volume.plot(time,volume['observed_m3']/1e6,'k--',label='Thực đo tích lũy')
+            self.ax_volume.plot(time,volume['simulated_m3']/1e6,'r-',label='Mô phỏng tích lũy')
+            measured=volume['observed_total_m3'];computed=volume['simulated_total_m3']
+            difference=100*(computed-measured)/measured if measured>0 else np.nan
+            note=f'Tổng đo / tính: {measured/1e6:.3f} / {computed/1e6:.3f} triệu m³; chênh lệch: {fmt(difference)}%'
+            self.ax_volume.legend(fontsize=8,loc='upper left')
+        else:
+            self.ax_volume.plot(time,np.cumsum(res['Q_sim_mean'])*dt*3600/1e6,'r-',label='Mô phỏng tích lũy')
+            self.ax_volume.legend(fontsize=8,loc='upper left')
+            note='Chưa đủ lưu lượng thực đo để so sánh tổng lượng.'
+        self.ax_volume.set_title('TỔNG LƯỢNG NƯỚC TOÀN THỜI ĐOẠN\n'+note,fontsize=8)
+        self.ax_volume.set(xlabel='Ngày/tháng/năm – giờ:phút' if dated else 'Thời gian từ bước đầu (giờ)',ylabel='Tích lũy (triệu m³)')
+        self.ax_volume.set_ylim(bottom=0);self.ax_volume.grid(alpha=.3)
+        if volume['valid'].any():
+            rule='Q tức thời: tích phân hình thang giữa hai điểm liên tiếp.' if res['Discharge_mode']=='endpoint' else 'Q trung bình: tổng Q × Δt.'
+            self.ax_volume.text(1,.02,rule+' Chỉ so sánh khoảng đủ Q đo.',transform=self.ax_volume.transAxes,ha='right',fontsize=7)
         self.fig.tight_layout();self.canvas.draw()
 
     def _export_csv(self):
@@ -1535,6 +1579,11 @@ class NAMDesktopApp:
             out['LoaiLuuLuongDanhGia']=res['Discharge_mode']
             out['Q_TrungBinhBuoc_m3s']=res['Q_sim_mean']
             out['Q_CuoiBuoc_m3s']=res['Q_sim_endpoint']
+            volume=cumulative_water_volume(out['Q_ThucDo_m3s'],res['Q_sim_mean'],dt,res['Discharge_mode'])
+            out['TongLuong_ThucDo_TichLuy_m3']=volume['observed_m3']
+            out['TongLuong_MoPhong_CungKhoang_TichLuy_m3']=volume['simulated_m3']
+            out['KhoangDuQuanTrac_TongLuong']=volume['valid']
+            out['TongLuong_MoPhong_ToanKy_TichLuy_m3']=np.cumsum(res['Q_sim_mean'])*dt*3600.
             for component,label in [('Q_surf','TranMat'),('Q_inter','SatMat'),('Q_base','Ngam')]:
                 out[f'Q_{label}_TrungBinhBuoc_m3s']=res[component+'_mean']
                 out[f'Q_{label}_CuoiBuoc_m3s']=res[component+'_endpoint']
