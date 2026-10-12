@@ -1043,6 +1043,7 @@ class NAMDesktopApp:
             command=self._export_csv,
         )
         btn_export.pack(fill=tk.X, pady=4)
+        ttk.Button(left_frame,text='Trích lưu lượng các lưu vực (Excel)',command=self._export_basins_dialog).pack(fill=tk.X,pady=4)
 
         # --- KHUNG BÊN PHẢI: ĐỒ THỊ MATPLOTLIB ---
         right_frame = ttk.Frame(main_paned)
@@ -2472,6 +2473,79 @@ class NAMDesktopApp:
             rule='Q tức thời: tích phân hình thang giữa hai điểm liên tiếp.' if res['Discharge_mode']=='endpoint' else 'Q trung bình: tổng Q × Δt.'
             self.ax_volume.text(1,.02,rule+' Chỉ so sánh khoảng đủ Q đo.',transform=self.ax_volume.transAxes,ha='right',fontsize=7)
         self.fig.tight_layout();self.canvas.draw()
+
+    def _collect_basin_discharge(self,basin_ids):
+        """Run an isolated project copy; keep the visible model and fit unchanged."""
+        payload=json.loads(self._project_text())
+        window=tk.Toplevel(self.root);window.withdraw()
+        try:
+            worker=NAMDesktopApp(window)
+            worker._apply_project(payload,worker._decode_project(payload))
+            tables=[];metadata=[];wide=[];axes=[];steps=[]
+            for basin_id in basin_ids:
+                if basin_id not in worker._basins:raise ValueError('Lưu vực không tồn tại: '+basin_id)
+                worker._activate_basin(basin_id)
+                record=worker._basins[basin_id]
+                if worker.df_data is None:raise ValueError(record['name']+': '+worker.lbl_data_status.cget('text'))
+                area,dt,warm,split,initial=worker._settings()
+                df=merge_series(worker.input_series,dt,*worker._period())
+                if warm>=len(df):raise ValueError(record['name']+': thời gian khởi động phải ngắn hơn chuỗi dữ liệu.')
+                result=run_nam(worker.best_params,area,df.Mua_mm.to_numpy(),df.BocHoi_mm.to_numpy(),dt,initial,discharge_mode=worker._discharge_mode())
+                axis=series_axis(df);axes.append(axis);steps.append(dt)
+                out=df[[axis]].copy()
+                out['MaLuuVuc']=basin_id;out['TenLuuVuc']=record['name']
+                out['BuocGio']=dt;out['KhoiDong']=np.arange(len(df))<warm
+                out['Q_TinhToan_m3s']=result['Q_sim']
+                out['Q_TrungBinhBuoc_m3s']=result['Q_sim_mean'];out['Q_CuoiBuoc_m3s']=result['Q_sim_endpoint']
+                for key,label in [('Q_surf','TranMat'),('Q_inter','SatMat'),('Q_base','Ngam')]:out['Q_'+label+'_m3s']=result[key]
+                tables.append(out)
+                wide.append(pd.Series(result['Q_sim'],index=pd.Index(df[axis],name=axis),name=basin_id+' — '+record['name']))
+                metadata.append(dict(MaLuuVuc=basin_id,TenLuuVuc=record['name'],DienTich_km2=area,BuocGio=dt,BatDau=str(df[axis].iloc[0]),KetThuc=str(df[axis].iloc[-1]),LoaiLuuLuong=result['Discharge_mode'],NguonBoThongSo=record.get('parameter_source') or '',**worker.best_params,**initial))
+            if not tables:raise ValueError('Chọn ít nhất một lưu vực.')
+            # Missing times remain blank; overlapping/nested basins are never summed.
+            aligned=pd.concat(wide,axis=1).sort_index().reset_index() if len(set(axes))==1 and (axes[0]=='ThoiGian' or len(set(steps))==1) else None
+            return pd.concat(tables,ignore_index=True),pd.DataFrame(metadata),aligned
+        finally:window.destroy()
+
+    def _export_basins_dialog(self):
+        if not self._project_idle():return
+        if not self._basins:
+            messagebox.showinfo('Trích lưu lượng','Chuyển các lưu vực từ bản đồ sang NAM trước khi trích kết quả.',parent=self.root);return
+        window=tk.Toplevel(self.root);window.title('Trích lưu lượng các lưu vực')
+        ttk.Label(window,text='Chọn lưu vực cần trích. Chạy với thông số và thời đoạn riêng đã thiết lập; không dò lại thông số.',wraplength=520).pack(fill='x',padx=10,pady=8)
+        choices=ttk.Treeview(window,columns=('name',),show='headings',selectmode='extended',height=12)
+        choices.heading('name',text='Lưu vực (Ctrl / Shift để chọn nhiều)');choices.column('name',width=520)
+        scroll=ttk.Scrollbar(window,orient='vertical',command=choices.yview);choices.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right',fill='y');choices.pack(fill='both',expand=True,padx=10)
+        for bid in self._basins:choices.insert('', 'end',iid=bid,values=(self._basin_display(bid),))
+        choices.selection_set(list(self._basins))
+        def export():
+            if not self._project_idle():return
+            selected=choices.selection()
+            if not selected:messagebox.showwarning('Trích lưu lượng','Chọn ít nhất một lưu vực.',parent=window);return
+            path=filedialog.asksaveasfilename(parent=window,defaultextension='.xlsx',filetypes=[('Excel','*.xlsx')])
+            if not path:return
+            temporary=None
+            try:
+                detail,info,aligned=self._collect_basin_discharge(selected)
+                with tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(path)),suffix='.xlsx',delete=False) as handle:temporary=handle.name
+                with pd.ExcelWriter(temporary,engine='openpyxl',datetime_format='dd/mm/yyyy hh:mm:ss') as writer:
+                    sheets={'Luu luong chi tiet':detail,'Thong tin luu vuc':info}
+                    if aligned is not None:sheets['So sanh luu luong']=aligned
+                    for name,table in sheets.items():
+                        table.to_excel(writer,sheet_name=name,index=False)
+                        sheet=writer.sheets[name];sheet.freeze_panes='B2';sheet.auto_filter.ref=sheet.dimensions
+                        for column in sheet.columns:
+                            sheet.column_dimensions[column[0].column_letter].width=25
+                            for cell in column[1:]:
+                                if isinstance(cell.value,(datetime,pd.Timestamp)):cell.number_format='dd/mm/yyyy hh:mm:ss'
+                                elif isinstance(cell.value,(int,float)) and not isinstance(cell.value,bool):cell.number_format='0.000'
+                os.replace(temporary,path);temporary=None
+                messagebox.showinfo('Trích lưu lượng',f'Đã xuất {len(selected)} lưu vực. Các ô thiếu thời điểm giữ trống; không cộng lưu lượng các lưu vực.',parent=window)
+            except Exception as exc:messagebox.showerror('Trích lưu lượng',str(exc),parent=window)
+            finally:
+                if temporary is not None:os.unlink(temporary)
+        ttk.Button(window,text='Xuất lưu lượng ra Excel',command=export).pack(fill='x',padx=10,pady=8)
 
     def _export_csv(self):
         if self.df_data is None:return
