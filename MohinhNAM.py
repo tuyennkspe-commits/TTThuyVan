@@ -11,6 +11,7 @@ Tăng tốc tùy chọn: python -m pip install numba
 Bản đồ lưu vực/Thiessen: python -m pip install geopandas shapely pyproj
 P/PET tổng mm mỗi bước; Q trung bình hoặc tức thời cuối bước m³/s, chọn theo quan trắc.
 Hiệu chỉnh cần kiểm định độc lập.
+SHP giữ riêng từng lưu vực; Thiessen mưa/PET tính riêng; dự án .namproj lưu toàn bộ mạng trạm và mô hình.
 """
 
 import os
@@ -299,14 +300,15 @@ def infer_time_step(stations,inputs):
 
 
 def detect_common_period(stations,inputs,dt):
-    """Chọn đoạn liên tục dài nhất có đủ cả ba yếu tố; không bắc qua lỗ hổng."""
-    if not all(k in inputs for k in ['BocHoi_mm','Q_ThucDo_m3s']):return None
+    """Giao mưa/PET và Q nếu có; chọn đoạn liên tục dài nhất, không bắc qua lỗ hổng."""
+    if 'BocHoi_mm' not in inputs:return None
     active=[v for v in stations.values() if v['weight']>0]
     if not active:return None
     weights=[finite_number(v['weight'],'Trọng số') for v in stations.values()]
     if any(not 0<=w<=1 for w in weights) or not np.isclose(sum(weights),1,rtol=0,atol=1e-8):raise ValueError('Tổng trọng số trạm mưa phải bằng 1 trước khi nhận diện khoảng chung.')
     pet=distribute_evaporation(inputs['BocHoi_mm'],active[0]['data'],dt)
-    data=[(v['data'],'Mua_mm') for v in active]+[(pet,'BocHoi_mm'),(inputs['Q_ThucDo_m3s'],'Q_ThucDo_m3s')]
+    data=[(v['data'],'Mua_mm') for v in active]+[(pet,'BocHoi_mm')]
+    if 'Q_ThucDo_m3s' in inputs:data.append((inputs['Q_ThucDo_m3s'],'Q_ThucDo_m3s'))
     axis=series_axis(data[0][0]);common=None
     for frame,key in data:
         if series_axis(frame)!=axis:raise ValueError('Các chuỗi phải cùng kiểu ngày giờ hoặc thứ tự bước.')
@@ -339,6 +341,25 @@ def weighted_rainfall(stations,start='',end=''):
             if current_axis!=axis or not series.index.equals(result.index):raise ValueError('Các trạm có trọng số >0 phải khớp ngày giờ hoặc cùng số bước; không trộn hai kiểu nhập.')
             result=result+series*item['weight']
     return result.rename('Mua_mm').reset_index()
+
+
+def weighted_evaporation(stations,rain,dt):
+    """Phân bổ từng trạm PET về bước tính trước khi lấy bình quân Thiessen."""
+    active=[item for item in stations.values() if item['weight']>0]
+    if not active or not np.isclose(sum(item['weight'] for item in active),1,atol=1e-8,rtol=0):
+        raise ValueError('Trọng số các trạm bốc hơi phải có tổng bằng 1.')
+    axis=series_axis(rain);target=pd.Index(rain[axis]);total=np.zeros(len(rain))
+    notes=[]
+    for item in active:
+        source=item['data']
+        if series_axis(source)!=axis:raise ValueError('Các trạm bốc hơi và mưa phải cùng kiểu thời gian/bước.')
+        distributed=distribute_evaporation(source,rain,dt)
+        values=distributed.set_index(axis)['BocHoi_mm'].reindex(target).to_numpy(dtype=float)
+        total+=item['weight']*values
+        notes.extend(source.attrs.get('import_notes',[]))
+    result=pd.DataFrame({axis:rain[axis].to_numpy(),'BocHoi_mm':total})
+    result.attrs={'pet_mode':'step_total','import_notes':notes+['Bốc hơi bình quân theo Thiessen; không điền hoặc phân phối lại trọng số khi thiếu số liệu.']}
+    return result
 
 
 def merge_series(series,dt,start='',end=''):
@@ -727,6 +748,9 @@ class NAMDesktopApp:
         self.rain_stations={}
         self._basin_geojson=None;self._basin_source='';self._station_positions={}
         self._thiessen_result=None;self._map_pick=False
+        self._shape_basins=[];self._basins={};self._active_basin_id=None
+        self._evap_stations={};self._evap_positions={};self._evap_thiessen=None
+        self._spatial_signature=None;self._parameter_source=None;self._independent_metrics=None
         self._is_demo=False
         self.auto_period=tk.BooleanVar(value=True)
         self.auto_dt=tk.BooleanVar(value=True)
@@ -794,6 +818,13 @@ class NAMDesktopApp:
         left_frame.bind('<Configure>',lambda event:controls.configure(scrollregion=controls.bbox('all')))
         controls.bind('<Configure>',lambda event:controls.itemconfigure(item,width=event.width))
 
+        ttk.Label(left_frame,text='Lưu vực mô phỏng NAM',style='Header.TLabel').pack(anchor='w')
+        self.basin_choice=ttk.Combobox(left_frame,state='readonly',width=43)
+        self.basin_choice.pack(fill='x',pady=4)
+        self.basin_choice.bind('<<ComboboxSelected>>',lambda event:self._select_basin_from_combo())
+        ttk.Button(left_frame,text='Áp dụng bộ thông số cho các lưu vực…',command=self._parameter_transfer_dialog).pack(fill='x',pady=3)
+        self.lbl_basin_model=ttk.Label(left_frame,text='Chưa chuyển lưu vực từ bản đồ.',wraplength=350)
+        self.lbl_basin_model.pack(anchor='w',pady=3)
         # 1. Thông tin lưu vực
         lbl_sec1 = ttk.Label(
             left_frame, text="1. Thông số Lưu vực", style="Header.TLabel"
@@ -806,7 +837,7 @@ class NAMDesktopApp:
         ttk.Label(f_basin, text="Diện tích F (km²):").grid(
             row=0, column=0, sticky="w", padx=3, pady=3
         )
-        self.ent_area = ttk.Entry(f_basin, width=10)
+        self.ent_area = ttk.Entry(f_basin, width=16)
         self.ent_area.insert(0, "150.0")
         self.ent_area.grid(row=0, column=1, sticky="w", padx=3, pady=3)
 
@@ -961,10 +992,12 @@ class NAMDesktopApp:
         main_paned.add(right_frame, weight=1)
 
         self.results_tabs=ttk.Notebook(right_frame);self.results_tabs.pack(fill='both',expand=True)
-        plot_frame=ttk.Frame(self.results_tabs);map_frame=ttk.Frame(self.results_tabs)
+        plot_frame=ttk.Frame(self.results_tabs);map_frame=ttk.Frame(self.results_tabs);basins_frame=ttk.Frame(self.results_tabs)
         self.results_tabs.add(plot_frame,text='Mô phỏng và kết quả')
         self.results_tabs.add(map_frame,text='Bản đồ lưu vực')
         self._build_basin_map(map_frame)
+        self.results_tabs.add(basins_frame,text='Danh sách lưu vực NAM')
+        self._build_basins_tab(basins_frame)
         right_frame=plot_frame
         # Thanh hiển thị chỉ số thống kê (NSE, Qmax, PBIAS)
         metrics_bar = ttk.Frame(right_frame, padding=5)
@@ -1008,10 +1041,280 @@ class NAMDesktopApp:
     # CÁC HÀM XỬ LÝ SỰ KIỆN VÀ DỮ LIỆU
     # ==========================================================================
 
+    def _build_basins_tab(self,parent):
+        bar=ttk.Frame(parent,padding=6);bar.pack(fill='x')
+        for i,(label,command) in enumerate([('Chuyển tất cả từ bản đồ',self._transfer_shape_basins),('Chọn lưu vực mô phỏng / hiệu chỉnh',self._select_basin_from_table),('Kiểm định lưu vực được chọn',self._validate_selected_basin),('Áp dụng bộ thông số…',self._parameter_transfer_dialog)]):
+            ttk.Button(bar,text=label,command=command).grid(row=i//2,column=i%2,sticky='ew',padx=3,pady=3)
+        bar.columnconfigure(0,weight=1);bar.columnconfigure(1,weight=1)
+        self.basins_tree=ttk.Treeview(parent,columns=('name','area','rain','evap','q','source','validation'),show='headings',selectmode='browse')
+        for key,label in [('name','Lưu vực'),('area','Diện tích (km²)'),('rain','Trọng số mưa'),('evap','Trọng số bốc hơi'),('q','Q thực đo'),('source','Nguồn thông số'),('validation','NSE kiểm định')]:
+            self.basins_tree.heading(key,text=label);self.basins_tree.column(key,width=140,stretch=True)
+        scrollbar=ttk.Scrollbar(parent,orient='vertical',command=self.basins_tree.yview);self.basins_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side='right',fill='y')
+        horizontal=ttk.Scrollbar(parent,orient='horizontal',command=self.basins_tree.xview)
+        self.basins_tree.configure(xscrollcommand=horizontal.set);horizontal.pack(side='bottom',fill='x')
+        self.basins_detail=ttk.Label(parent,wraplength=850);self.basins_detail.pack(side='bottom',fill='x',padx=8,pady=4)
+        self.basins_tree.pack(fill='both',expand=True,padx=6,pady=6)
+        self.basins_tree.bind('<<TreeviewSelect>>',lambda event:self._show_basin_detail())
+        self.basins_tree.bind('<Double-1>',lambda event:self._select_basin_from_table())
+        ttk.Label(parent,text='SHP giữ nguyên từng đối tượng, kể cả lưu vực lồng nhau. Chọn lưu vực trước khi nhập Q thực đo, hiệu chỉnh hoặc kiểm định. Thông số chuyển sang lưu vực khác cần được kiểm tra tại lưu vực nhận.',wraplength=900).pack(fill='x',padx=8,pady=6)
+
+    def _show_basin_detail(self):
+        selected=self.basins_tree.selection()
+        if not selected:self.basins_detail.config(text='');return
+        record=self._basins.get(selected[0],{})
+        show=lambda values:'; '.join(f'{name}: {weight:.6f}' for name,weight in values.items()) or 'Chưa đủ vị trí / số liệu trạm'
+        self.basins_detail.config(text='Trọng số mưa: '+show(record.get('rain_weights',{}))+'\nTrọng số bốc hơi: '+show(record.get('evap_weights',{})))
+
+    def _capture_active_basin(self):
+        if self._active_basin_id not in self._basins:return
+        record=self._basins[self._active_basin_id]
+        record['settings']={name:getattr(self,name).get() for name in self._PROJECT_ENTRIES}
+        record['auto_period']=self.auto_period.get();record['auto_dt']=self.auto_dt.get()
+        record['discharge_mode']=self._discharge_mode();record['params']=self.best_params.copy()
+        record['bounds']=[list(pair) for pair in self.param_bounds]
+        record['observed']=self._pack_series(self.input_series['Q_ThucDo_m3s']) if 'Q_ThucDo_m3s' in self.input_series else None
+        record['calibrated']=None if self._calibrated_params is None else dict(params=self._calibrated_params.copy(),area=self._calibrated_area,discharge_mode=self._calibrated_discharge_mode)
+        record['parameter_source']=self._parameter_source;record['independent_metrics']=self._independent_metrics
+        record['rain_weights']={} if self._thiessen_result is None else dict(self._thiessen_result['weights'])
+        record['evap_weights']={} if self._evap_thiessen is None else dict(self._evap_thiessen['weights'])
+        record['calibration_period']=getattr(self,'_calibration_period',None)
+
+    def _basin_display(self,basin_id):
+        return f'{basin_id} — {self._basins[basin_id]["name"]}'
+
+    def _update_basins_table(self):
+        self.basin_choice.config(values=[self._basin_display(bid) for bid in self._basins])
+        if self._active_basin_id in self._basins:self.basin_choice.set(self._basin_display(self._active_basin_id))
+        else:self.basin_choice.set('')
+        self.basins_tree.delete(*self.basins_tree.get_children())
+        for feature in self._shape_basins:
+            bid=feature['id'];record=self._basins.get(bid,{})
+            metrics=self._source_validation(record) or record.get('independent_metrics') or {};nse=metrics.get('nse')
+            source=record.get('parameter_source')
+            source_label=self._basins.get(source,{}).get('name',source) if source else 'Chưa hiệu chỉnh'
+            if source is None and record.get('validation_source'):source_label='KĐ từ '+self._basins.get(record['validation_source'],{}).get('name',record['validation_source'])
+            text=lambda weights:'; '.join(f'{name}: {weight:.3f}' for name,weight in weights.items())
+            self.basins_tree.insert('','end',iid=bid,values=(f'{bid} — {feature["name"]}',f'{feature["area_km2"]:.3f}',text(record.get('rain_weights',{})),text(record.get('evap_weights',{})),
+                'Đã nhập' if record.get('observed') else 'Chưa nhập',source_label,(f'{nse:.3f}'+(' tại '+str(self._basins.get(metrics.get('basin_id'),{}).get('name',metrics.get('basin_id'))) if metrics.get('basin_id') not in (None,bid) else '')) if nse is not None else 'Chưa kiểm định'))
+        if self._active_basin_id in self._basins:
+            record=self._basins[self._active_basin_id];source=record.get('parameter_source')
+            self.lbl_basin_model.config(text=f'Đang làm: {self._basin_display(self._active_basin_id)}. '+('Thông số từ '+str(self._basins.get(source,{}).get('name',source))+'.' if source else 'Chưa hiệu chỉnh.'))
+            self.basins_tree.selection_set(self._active_basin_id)
+        else:self.lbl_basin_model.config(text='Chưa chuyển lưu vực từ bản đồ.')
+
+    def _transfer_shape_basins(self):
+        if not self._project_idle():return
+        if not self._shape_basins:
+            messagebox.showinfo('Lưu vực','Nhập SHP lưu vực trước.',parent=self.root);return
+        self._capture_active_basin()
+        for feature in self._shape_basins:
+            if feature['id'] in self._basins:continue
+            settings={name:getattr(self,name).get() for name in self._PROJECT_ENTRIES}
+            settings['ent_area']=f'{feature["area_km2"]:.12g}'
+            record=dict(feature,settings=settings,auto_period=True,auto_dt=self.auto_dt.get(),discharge_mode=self._discharge_mode(),params=self.best_params.copy(),
+                bounds=[list(pair) for pair in self.param_bounds],observed=None,calibrated=None,parameter_source=None,independent_metrics=None,rain_weights={},evap_weights={},calibration_period=None)
+            self._basins[feature['id']]=record
+        selected=self._active_basin_id or next(iter(self._basins))
+        self._activate_basin(selected)
+        self.results_tabs.select(2)
+
+    def _activate_basin(self,basin_id,capture=True):
+        if not self._project_idle():
+            if self._active_basin_id in self._basins:self.basin_choice.set(self._basin_display(self._active_basin_id))
+            return False
+        if basin_id not in self._basins:return False
+        if capture:self._capture_active_basin()
+        record=self._basins[basin_id];self._active_basin_id=basin_id
+        self._basin_geojson=record['geometry'];self._thiessen_result=None;self._evap_thiessen=None;self._spatial_signature=None
+        self.best_params=record['params'].copy();self.param_bounds=[tuple(pair) for pair in record['bounds']]
+        calibrated=record.get('calibrated');self._calibrated_params=None if calibrated is None else calibrated['params'].copy()
+        if calibrated is not None:
+            self._calibrated_area=record['area_km2'];self._calibrated_discharge_mode=calibrated['discharge_mode']
+        self._parameter_source=record.get('parameter_source');self._independent_metrics=record.get('independent_metrics');self._calibration_period=record.get('calibration_period')
+        for name,value in record['settings'].items():
+            entry=getattr(self,name);entry.config(state='normal');entry.delete(0,'end');entry.insert(0,value)
+        self.ent_area.delete(0,'end');self.ent_area.insert(0,f'{record["area_km2"]:.12g}');self.ent_area.config(state='readonly')
+        if self.validation_mode:self.ent_split.delete(0,'end');self.ent_split.insert(0,'100');self.ent_split.config(state='readonly')
+        self.auto_period.set(record['auto_period']);self.auto_dt.set(record['auto_dt'])
+        self.discharge_choice.current(1 if record['discharge_mode']=='endpoint' else 0)
+        if record.get('observed') is None:self.input_series.pop('Q_ThucDo_m3s',None)
+        else:self.input_series['Q_ThucDo_m3s']=self._unpack_series(record['observed'],'Q_ThucDo_m3s')
+        self.series_labels['Q_ThucDo_m3s'].config(text='Q riêng: '+record['name'] if record.get('observed') else 'Chưa nhập Q cho '+record['name'],foreground='blue')
+        self._suggested_period=self._period();self._update_parameter_display();self._refresh_inputs()
+        self._capture_active_basin();self._update_basins_table();self._draw_basin_map()
+        return True
+
+    def _select_basin_from_combo(self):
+        selected=self.basin_choice.get()
+        bid=next((key for key in self._basins if self._basin_display(key)==selected),None)
+        if bid is not None:self._activate_basin(bid)
+
+    def _select_basin_from_table(self):
+        selected=self.basins_tree.selection()
+        if selected:
+            if not self._basins:self._transfer_shape_basins()
+            self._activate_basin(selected[0]);self.results_tabs.select(0)
+
+    def _validate_selected_basin(self):
+        selected=self.basins_tree.selection()
+        if selected and self._activate_basin(selected[0]):self._validation_source_dialog()
+
+    @staticmethod
+    def _source_validation(record):
+        calibrated=record.get('calibrated')
+        if calibrated is None:return None
+        own=record.get('independent_metrics')
+        if own is not None and own.get('nse') is not None and np.isfinite(own['nse']) and (record.get('validation_params') is None or record['validation_params']==calibrated['params']):
+            return dict(own,basin_id=record['id'])
+        for bid,result in record.get('validation_results',{}).items():
+            if result.get('nse') is not None and np.isfinite(result['nse']) and result.get('params')==calibrated['params']:
+                return dict(result,basin_id=bid)
+        return None
+
+    def _validation_source_dialog(self):
+        if not self._project_idle():return
+        self._capture_active_basin()
+        sources=[bid for bid,record in self._basins.items() if record.get('calibrated') is not None]
+        if not sources:
+            messagebox.showinfo('Kiểm định','Hiệu chỉnh ít nhất một lưu vực để có bộ thông số.',parent=self.root);return
+        window=tk.Toplevel(self.root);window.title('Chọn bộ thông số dùng kiểm định');window.transient(self.root);window.grab_set()
+        ttk.Label(window,text='Lưu vực kiểm định: '+self._basin_display(self._active_basin_id)).pack(padx=10,pady=6)
+        ttk.Label(window,text='Chọn lưu vực cung cấp bộ thông số đã hiệu chỉnh:').pack(padx=10,pady=4)
+        choice=ttk.Combobox(window,values=[self._basin_display(bid) for bid in sources],state='readonly',width=60);choice.current(0);choice.pack(padx=10,pady=6)
+        def run():
+            source_id=sources[choice.current()];window.destroy();self._open_basin_validation(source_id)
+        ttk.Button(window,text='Mở kiểm định với bộ thông số cố định',command=run).pack(padx=10,pady=8)
+
+    def _transfer_parameters(self,source_id,target_ids):
+        self._capture_active_basin()
+        source=self._basins[source_id]
+        if source.get('calibrated') is None:raise ValueError('Lưu vực nguồn chưa có bộ thông số hiệu chỉnh.')
+        if self._source_validation(source) is None:
+            raise ValueError('Chạy kiểm định độc lập có NSE xác định cho lưu vực nguồn trước khi áp dụng bộ thông số.')
+        if any(target_id not in self._basins for target_id in target_ids):raise ValueError('Lưu vực nhận không có trong danh sách.')
+        params=source['calibrated']['params'];mode=source['calibrated']['discharge_mode']
+        for target_id in target_ids:
+            if target_id==source_id:continue
+            target=self._basins[target_id]
+            target['params']=params.copy();target['discharge_mode']=mode
+            target['calibrated']=dict(params=params.copy(),area=target['area_km2'],discharge_mode=mode)
+            tested=target.get('independent_metrics') if target.get('validation_source')==source_id and target.get('validation_params')==params else None
+            target['parameter_source']=source_id;target['independent_metrics']=tested;target['calibration_metrics']=None;target['calibration_period']=None
+            target['validation_results']={}
+        if self._active_basin_id in target_ids and self._active_basin_id!=source_id:self._activate_basin(self._active_basin_id,capture=False)
+        self._update_basins_table()
+
+    def _parameter_transfer_dialog(self):
+        if not self._project_idle():return
+        self._capture_active_basin()
+        sources=[bid for bid,record in self._basins.items() if record.get('calibrated') is not None]
+        if not sources:
+            messagebox.showinfo('Thông số','Chọn một lưu vực và hiệu chỉnh trước.',parent=self.root);return
+        window=tk.Toplevel(self.root);window.title('Áp dụng bộ thông số NAM cho các lưu vực');window.geometry('900x430');window.transient(self.root);window.grab_set()
+        ttk.Label(window,text='Lưu vực nguồn (đã hiệu chỉnh và kiểm định):').pack(anchor='w',padx=8,pady=4)
+        choice=ttk.Combobox(window,values=[self._basin_display(bid) for bid in sources],state='readonly',width=65);choice.current(0);choice.pack(fill='x',padx=8)
+        status=ttk.Label(window,wraplength=850);status.pack(fill='x',padx=8,pady=4)
+        def show_source(event=None):
+            record=self._basins[sources[choice.current()]];metric=self._source_validation(record) or {}
+            status.config(text='NSE kiểm định tại '+str(self._basins.get(metric.get('basin_id'),{}).get('name','chưa chọn'))+': '+(str(round(metric['nse'],3)) if metric.get('nse') is not None else 'chưa có')+'. Chỉ chuyển thông số và loại Q đánh giá; giữ diện tích, đầu vào và thời gian riêng của từng lưu vực nhận.')
+        choice.bind('<<ComboboxSelected>>',show_source);show_source()
+        tree=ttk.Treeview(window,columns=('name','area'),show='headings',selectmode='extended');tree.heading('name',text='Lưu vực nhận');tree.heading('area',text='Diện tích (km²)')
+        for bid,record in self._basins.items():tree.insert('','end',iid=bid,values=(self._basin_display(bid),f'{record["area_km2"]:.3f}'))
+        tree.pack(fill='both',expand=True,padx=8,pady=4)
+        row=ttk.Frame(window);row.pack(fill='x',padx=8,pady=8)
+        ttk.Button(row,text='Chọn tất cả',command=lambda:tree.selection_set(tree.get_children())).pack(side='left')
+        def apply():
+            try:
+                if not tree.selection():raise ValueError('Chọn các lưu vực nhận bộ thông số.')
+                self._transfer_parameters(sources[choice.current()],tree.selection());window.destroy()
+            except Exception as exc:messagebox.showerror('Áp dụng thông số',str(exc),parent=window)
+        ttk.Button(row,text='Áp dụng cho các lưu vực đã chọn',command=apply).pack(side='right')
+
+    def _import_evap_station(self,name):
+        if not self._project_idle():return
+        path=filedialog.askopenfilename(parent=self.root,title='Chọn bốc hơi trạm '+name,filetypes=[('CSV / Excel / MIKE DFS0','*.csv *.xlsx *.dfs0')])
+        if not path:return
+        try:
+            prepared=prepare_series(read_series_file(path,'BocHoi_mm',self._choose_dfs_item),'BocHoi_mm')
+            if 'ThoiGian' in prepared:
+                mode=simpledialog.askinteger('Bốc hơi trạm '+name,'1. Tổng mm/bước (thời gian cuối bước).\n2. Tổng mm/tháng.\n3. Trung bình mm/ngày của tháng.\n4. Tổng mm/ngày theo lịch.',initialvalue=1,minvalue=1,maxvalue=4,parent=self.root)
+                if mode is None:return
+                prepared.attrs['pet_mode']={1:'step_total',2:'month_total',3:'month_daily_mean',4:'day_total'}[mode]
+            if name in self._evap_stations and not messagebox.askyesno('Bốc hơi','Thay dữ liệu bốc hơi trạm '+name+'?',parent=self.root):return
+            self._evap_stations[name]=dict(data=prepared,source=Path(path).name,weight=1. if not self._evap_stations else self._evap_stations.get(name,{}).get('weight',0.))
+            self._spatial_signature=None;self._evap_thiessen=None
+            if self._basin_geojson is not None and self.rain_stations:self._calculate_thiessen()
+            else:self._refresh_inputs();self._draw_basin_map()
+        except ImportCancelled:return
+        except Exception as exc:messagebox.showerror('Trạm bốc hơi',str(exc),parent=self.root)
+
+    def _manage_evap_stations(self):
+        window=tk.Toplevel(self.root);window.title('Mạng trạm bốc hơi');window.geometry('750x350')
+        tree=ttk.Treeview(window,columns=('name','weight','source'),show='headings')
+        for key,label in [('name','Trạm'),('weight','Trọng số lưu vực đang chọn'),('source','Dữ liệu')]:tree.heading(key,text=label)
+        tree.pack(fill='both',expand=True,padx=6,pady=6)
+        def refresh():
+            tree.delete(*tree.get_children())
+            for name in dict.fromkeys([*self._evap_stations,*self._evap_positions]):
+                item=self._evap_stations.get(name,{})
+                tree.insert('','end',iid=name,values=(name,f'{item.get("weight",0):.6f}',item.get('source','Chưa chọn dữ liệu')))
+        def replace():
+            if tree.selection():self._import_evap_station(tree.selection()[0]);refresh()
+        def remove():
+            if tree.selection():
+                name=tree.selection()[0];self._evap_stations.pop(name,None);self._evap_positions.pop(name,None)
+                self._spatial_signature=None;self._evap_thiessen=None;self.input_series.pop('BocHoi_mm',None)
+                self._refresh_inputs();self._draw_basin_map();refresh()
+        row=ttk.Frame(window);row.pack(fill='x',padx=6,pady=6)
+        for label,command in [('Thêm trạm / vị trí',lambda:self._station_coordinate_dialog('evap')),('Chọn lại dữ liệu',replace),('Xóa trạm',remove)]:ttk.Button(row,text=label,command=command).pack(side='left',padx=3)
+        window.bind('<FocusIn>',lambda event:refresh() if event.widget==window else None);refresh()
+
+    def _open_basin_validation(self,source_id=None):
+        if not self._project_idle():return
+        self._capture_active_basin();bid=self._active_basin_id;record=self._basins[bid]
+        if source_id is None:
+            if record.get('calibrated') is None:self._validation_source_dialog();return
+            source_id=bid
+        source=self._basins[source_id];fitted=source['calibrated']
+        import copy
+        window=tk.Toplevel(self.root);app=NAMDesktopApp(window,validation_params=fitted['params'])
+        app._shape_basins=[copy.deepcopy(feature) for feature in self._shape_basins if feature['id']==bid]
+        app._basins={bid:copy.deepcopy(record)};app._basin_source=self._basin_source
+        app._basins[bid]['params']=fitted['params'].copy()
+        app._basins[bid]['calibrated']=dict(params=fitted['params'].copy(),area=record['area_km2'],discharge_mode=fitted['discharge_mode'])
+        app._basins[bid]['parameter_source']=source_id
+        app._basins[bid]['discharge_mode']=fitted['discharge_mode']
+        app._basins[bid]['calibration_period']=record.get('calibration_period') if source_id==bid else None
+        app._station_positions=copy.deepcopy(self._station_positions);app._evap_positions=copy.deepcopy(self._evap_positions)
+        app.rain_stations={name:dict(item,data=item['data'].copy()) for name,item in self.rain_stations.items()}
+        app._evap_stations={name:dict(item,data=item['data'].copy()) for name,item in self._evap_stations.items()}
+        app.input_series={key:frame.copy() for key,frame in self.input_series.items() if key!='Mua_mm'}
+        app._activate_basin(bid,capture=False);app.basin_choice.config(state='disabled');app.discharge_choice.config(state='disabled')
+        app._validation_forbidden_period=record.get('calibration_period') if source_id==bid else None
+        def store(metrics,params,period):
+            current=self._basins.get(bid)
+            donor=self._basins.get(source_id)
+            if current is None or donor is None or donor.get('calibrated') is None:return
+            if any(donor['calibrated']['params'][key]!=params[key] for key in PARAM_KEYS):return
+            result={key:float(value) if np.isfinite(value) else None for key,value in metrics.items()}
+            result['requested_period']=list(period);current['independent_metrics']=result
+            current['validation_source']=source_id;current['validation_params']=params.copy()
+            donor.setdefault('validation_results',{})[bid]=dict(result,params=params.copy())
+            if self._active_basin_id==bid:self._independent_metrics=result
+            self._update_basins_table()
+        app._validation_callback=store
+        app.lbl_calib_status.config(text='Kiểm định '+record['name']+' với thông số từ '+source['name']+'. Chọn thời đoạn / số liệu kiểm định; thông số giữ cố định.')
+        app._project_defaults=app._project_payload();app._saved_project=app._project_text();window._nam_app=app
+
     def _build_basin_map(self,parent):
         row=ttk.Frame(parent,padding=5);row.pack(fill='x')
         for label,command in [('Nhập lưu vực (.shp)',self._import_basin),('Thêm / sửa trạm mưa',self._station_coordinate_dialog),('Tính trọng số Thiessen',self._calculate_thiessen)]:
             ttk.Button(row,text=label,command=command).pack(side='left',padx=3)
+        row=ttk.Frame(parent,padding=5);row.pack(fill='x')
+        ttk.Button(row,text='Chuyển tất cả lưu vực sang NAM',command=self._transfer_shape_basins).pack(side='left',padx=3)
+        ttk.Button(row,text='Thêm / sửa trạm bốc hơi',command=lambda:self._station_coordinate_dialog('evap')).pack(side='left',padx=3)
+        ttk.Button(row,text='Quản lý mạng trạm bốc hơi',command=self._manage_evap_stations).pack(side='left',padx=3)
         row=ttk.Frame(parent,padding=5);row.pack(fill='x')
         ttk.Label(row,text='Trạm để đặt trên bản đồ:').pack(side='left')
         self.map_station_choice=ttk.Combobox(row,state='readonly',width=25);self.map_station_choice.pack(side='left',padx=3)
@@ -1038,25 +1341,34 @@ class NAMDesktopApp:
     def _import_basin(self):
         if not self._project_idle():return
         if self.validation_mode:
-            messagebox.showinfo('Kiểm định','Diện tích lưu vực kiểm định phải giữ như khi hiệu chỉnh. Nhập lưu vực ở cửa sổ chính.',parent=self.root);return
-        path=filedialog.askopenfilename(parent=self.root,title='Nhập ranh giới lưu vực',filetypes=[('Shapefile','*.shp')])
+            messagebox.showinfo('Kiểm định','Nhập danh sách lưu vực tại cửa sổ chính.',parent=self.root);return
+        path=filedialog.askopenfilename(parent=self.root,title='Nhập các lưu vực — giữ nguyên từng đối tượng',filetypes=[('Shapefile','*.shp')])
         if not path:return
         try:
-            gpd,_,mapping,_,_,union,_,_=_geo_modules()
-            frame=gpd.read_file(path)
+            gpd,_,mapping,_,_,union,_,_=_geo_modules();frame=gpd.read_file(path)
             if frame.crs is None:
-                code=simpledialog.askstring('Hệ tọa độ SHP','Tệp thiếu hệ tọa độ (.prj). Nhập EPSG hoặc định nghĩa CRS đúng của dữ liệu (không tự đoán):',parent=self.root)
+                code=simpledialog.askstring('Hệ tọa độ SHP','SHP thiếu .prj. Nhập hệ tọa độ đúng (EPSG hoặc CRS):',parent=self.root)
                 if not code:return
                 frame=frame.set_crs(code)
-            if frame.empty or frame.geometry.isna().any() or frame.geometry.is_empty.any():raise ValueError('SHP rỗng hoặc chứa đối tượng không có hình học.')
-            if not frame.geom_type.isin(['Polygon','MultiPolygon']).all() or not frame.geometry.is_valid.all():
-                raise ValueError('SHP lưu vực phải gồm các polygon hợp lệ. Kiểm tra lại hình học trong phần mềm GIS.')
-            if len(frame)>1 and not messagebox.askyesno('Nhiều polygon',f'SHP có {len(frame)} đối tượng. Hợp nhất tất cả thành một lưu vực (phần chồng chỉ tính một lần)?',parent=self.root):return
-            geometry=union(frame.to_crs(4326).geometry.tolist());geojson=mapping(geometry)
-            metric,_,_=basin_metric_geometry(geojson)
-            self._basin_geojson=geojson;self._basin_source=Path(path).name;self._thiessen_result=None
-            self.ent_area.delete(0,'end');self.ent_area.insert(0,f'{metric.area/1e6:.12g}')
-            self._refresh_inputs();self._draw_basin_map()
+            if frame.empty or frame.geometry.isna().any() or frame.geometry.is_empty.any():raise ValueError('SHP rỗng hoặc có hình học trống.')
+            if not frame.geom_type.isin(['Polygon','MultiPolygon']).all() or not frame.geometry.is_valid.all():raise ValueError('Mỗi đối tượng phải là Polygon/MultiPolygon hợp lệ.')
+            if self._basins and not messagebox.askyesno('Thay bản đồ','Thay danh sách lưu vực đang làm? Hãy lưu dự án hiện tại nếu cần giữ.',parent=self.root):return
+            fields=[column for column in frame.columns if column!=frame.geometry.name]
+            preferred=next((c for c in fields if str(c).casefold() in ('name','ten','ten_lv','ten_luuvuc','basin_name','id')),None)
+            converted=frame.to_crs(4326);features=[]
+            for i,(_,row) in enumerate(converted.iterrows(),1):
+                geometry=mapping(row.geometry);metric,_,_=basin_metric_geometry(geometry)
+                value=row[preferred] if preferred else None
+                name=str(value) if value is not None and pd.notna(value) else f'Lưu vực {i}'
+                properties={str(c):str(row[c]) if pd.notna(row[c]) else None for c in fields}
+                features.append(dict(id=f'LV_{i}',name=name,geometry=geometry,area_km2=metric.area/1e6,properties=properties))
+            self._shape_basins=features;self._basins={};self._active_basin_id=None
+            self._parameter_source=None;self._independent_metrics=None;self._calibration_period=None;self._calibrated_params=None
+            self._basin_geojson=mapping(union(converted.geometry.tolist())) # Chỉ làm khung hiển thị, không gộp các lưu vực NAM.
+            self._basin_source=Path(path).name;self._thiessen_result=None;self._evap_thiessen=None;self._spatial_signature=None
+            self.ent_area.config(state='normal')
+            self._refresh_inputs();self._update_basins_table();self._draw_basin_map()
+            self.lbl_map_status.config(text=f'Đã giữ nguyên {len(features)} đối tượng lưu vực. Bấm Chuyển tất cả lưu vực sang NAM để tạo mô hình riêng.')
         except Exception as exc:messagebox.showerror('Nhập lưu vực',str(exc),parent=self.root)
 
     @staticmethod
@@ -1076,13 +1388,16 @@ class NAMDesktopApp:
         if not (-180<=lon<=180 and -90<lat<90):raise ValueError('Tọa độ sau chuyển đổi không hợp lệ; kiểm tra hệ tọa độ và thứ tự X Bắc/Y Đông.')
         return [lon,lat]
 
-    def _station_coordinate_dialog(self):
+    def _station_coordinate_dialog(self,kind='rain'):
+        positions=self._station_positions if kind=='rain' else self._evap_positions
+        network=self.rain_stations if kind=='rain' else self._evap_stations
+        station_label='mưa' if kind=='rain' else 'bốc hơi'
         if not self._project_idle():return
         self._sync_map_stations()
-        window=tk.Toplevel(self.root);window.title('Thêm trạm mưa — vị trí và dữ liệu');window.transient(self.root)
+        window=tk.Toplevel(self.root);window.title('Thêm trạm '+station_label+' — vị trí và dữ liệu');window.transient(self.root)
         fields={};labels={}
-        names=list(dict.fromkeys([*self.rain_stations,*self._station_positions]))
-        for r,(key,label,default) in enumerate([('name','Tên trạm (nhập mới hoặc chọn)',self.map_station_choice.get()),('crs','Hệ tọa độ EPSG','EPSG:4326'),('x','Vĩ độ (độ)',''),('y','Kinh độ (độ)','')]):
+        names=list(dict.fromkeys([*network,*positions]))
+        for r,(key,label,default) in enumerate([('name','Tên trạm (nhập mới hoặc chọn)',self.map_station_choice.get() if kind=='rain' else ''),('crs','Hệ tọa độ EPSG','EPSG:4326'),('x','Vĩ độ (độ)',''),('y','Kinh độ (độ)','')]):
             labels[key]=ttk.Label(window,text=label);labels[key].grid(row=r,column=0,padx=8,pady=5,sticky='w')
             entry=ttk.Combobox(window,values=names,state='normal',width=28) if key=='name' else ttk.Entry(window,width=30)
             entry.set(default) if key=='name' else entry.insert(0,default)
@@ -1094,9 +1409,9 @@ class NAMDesktopApp:
             except Exception:return
             labels['x'].config(text='Vĩ độ (độ)' if geographic else 'X — Northing / tọa độ Bắc (m)')
             labels['y'].config(text='Kinh độ (độ)' if geographic else 'Y — Easting / tọa độ Đông (m)')
-            note.config(text='Ví dụ: vĩ độ 22.45235; kinh độ 105.72063. Sau khi lưu vị trí, chọn tệp mưa cho đúng trạm.' if geographic else 'Nhập X Bắc trước, Y Đông sau. Hệ tọa độ phải đúng với dữ liệu. Sau đó chọn tệp mưa cho trạm.')
+            note.config(text='Ví dụ: vĩ độ 22.45235; kinh độ 105.72063. Sau khi lưu vị trí, chọn tệp '+station_label+' cho đúng trạm.' if geographic else 'Nhập X Bắc trước, Y Đông sau. Hệ tọa độ phải đúng với dữ liệu. Sau đó chọn tệp '+station_label+' cho trạm.')
         def fill_existing(event=None):
-            point=self._station_positions.get(fields['name'].get().strip())
+            point=positions.get(fields['name'].get().strip())
             if point is not None:
                 for key,value in [('crs','EPSG:4326'),('x',f'{point[1]:.10f}'),('y',f'{point[0]:.10f}')]:
                     fields[key].delete(0,'end');fields[key].insert(0,value)
@@ -1104,16 +1419,17 @@ class NAMDesktopApp:
         fields['crs'].bind('<KeyRelease>',update_labels);fields['name'].bind('<<ComboboxSelected>>',fill_existing)
         update_labels();fill_existing()
         def save():
+            if not self._project_idle():return
             try:
                 name=fields['name'].get().strip()
                 if not name:raise ValueError('Tên trạm không được để trống.')
                 point=self._station_lonlat(fields['x'].get(),fields['y'].get(),fields['crs'].get(),
                     lambda:messagebox.askyesno('Thứ tự tọa độ','Hai giá trị có vẻ là kinh độ rồi vĩ độ. Đổi lại thứ tự cho đúng?',parent=window))
-                self._station_positions[name]=point;self._thiessen_result=None
+                positions[name]=point;self._thiessen_result=None;self._evap_thiessen=None;self._spatial_signature=None
                 self._draw_basin_map();self.map_station_choice.set(name);window.destroy()
-                self._import_rain_station(name)
+                self._import_rain_station(name) if kind=='rain' else self._import_evap_station(name)
             except Exception as exc:messagebox.showerror('Tọa độ trạm',str(exc),parent=window)
-        ttk.Button(window,text='Lưu vị trí và chọn dữ liệu mưa',command=save).grid(row=5,column=0,columnspan=2,pady=8)
+        ttk.Button(window,text='Lưu vị trí và chọn dữ liệu '+station_label,command=save).grid(row=5,column=0,columnspan=2,pady=8)
 
     def _enable_map_pick(self):
         self._sync_map_stations()
@@ -1129,35 +1445,55 @@ class NAMDesktopApp:
     def _map_clicked(self,event):
         if not self._map_pick or event.inaxes!=self.map_ax or event.xdata is None:return
         if self.map_canvas.toolbar.mode:return
+        if not self._project_idle():return
         try:
             _,_,_,_,_,_,_,Transformer=_geo_modules()
             _,crs,_=basin_metric_geometry(self._basin_geojson)
             lon,lat=Transformer.from_crs(crs,4326,always_xy=True).transform(event.xdata,event.ydata,errcheck=True)
             name=self.map_station_choice.get()
             self._station_positions[name]=[lon,lat]
-            self._map_pick=False;self._thiessen_result=None;self._draw_basin_map()
+            self._map_pick=False;self._thiessen_result=None;self._spatial_signature=None;self._draw_basin_map()
             if name not in self.rain_stations:self._import_rain_station(name)
         except Exception as exc:messagebox.showerror('Đặt trạm',str(exc),parent=self.root)
 
     def _remove_station_position(self):
         self._station_positions.pop(self.map_station_choice.get(),None)
-        self._thiessen_result=None;self._draw_basin_map()
+        self._thiessen_result=None;self._spatial_signature=None;self._draw_basin_map()
+
+    def _assign_spatial_weights(self):
+        if self._basin_geojson is None:return
+        signature=(self._active_basin_id,id(self._basin_geojson),
+            tuple((name,tuple(self._station_positions.get(name,()))) for name in self.rain_stations),
+            tuple((name,tuple(self._evap_positions.get(name,()))) for name in self._evap_stations))
+        if signature==self._spatial_signature:return
+        for network,positions,label,attr in [(self.rain_stations,self._station_positions,'mưa','_thiessen_result'),(self._evap_stations,self._evap_positions,'bốc hơi','_evap_thiessen')]:
+            if not network:continue
+            missing=[name for name in network if name not in positions]
+            pending=[name for name in positions if name not in network]
+            if missing:raise ValueError('Chưa có tọa độ trạm '+label+': '+', '.join(missing))
+            if pending:raise ValueError('Chưa chọn dữ liệu cho trạm '+label+': '+', '.join(pending))
+            result=thiessen_basin_weights(self._basin_geojson,{name:positions[name] for name in network})
+            for name,item in network.items():item['weight']=float(result['weights'][name])
+            setattr(self,attr,result)
+        self._spatial_signature=signature
+        token=repr((tuple((name,tuple(self._station_positions.get(name,()))) for name in self.rain_stations),
+                    tuple((name,tuple(self._evap_positions.get(name,()))) for name in self._evap_stations)))
+        for bid,record in self._basins.items():
+            if record.get('spatial_token')==token:continue
+            for network,positions,key in [(self.rain_stations,self._station_positions,'rain_weights'),(self._evap_stations,self._evap_positions,'evap_weights')]:
+                record[key]={} if not network else dict(thiessen_basin_weights(record['geometry'],{name:positions[name] for name in network})['weights'])
+            record['spatial_token']=token
 
     def _calculate_thiessen(self):
         if not self._project_idle():return
         try:
             if self._basin_geojson is None:raise ValueError('Chưa nhập lưu vực.')
-            pending=[name for name in self._station_positions if name not in self.rain_stations]
-            if pending:raise ValueError('Chưa chọn dữ liệu mưa cho trạm: '+', '.join(pending)+'. Chọn trạm rồi bấm Chọn dữ liệu mưa.')
-            if not self.rain_stations:raise ValueError('Chưa nhập các chuỗi mưa.')
-            missing=[name for name in self.rain_stations if name not in self._station_positions]
-            if missing:raise ValueError('Chưa có tọa độ trạm: '+', '.join(missing))
-            positions={name:self._station_positions[name] for name in self.rain_stations}
-            result=thiessen_basin_weights(self._basin_geojson,positions)
-            for name,item in self.rain_stations.items():item['weight']=float(result['weights'][name])
-            self._thiessen_result=result
-            self._update_rain_label();self._thiessen_result=result;self._refresh_inputs();self._draw_basin_map()
-            self.lbl_map_status.config(text=f'Diện tích lưu vực: {result["area_km2"]:.3f} km². Tổng trọng số = {sum(result["weights"].values()):.8f}. Đã áp dụng vào mưa bình quân lưu vực.')
+            if self._shape_basins and self._active_basin_id is None:raise ValueError('Bấm Chuyển tất cả lưu vực sang NAM và chọn lưu vực trước.')
+            if not self.rain_stations:raise ValueError('Chưa nhập trạm mưa.')
+            self._spatial_signature=None;self._assign_spatial_weights()
+            self.series_labels['Mua_mm'].config(text=f'{len(self.rain_stations)} trạm; trọng số Thiessen riêng cho lưu vực đang chọn.',foreground='blue')
+            self._refresh_inputs();self._draw_basin_map();self._capture_active_basin();self._update_basins_table()
+            self.lbl_map_status.config(text='Đã tính riêng Thiessen mưa và bốc hơi cho lưu vực đang chọn; mỗi mạng có tổng trọng số = 1.')
         except Exception as exc:messagebox.showerror('Thiessen',str(exc),parent=self.root)
 
     def _draw_basin_map(self):
@@ -1186,6 +1522,12 @@ class NAMDesktopApp:
                         coords=list(ring.coords);vertices.extend(coords);codes.extend([PlotPath.MOVETO]+[PlotPath.LINETO]*(len(coords)-2)+[PlotPath.CLOSEPOLY])
                     self.map_ax.add_patch(PathPatch(PlotPath(vertices,codes),facecolor=color,edgecolor='#28536b',alpha=alpha,lw=1.1))
             draw_polygon(basin,'#dcebf3',1.)
+            if self._shape_basins:
+                _,shape,_,_,transform,_,_,_=_geo_modules()
+                for feature in self._shape_basins:
+                    part=transform(forward.transform,shape(feature['geometry']))
+                    draw_polygon(part,'none',1.)
+                    center=part.representative_point();self.map_ax.annotate(feature['name'],(center.x,center.y),fontsize=8,color='#315779')
             result=self._thiessen_result
             if result is not None:
                 colors=['#79c7c5','#f2b880','#a6c48a','#b5a7d4','#ef9c9c']
@@ -1199,10 +1541,17 @@ class NAMDesktopApp:
                 area='' if result is None else f'{result["areas_km2"].get(name,0):.3f}'
                 weight='' if result is None else f'{result["weights"].get(name,0):.6f}'
                 self.map_tree.insert('','end',values=(name,f'{point[0]:.7f}',f'{point[1]:.7f}',area,weight,self.rain_stations[name]['source'] if name in self.rain_stations else 'Chưa chọn dữ liệu'))
+            for name,point in self._evap_positions.items():
+                x,y=forward.transform(*point);self.map_ax.plot(x,y,'s',color='#df8a16',markersize=7)
+                self.map_ax.annotate('BH: '+name,(x,y),xytext=(5,-12),textcoords='offset points',fontsize=8)
+                result_pet=self._evap_thiessen
+                area='' if result_pet is None else f"{result_pet['areas_km2'].get(name,0):.3f}"
+                weight='' if result_pet is None else f"{result_pet['weights'].get(name,0):.6f}"
+                self.map_tree.insert('','end',values=('BH: '+name,f'{point[0]:.7f}',f'{point[1]:.7f}',area,weight,self._evap_stations[name]['source'] if name in self._evap_stations else 'Chưa chọn dữ liệu'))
             self.map_ax.autoscale_view();self.map_ax.margins(.1);self.map_ax.set_aspect('equal',adjustable='datalim')
             self.map_ax.set(xlabel='Easting (m)',ylabel='Northing (m)',title='Lưu vực và trạm mưa — phép chiếu bảo toàn diện tích')
             self.map_ax.ticklabel_format(style='plain',useOffset=False);self.map_ax.grid(alpha=.2)
-            self.lbl_map_status.config(text=f'{self._basin_source} — Diện tích: {basin.area/1e6:.3f} km². Đặt đủ vị trí trạm rồi bấm tính Thiessen để cập nhật trọng số.')
+            self.lbl_map_status.config(text=f'{self._basin_source} — Diện tích đang chọn: {basin.area/1e6:.3f} km². Thiessen được tính riêng cho lưu vực NAM đang chọn.')
             self.map_fig.tight_layout();self.map_canvas.draw()
         except Exception as exc:self.lbl_map_status.config(text=str(exc))
 
@@ -1231,6 +1580,7 @@ class NAMDesktopApp:
         return result
 
     def _project_payload(self):
+        self._capture_active_basin()
         calibrated=None
         if self._calibrated_params is not None:
             calibrated=dict(params=self._calibrated_params,area=self._calibrated_area,
@@ -1241,6 +1591,8 @@ class NAMDesktopApp:
                     auto_period=self.auto_period.get(),auto_dt=self.auto_dt.get(),
                     discharge_mode=self._discharge_mode(),params=self.best_params.copy(),
                     bounds=[list(pair) for pair in self.param_bounds],calibrated=calibrated,
+                    multi_basins=dict(features=self._shape_basins,basins=self._basins,active=self._active_basin_id,
+                        evap_positions=self._evap_positions,evap_stations={name:dict(weight=item['weight'],source=item['source'],data=self._pack_series(item['data'])) for name,item in self._evap_stations.items()}),
                     demo=self._is_demo,basin_map=dict(geometry=self._basin_geojson,source=self._basin_source,stations=self._station_positions,thiessen_computed=self._thiessen_result is not None),
                     rain_stations=[dict(name=name,weight=item['weight'],source=item['source'],
                         data=self._pack_series(item['data'])) for name,item in self.rain_stations.items()],
@@ -1336,10 +1688,50 @@ class NAMDesktopApp:
             if basin_map.get('geometry') is None or not stations or any(name not in basin_map.get('stations',{}) for name in stations):
                 raise ValueError('Dự án thiếu lưu vực hoặc tọa độ dùng tính Thiessen.')
             thiessen_basin_weights(basin_map['geometry'],{name:basin_map['stations'][name] for name in stations})
+        multi=payload.get('multi_basins',{})
+        features=multi.get('features',[]);basins=multi.get('basins',{})
+        ids=set()
+        for feature in features:
+            if feature['id'] in ids:raise ValueError('Trùng mã lưu vực trong dự án.')
+            ids.add(feature['id']);geometry,_,_=basin_metric_geometry(feature['geometry'])
+            if not np.isclose(finite_number(feature['area_km2'],'Diện tích lưu vực',True),geometry.area/1e6,rtol=1e-8):raise ValueError('Diện tích không khớp hình học lưu vực.')
+        if multi.get('active') is not None and multi['active'] not in basins:raise ValueError('Lưu vực đang chọn không có trong dự án.')
+        for basin_id,record in basins.items():
+            if basin_id!=record['id'] or basin_id not in ids:raise ValueError('Mã lưu vực không hợp lệ.')
+            parameters(record['params'])
+            geometry,_,_=basin_metric_geometry(record['geometry'])
+            if not np.isclose(finite_number(record['area_km2'],'Diện tích lưu vực',True),geometry.area/1e6,rtol=1e-8):raise ValueError('Diện tích mô hình không khớp lưu vực.')
+            if set(record['settings'])!=set(self._PROJECT_ENTRIES) or not all(isinstance(v,str) for v in record['settings'].values()):raise ValueError('Thiếu thiết lập lưu vực.')
+            if record['discharge_mode'] not in ('mean','endpoint') or not isinstance(record['auto_period'],bool) or not isinstance(record['auto_dt'],bool):raise ValueError('Thiết lập mô hình lưu vực không hợp lệ.')
+            limits=record['bounds']
+            if len(limits)!=len(PARAM_KEYS) or any(len(pair)!=2 or not all(np.isfinite(v) for v in pair) or pair[0]>=pair[1] for pair in limits):raise ValueError('Giới hạn thông số lưu vực không hợp lệ.')
+            if record.get('observed') is not None:self._unpack_series(record['observed'],'Q_ThucDo_m3s')
+            if record.get('calibrated') is not None:parameters(record['calibrated']['params'])
+            if record.get('validation_params') is not None:parameters(record['validation_params'])
+            for result in [record.get('independent_metrics'),*record.get('validation_results',{}).values()]:
+                if result is None:continue
+                value=result.get('nse')
+                if value is not None and (not isinstance(value,(int,float)) or not np.isfinite(value)):raise ValueError('NSE kiểm định trong dự án không hợp lệ.')
+                if result.get('params') is not None:parameters(result['params'])
+        for name,item in multi.get('evap_stations',{}).items():
+            self._unpack_series(item['data'],'BocHoi_mm')
+            if not isinstance(name,str) or not 0<=finite_number(item['weight'],'Trọng số bốc hơi')<=1:raise ValueError('Trạm bốc hơi không hợp lệ.')
+        for point in multi.get('evap_positions',{}).values():
+            if len(point)!=2 or not all(np.isfinite(v) for v in point) or not (-180<=point[0]<=180 and -90<point[1]<90):raise ValueError('Tọa độ bốc hơi không hợp lệ.')
         return params,bounds,stations,inputs,calibrated
 
     def _apply_project(self,payload,decoded):
         params,bounds,stations,inputs,calibrated=decoded
+        multi=payload.get('multi_basins',{})
+        self._shape_basins=multi.get('features',[]);self._basins=multi.get('basins',{});self._active_basin_id=multi.get('active')
+        self._evap_positions=multi.get('evap_positions',{})
+        self._evap_stations={name:dict(weight=item['weight'],source=item['source'],data=self._unpack_series(item['data'],'BocHoi_mm')) for name,item in multi.get('evap_stations',{}).items()}
+        self._evap_thiessen=None;self._spatial_signature=None
+        self._parameter_source=None;self._independent_metrics=None;self._calibration_period=None
+        if self.validation_mode:self._validation_forbidden_period=None
+        if self._active_basin_id:
+            record=self._basins[self._active_basin_id];self._parameter_source=record.get('parameter_source');self._independent_metrics=record.get('independent_metrics');self._calibration_period=record.get('calibration_period')
+            if self.validation_mode:self._validation_forbidden_period=self._calibration_period
         for name,value in payload['settings'].items():
             entry=getattr(self,name);state=entry.cget('state');entry.config(state='normal')
             entry.delete(0,'end');entry.insert(0,value);entry.config(state=state)
@@ -1363,7 +1755,8 @@ class NAMDesktopApp:
             result=thiessen_basin_weights(self._basin_geojson,positions)
             if all(np.isclose(item['weight'],result['weights'][name],atol=1e-10) for name,item in self.rain_stations.items()):
                 self._thiessen_result=result
-        self._draw_basin_map()
+        if not self.validation_mode:self.ent_area.config(state='readonly' if self._active_basin_id else 'normal')
+        self._draw_basin_map();self._update_basins_table()
         self.lbl_calib_status.config(text='Đã mở dự án. Bấm chạy mô phỏng để tính lại kết quả.' if stations else 'Sẵn sàng')
 
     def _open_project(self):
@@ -1389,6 +1782,8 @@ class NAMDesktopApp:
         if self._confirm_project_change():self.root.destroy()
 
     def _load_synthetic_data(self):
+        if self._shape_basins:
+            messagebox.showinfo('Dữ liệu giả lập','Tạo dự án mới trước khi thử số liệu giả lập, để giữ dữ liệu các lưu vực đang làm.',parent=self.root);return
         if self.validation_mode:
             messagebox.showinfo("Kiểm định","Nhập số liệu độc lập của bạn bằng các nút nhập mưa, bốc hơi và Q thực đo.");return
         """Sinh chuỗi mưa rào mẫu và lưu lượng thực đo giả lập 72 giờ."""
@@ -1465,7 +1860,7 @@ class NAMDesktopApp:
         return 'endpoint' if self.discharge_choice.current()==1 else 'mean'
 
     def _signature(self):
-        return tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get(),self.auto_dt.get(),self._discharge_mode())+tuple(self.best_params.items())+(id(self.df_data),)+tuple(self.param_bounds)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())
+        return (self._active_basin_id,)+tuple(e.get() for e in self.setting_entries)+(self.ent_maxiter.get(),self.ent_runs.get(),self.auto_period.get(),self.auto_dt.get(),self._discharge_mode())+tuple(self.best_params.items())+(id(self.df_data),)+tuple(self.param_bounds)+tuple((name,v['weight'],id(v['data'])) for name,v in self.rain_stations.items())+tuple((name,v['weight'],id(v['data'])) for name,v in self._evap_stations.items())+tuple((name,tuple(point)) for name,point in self._station_positions.items())+tuple((name,tuple(point)) for name,point in self._evap_positions.items())
 
     def _watch(self):
         if self.current_sim is not None and self._result_signature!=self._signature():
@@ -1482,6 +1877,8 @@ class NAMDesktopApp:
         self._recompute_and_plot()
 
     def _open_validation(self):
+        if self._active_basin_id and not self._busy:
+            self._open_basin_validation();return
         if self._busy:
             messagebox.showinfo("Kiểm định","Dừng hoặc hoàn tất hiệu chỉnh trước khi mở kiểm định.");return
         if self._calibrated_params is None:
@@ -1565,7 +1962,7 @@ class NAMDesktopApp:
         except Exception as exc:messagebox.showerror('Nhập trạm mưa',str(exc))
 
     def _update_rain_label(self):
-        self._thiessen_result=None
+        self._thiessen_result=None;self._spatial_signature=None
         self._sync_map_stations()
         self.series_labels['Mua_mm'].config(text=f'{len(self.rain_stations)} trạm; tổng trọng số = {sum(v["weight"] for v in self.rain_stations.values()):.6f}',foreground='blue')
         self._draw_basin_map()
@@ -1585,6 +1982,7 @@ class NAMDesktopApp:
         def selected():
             return tree.item(tree.selection()[0],'values')[0] if tree.selection() else None
         def edit(event=None):
+            if self._basins:self._calculate_thiessen();refresh();return
             name=selected()
             if name is None:return
             weight=simpledialog.askfloat('Trọng số',name+':',initialvalue=self.rain_stations[name]['weight'],minvalue=0,maxvalue=1,parent=window)
@@ -1592,16 +1990,20 @@ class NAMDesktopApp:
                 self.rain_stations[name]['weight']=weight;refresh();self._update_rain_label();self._refresh_inputs()
         def delete():
             name=selected()
-            if name is not None:del self.rain_stations[name];refresh();self._update_rain_label();self._refresh_inputs()
+            if name is not None:
+                del self.rain_stations[name];self._station_positions.pop(name,None)
+                refresh();self._update_rain_label();self._refresh_inputs()
         def view():
             name=selected()
             if name is not None:self._view_series('Mua_mm',self.rain_stations[name]['data'])
         row=ttk.Frame(window);row.pack(fill='x',pady=5)
-        for text,command in [('Thêm trạm',lambda:(self._import_rain_station(),refresh())),('Sửa trọng số',edit),('Xóa trạm',delete),('Xem mưa trạm',view),('Xem mưa bình quân',lambda:self._view_series('Mua_mm'))]:ttk.Button(row,text=text,command=command).pack(side='left',padx=3)
+        for text,command in [('Thêm trạm',lambda:(self._import_rain_station(),refresh())),('Tính Thiessen' if self._basins else 'Sửa trọng số',edit),('Xóa trạm',delete),('Xem mưa trạm',view),('Xem mưa bình quân',lambda:self._view_series('Mua_mm'))]:ttk.Button(row,text=text,command=command).pack(side='left',padx=3)
         tree.bind('<Double-1>',edit);refresh()
 
     def _import_series(self,key):
         if key=='Mua_mm':self._import_rain_station();return
+        if key=='BocHoi_mm' and self._basins:
+            self._station_coordinate_dialog('evap');return
         path=filedialog.askopenfilename(title='Nhập riêng '+SERIES_NAMES[key],filetypes=[('CSV / Excel / MIKE DFS0','*.csv *.xlsx *.dfs0'),('MIKE DFS0','*.dfs0'),('Excel','*.xlsx'),('CSV','*.csv')])
         if not path:return
         try:
@@ -1618,6 +2020,7 @@ class NAMDesktopApp:
             self.input_series[key]=prepared
             self.series_labels[key].config(text=f'{os.path.basename(path)} — {len(prepared)} dòng'+(' (có Q thiếu ngày bị loại)' if any('thiếu ngày giờ' in n for n in prepared.attrs.get('import_notes',[])) else ''),foreground='blue')
             self._refresh_inputs()
+            self._capture_active_basin();self._update_basins_table()
             if prepared.attrs.get('import_notes'):messagebox.showinfo('Thông tin nhập dữ liệu','\n'.join(prepared.attrs['import_notes']))
         except ImportCancelled:return
         except Exception as exc:messagebox.showerror('Nhập '+SERIES_NAMES[key],str(exc))
@@ -1632,6 +2035,14 @@ class NAMDesktopApp:
     def _refresh_inputs(self):
         self.df_data=None;self.current_sim=None;self.ax_rain.clear();self.ax_flow.clear();self.ax_volume.clear();self.canvas.draw()
         for label in [self.lbl_metric_nse,self.lbl_metric_peak,self.lbl_metric_pbias]:label.config(text='Chưa tính')
+        if self._shape_basins and self._active_basin_id is None:
+            self.df_data=None;self.current_sim=None
+            self.lbl_data_status.config(text='Bấm Chuyển tất cả lưu vực sang NAM, rồi chọn lưu vực mô phỏng.',foreground='#b00020');return
+        if self._active_basin_id:
+            try:self._assign_spatial_weights()
+            except Exception as exc:
+                self.df_data=None;self.current_sim=None
+                self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
         auto_note=''
         if self.auto_dt.get():
             try:
@@ -1639,6 +2050,15 @@ class NAMDesktopApp:
                 if inferred is not None:
                     self.ent_dt.delete(0,'end');self.ent_dt.insert(0,f'{inferred:g}')
             except Exception as exc:self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
+        if self._active_basin_id and not self._evap_stations:
+            self.lbl_data_status.config(text='Thêm trạm bốc hơi cùng tọa độ và dữ liệu để tính Thiessen cho từng lưu vực.',foreground='#b00020');return
+        if self._evap_stations and self.rain_stations:
+            try:
+                reference=next(item['data'] for item in self.rain_stations.values() if item['weight']>0)
+                self.input_series['BocHoi_mm']=weighted_evaporation(self._evap_stations,reference,finite_number(self.ent_dt.get(),'Bước tính',True))
+                self.series_labels['BocHoi_mm'].config(text=f'{len(self._evap_stations)} trạm; bốc hơi bình quân Thiessen riêng cho lưu vực.',foreground='blue')
+            except Exception as exc:
+                self.df_data=None;self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
         current_period=self._period()
         if any(current_period) and current_period!=getattr(self,'_suggested_period',('','')):self.auto_period.set(False)
         if self.auto_period.get():
@@ -1650,7 +2070,7 @@ class NAMDesktopApp:
                     self.ent_period_start.insert(0,start);self.ent_period_end.insert(0,end)
                     self._suggested_period=(start,end)
                     auto_note=f' Khoảng tham khảo từ dữ liệu: {count} bước.'+ (f' Có {segments} đoạn; chọn đoạn liên tục dài nhất.' if segments>1 else '')
-                else:auto_note=' Chưa đủ 3 yếu tố để tự nhận khoảng; chỉ mô phỏng khi đã có mưa/bốc hơi.'
+                else:auto_note=' Chưa đủ mưa/bốc hơi để gợi ý khoảng mô phỏng.'
             except Exception as exc:
                 self.lbl_data_status.config(text=str(exc),foreground='#b00020');return
         if self.rain_stations:
@@ -1670,7 +2090,7 @@ class NAMDesktopApp:
     def _clear_observed(self):
         self.input_series.pop('Q_ThucDo_m3s',None)
         self.series_labels['Q_ThucDo_m3s'].config(text='Chưa nhập (không bắt buộc)',foreground='gray')
-        self._refresh_inputs()
+        self._refresh_inputs();self._capture_active_basin();self._update_basins_table()
 
     def _view_series(self,key,data=None):
         if data is None and key not in self.input_series:
@@ -1795,7 +2215,15 @@ class NAMDesktopApp:
             self.lbl_calib_status.config(text='Đầu vào đã thay đổi: bỏ kết quả hiệu chỉnh cũ.');return
         self.best_params=params
         if np.isfinite(nse):
+            self._parameter_source=self._active_basin_id;self._independent_metrics=None
+            if self._active_basin_id:
+                record=self._basins[self._active_basin_id];record['validation_results']={};record['validation_source']=None;record['validation_params']=None
             self._calibrated_params=params.copy();self._calibrated_area=self._settings()[0];self._calibrated_discharge_mode=self._discharge_mode()
+            _,_,warm,split,_=self._settings();end=warm+int((len(self.df_data)-warm)*split)
+            axis=series_axis(self.df_data)
+            if end>warm:
+                values=self.df_data[axis].iloc[warm:end]
+                self._calibration_period=dict(axis=axis,start=str(values.iloc[0]),end=str(values.iloc[-1]))
         self._update_parameter_display();self._recompute_and_plot()
         self.lbl_calib_status.config(text=f'NSE hiệu chỉnh = {nse:.3f}; '+reason,foreground='green' if success else '#b05b00')
 
@@ -1811,6 +2239,12 @@ class NAMDesktopApp:
             rain=df['Mua_mm'].to_numpy();pet=df['BocHoi_mm'].to_numpy();q_obs=df['Q_ThucDo_m3s'].to_numpy()
             if self.validation_mode and not np.isfinite(compute_nse(q_obs[warm:],np.zeros(len(q_obs)-warm))):
                 raise ValueError('Kiểm định cần ít nhất 2 Q thực đo sau khởi động và phương sai khác 0.')
+            forbidden=getattr(self,'_validation_forbidden_period',None)
+            if self.validation_mode and forbidden is not None and forbidden['axis']=='ThoiGian' and series_axis(df)==forbidden['axis']:
+                values=df[forbidden['axis']].iloc[warm:]
+                low=pd.Timestamp(forbidden['start']) if forbidden['axis']=='ThoiGian' else float(forbidden['start'])
+                high=pd.Timestamp(forbidden['end']) if forbidden['axis']=='ThoiGian' else float(forbidden['end'])
+                if ((values>=low)&(values<=high)).any():raise ValueError('Thời đoạn kiểm định trùng thời đoạn hiệu chỉnh. Chọn khoảng độc lập hoặc nhập chuỗi mới có thời gian đúng.')
             res=run_nam(self.best_params,area,rain,pet,dt,initial,use_acceleration=NUMBA_AVAILABLE and bool(_nam_kernel.signatures),discharge_mode=self._discharge_mode())
         except Exception as exc:messagebox.showerror('Mô phỏng',str(exc));return
         self.current_sim=res;self._result_signature=self._signature()
@@ -1818,8 +2252,17 @@ class NAMDesktopApp:
         q_sim=res['Q_sim'];end=warm+int((len(df)-warm)*split)
         train=compute_metrics(q_obs[warm:end],q_sim[warm:end]);validation=compute_metrics(q_obs[end:],q_sim[end:])
         metric=compute_metrics(q_obs[warm:],q_sim[warm:])
+        if self.validation_mode and hasattr(self,'_validation_callback'):
+            self._independent_metrics={key:float(value) if np.isfinite(value) else None for key,value in metric.items()}
+            self._validation_callback(metric,self.best_params.copy(),self._period())
+        elif self._active_basin_id:
+            if self._parameter_source==self._active_basin_id and self._calibrated_params is not None:
+                self._basins[self._active_basin_id]['calibration_metrics']={key:float(value) if np.isfinite(value) else None for key,value in train.items()}
+            self._capture_active_basin();self._update_basins_table()
         fmt=lambda v:f'{v:.3f}' if np.isfinite(v) else 'không xác định'
         self.lbl_metric_nse.config(text=f'NSE hiệu chỉnh: {fmt(train["nse"])} | kiểm định: {fmt(validation["nse"])}')
+        if self._active_basin_id and self._parameter_source!=self._active_basin_id and not self.validation_mode:
+            self.lbl_metric_nse.config(text=f'NSE mô phỏng: {fmt(metric["nse"])} — {metric["n"]} điểm thực đo')
         if self.validation_mode:self.lbl_metric_nse.config(text=f'NSE kiểm định độc lập: {fmt(metric["nse"])} — {metric["n"]} điểm thực đo')
         self.lbl_metric_peak.config(text=f'Đỉnh Q đo/mô phỏng: {fmt(metric["observed_peak"])}/{fmt(metric["simulated_peak"])} m³/s')
         self.lbl_metric_pbias.config(text=f'PBIAS (đo−mô phỏng): {fmt(metric["pbias"])}%')
@@ -1842,7 +2285,7 @@ class NAMDesktopApp:
         self.ax_flow.plot(time,q_sim,'r-',label='Lưu lượng mô phỏng '+('cuối bước' if res['Discharge_mode']=='endpoint' else 'trung bình bước'))
         self.ax_flow.stackplot(time,res['Q_base'],res['Q_inter'],res['Q_surf'],labels=['Dòng ngầm','Dòng sát mặt','Dòng tràn'],alpha=.25)
         if warm:self.ax_flow.axvspan(time[0],time[warm],color='gray',alpha=.2,label='Khởi động (không đánh giá)')
-        if end<len(df):self.ax_flow.axvline(time[end],color='navy',linestyle=':',label='Bắt đầu kiểm định')
+        if end<len(df) and (self._active_basin_id is None or self._parameter_source==self._active_basin_id):self.ax_flow.axvline(time[end],color='navy',linestyle=':',label='Bắt đầu kiểm định')
         self.ax_flow.set(ylabel='Lưu lượng (m³/s)',xlim=(time[0]-step*.5,time[-1]+step*.5))
         self.ax_flow.set_ylim(bottom=0);self.ax_flow.grid(alpha=.3);self.ax_flow.legend(fontsize=8)
         volume=cumulative_water_volume(q_obs,res['Q_sim_mean'],dt,res['Discharge_mode'])
@@ -1877,8 +2320,13 @@ class NAMDesktopApp:
             out['Gio']=np.arange(len(out))*dt
             for column,key in [('Q_MoPhong_m3s','Q_sim'),('Q_TranMat_m3s','Q_surf'),('Q_SatMat_m3s','Q_inter'),('Q_Ngam_m3s','Q_base'),('BocHoiThuc_mm','Evap_actual_mm'),('TruLuong_mm','Storage_mm'),('SaiSoCanBang_mm','Balance_error_mm'),('CK_TranMat_NhoNhat_gio','CK_overland_min_hours')]:out[column]=res[key]
             end=settings['warm']+int((len(out)-settings['warm'])*settings['split'])
-            out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Kiem_dinh_doc_lap' if self.validation_mode else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
+            out['GiaiDoan']=['Khoi_dong' if i<settings['warm'] else 'Kiem_dinh_doc_lap' if self.validation_mode else 'Mo_phong' if self._active_basin_id and self._parameter_source!=self._active_basin_id else 'Hieu_chinh' if i<end else 'Kiem_dinh' for i in range(len(out))]
             out['DienTich_km2']=settings['area'];out['BuocGio']=dt
+            out['MaLuuVuc']=self._active_basin_id or ''
+            out['TenLuuVuc']=self._basins.get(self._active_basin_id,{}).get('name','')
+            out['NguonBoThongSo']=self._parameter_source or ''
+            for i,(name,item) in enumerate(self._evap_stations.items(),1):
+                out[f'BocHoi_Tram_{i}_Ten']=name;out[f'BocHoi_Tram_{i}_TrongSo']=item['weight']
             out['LoaiLuuLuongDanhGia']=res['Discharge_mode']
             out['Q_TrungBinhBuoc_m3s']=res['Q_sim_mean']
             out['Q_CuoiBuoc_m3s']=res['Q_sim_endpoint']
