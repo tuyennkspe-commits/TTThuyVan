@@ -21,6 +21,7 @@ import re
 from datetime import datetime, date
 from pathlib import Path
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import queue
 import time
 import tkinter as tk
@@ -517,6 +518,35 @@ def _nam_kernel(p,rain,pet,dt,sub,U,L,surf,inter,base):
         residual[t]=before+rain[t]-evap[t]-components[t].sum()-stores[t]
     return components,evap,stores,residual,ck_of,U,L,surf,inter,base,endpoints
 
+def _nam_flow_kernel(p,rain,pet,dt,sub,U,L,surf,inter,base):
+    n=len(rain);flow=np.zeros(n);endpoints=np.zeros(n)
+    steps=int(np.ceil(dt/sub));h=dt/steps
+    for t in range(n):
+        total=0.
+        for _ in range(steps):
+            U+=rain[t]/steps
+            eu=min(U,pet[t]/steps);U-=eu
+            el=min(L,(pet[t]/steps-eu)*L/p[1]);L-=el
+            moisture=L/p[1]
+            threshold=lambda x:max((moisture-x)/(1-x),0.)
+            # IF rút nước bể mặt trước khi xác định Pn, theo cân bằng Pn
+            # có trừ IF tại IJISET tr.664. U dùng để sinh IF không vượt Umax.
+            surface_available=min(U,p[0])
+            inf_flow=surface_available*(-np.expm1(-threshold(p[5])*h/p[7]));U-=inf_flow
+            excess=max(U-p[0],0.);U-=excess
+            of=p[2]*threshold(p[4])*excess
+            infiltration=excess-of;recharge=infiltration*threshold(p[6])
+            L+=infiltration-recharge
+            # Bể rễ đầy: phần thấm vượt sức chứa bổ cập ngầm, không mất nước.
+            spill=max(L-p[1],0.);L-=spill;recharge+=spill
+            surf,qo,kmin=_kernel_route_overland(surf,of/h,h,p[3])
+            inter,qi=_kernel_route_cascade(inter,inf_flow/h,h,p[3])
+            base,qb=_kernel_route_linear(base,recharge/h,h,p[8])
+            total+=qo+qi+qb
+        flow[t]=total
+        endpoints[t]=_kernel_overland_discharge(surf[1],p[3])+inter[1]/p[3]+base/p[8]
+    return flow,endpoints,U,L,surf,inter,base
+
 if NUMBA_AVAILABLE:
     def _compile_nam(function):
         # Reuse compiled code across sessions; packaged apps may lack a cache locator.
@@ -528,6 +558,7 @@ if NUMBA_AVAILABLE:
     _kernel_overland_discharge=_compile_nam(_kernel_overland_discharge)
     _kernel_route_overland=_compile_nam(_kernel_route_overland)
     _nam_kernel=_compile_nam(_nam_kernel)
+    _nam_flow_kernel=_compile_nam(_nam_flow_kernel)
 
 
 def calibration_discharge(params,area,rain,pet,dt,initial,cancel_event,mode):
@@ -544,9 +575,9 @@ def calibration_discharge(params,area,rain,pet,dt,initial,cancel_event,mode):
     for start in range(0,len(rain),256):
         if cancel_event.is_set():raise CalibrationStopped()
         stop=min(start+256,len(rain))
-        result=_nam_kernel(p,rain[start:stop],pet[start:stop],dt,1.,U,L,surf,inter,base)
-        flow[start:stop]=result[-1].sum(axis=1)*area/3.6 if mode=='endpoint' else result[0].sum(axis=1)*area/(3.6*dt)
-        U,L,surf,inter,base=result[5:10]
+        result=_nam_flow_kernel(p,rain[start:stop],pet[start:stop],dt,1.,U,L,surf,inter,base)
+        flow[start:stop]=result[1]*area/3.6 if mode=='endpoint' else result[0]*area/(3.6*dt)
+        U,L,surf,inter,base=result[2:]
     return flow
 
 
@@ -1022,7 +1053,7 @@ class NAMDesktopApp:
         runs_row=ttk.Frame(calib_frame);runs_row.pack(fill=tk.X,pady=2)
         ttk.Label(runs_row,text='Số lần chạy hiệu chỉnh:').pack(side=tk.LEFT)
         self.ent_runs=ttk.Entry(runs_row,width=6);self.ent_runs.insert(0,'3');self.ent_runs.pack(side=tk.LEFT,padx=6)
-        ttk.Label(calib_frame,text='Tìm kiếm toàn cục, sau đó tinh chỉnh cục bộ; giữ NSE tốt nhất.\nThông số được chuẩn hóa; mỗi lần chạy khảo sát thêm vùng mới. Kiểm định độc lập để đánh giá khả năng áp dụng.',wraplength=350).pack(anchor='w')
+        ttk.Label(calib_frame,text='Tìm kiếm toàn cục, sau đó tinh chỉnh cục bộ; giữ NSE tốt nhất.\nTự dùng tối đa 4 luồng khi có Numba; chuyển sang tinh chỉnh khi tìm kiếm ít cải thiện. Kiểm định độc lập để đánh giá khả năng áp dụng.',wraplength=350).pack(anchor='w')
 
 
         self.btn_calibrate = ttk.Button(
@@ -2389,7 +2420,7 @@ class NAMDesktopApp:
             started=time.perf_counter()
             rain=np.ascontiguousarray(df['Mua_mm'].to_numpy()[:end]);pet=np.ascontiguousarray(df['BocHoi_mm'].to_numpy()[:end]);obs=df['Q_ThucDo_m3s'].to_numpy()
             best_params=current.copy();best_nse=np.nan
-            cache={};evaluations=0;cache_hits=0
+            cache={};evaluations=0;cache_hits=0;best_lock=threading.Lock();cache_lock=threading.Lock()
             valid=np.isfinite(obs[warm:end]);observed=obs[warm:end][valid]
             normalizer=np.sqrt(np.sum((observed-observed.mean())**2))
             if len(observed)<3 or not np.isfinite(normalizer) or normalizer<=0:raise ValueError('Hiệu chỉnh cần ít nhất 3 Q thực đo và phương sai khác 0.')
@@ -2398,12 +2429,14 @@ class NAMDesktopApp:
                 nonlocal evaluations,cache_hits
                 if self._stop_event.is_set():raise CalibrationStopped()
                 key=tuple(float(params[k]) for k in PARAM_KEYS)
-                if key in cache:cache_hits+=1;return cache[key]
+                with cache_lock:
+                    if key in cache:cache_hits+=1;return cache[key]
                 sim=calibration_discharge(params,area,rain,pet,dt,initial,self._stop_event,discharge_mode)
                 values=(sim[warm:end][valid]-observed)/normalizer
                 if not np.all(np.isfinite(values)):raise ValueError('Mô phỏng không hữu hạn.')
-                if len(cache)>=cache_limit:cache.clear()
-                cache[key]=values;evaluations+=1
+                with cache_lock:
+                    if len(cache)>=cache_limit:cache.clear()
+                    cache[key]=values;evaluations+=1
                 return values
             def score(params):
                 values=residuals(params);nse=1-float(np.dot(values,values))
@@ -2423,32 +2456,42 @@ class NAMDesktopApp:
             def objective(x):
                 nonlocal best_params,best_nse
                 params=decode(x);nse=score(params)
-                if nse>best_nse:best_nse=nse;best_params=params.copy()
+                with best_lock:
+                    if nse>best_nse:best_nse=nse;best_params=params.copy()
                 return 1-nse
-            converged=0
-            for run in range(runs):
-                generation=0
-                def callback(xk,convergence):
-                    nonlocal generation
-                    generation+=1
-                    elapsed=time.perf_counter()-started
-                    self._worker_queue.put(('progress',f'Lần {run+1}/{runs} · thế hệ {generation}/{maxiter}\nNSE tốt nhất: {best_nse:.4f} · {evaluations} mô phỏng · {elapsed:.1f} giây',90*(run+generation/maxiter)/runs))
-                    return self._stop_event.is_set()
-                candidate=encode(best_params)
-                population=qmc.LatinHypercube(d=len(PARAM_KEYS),seed=42+run).random(10*len(PARAM_KEYS))
-                population[:9]=np.clip(candidate+np.random.default_rng(42+run).normal(0,.08,(9,len(PARAM_KEYS))),0,1)
-                population[0]=candidate
-                result=differential_evolution(objective,bounds=[(0.,1.)]*len(PARAM_KEYS),maxiter=maxiter,tol=.005,
-                    seed=42+run,polish=False,init=population,callback=callback)
-                converged+=int(result.success)
-            self._worker_queue.put(('progress','Tinh chỉnh cục bộ bộ thông số tốt nhất bằng NAM…',90))
+            converged=0;plateau_runs=0
+            cores=min(4,max(1,(os.cpu_count() or 1)-1)) if NUMBA_AVAILABLE else 1
+            # Compile once before concurrent candidate evaluations.
             def local_residual(x):
                 objective(x)
                 return residuals(decode(x))
-            least_squares(local_residual,encode(best_params),bounds=(np.zeros(len(PARAM_KEYS)),np.ones(len(PARAM_KEYS))),max_nfev=60,x_scale='jac',ftol=1e-7,xtol=1e-7,gtol=1e-7)
+            def refine(limit):
+                least_squares(local_residual,encode(best_params),bounds=(np.zeros(len(PARAM_KEYS)),np.ones(len(PARAM_KEYS))),max_nfev=limit,x_scale='jac',ftol=1e-7,xtol=1e-7,gtol=1e-7)
+            for run in range(runs):
+                generation=0;stale=0;last_nse=best_nse
+                def callback(xk,convergence):
+                    nonlocal generation,stale,last_nse
+                    generation+=1
+                    stale=stale+1 if best_nse-last_nse<1e-5 else 0;last_nse=best_nse
+                    elapsed=time.perf_counter()-started
+                    self._worker_queue.put(('progress',f'Lần {run+1}/{runs} · thế hệ {generation}/{maxiter}\nNSE tốt nhất: {best_nse:.4f} · {evaluations} mô phỏng · {elapsed:.1f} giây · {cores} luồng',90*(run+generation/maxiter)/runs))
+                    return self._stop_event.is_set() or stale>=20
+                candidate=encode(best_params)
+                population=qmc.LatinHypercube(d=len(PARAM_KEYS),seed=42+run).random(6*len(PARAM_KEYS))
+                population[:9]=np.clip(candidate+np.random.default_rng(42+run).normal(0,.08,(9,len(PARAM_KEYS))),0,1)
+                population[0]=candidate
+                with ThreadPoolExecutor(max_workers=cores) as pool:
+                    result=differential_evolution(objective,bounds=[(0.,1.)]*len(PARAM_KEYS),maxiter=maxiter,tol=.005,
+                        seed=42+run,polish=False,init=population,callback=callback,workers=pool.map if cores>1 else 1,updating='deferred')
+                self._worker_queue.put(('progress',f'Tinh chỉnh cục bộ lần {run+1}/{runs}…',90*(run+1)/runs))
+                refine(30)
+                plateau_runs+=int(stale>=20)
+                converged+=int(result.success)
+            self._worker_queue.put(('progress','Tinh chỉnh cục bộ bộ thông số tốt nhất bằng NAM…',90))
+            refine(60)
             # Không bao giờ thay bộ hiện tại bằng bộ có NSE thấp hơn.
             self._worker_queue.put(('done',signature,best_params,float(best_nse),converged==runs,
-                f'{time.perf_counter()-started:.1f} giây; {evaluations} phép mô phỏng, dùng lại {cache_hits} kết quả; đã chạy {runs} lần; {converged} lần đạt điều kiện hội tụ, {runs-converged} lần hết giới hạn thế hệ.'))
+                f'{time.perf_counter()-started:.1f} giây; {evaluations} phép mô phỏng, dùng lại {cache_hits} kết quả; đã chạy {runs} lần; {converged} lần hội tụ; {plateau_runs} lần chuyển sớm sang tinh chỉnh do ít cải thiện.'))
         except CalibrationStopped:
             self._worker_queue.put(('done',signature,best_params,float(best_nse),False,'Đã dừng theo yêu cầu; giữ bộ tốt nhất đã đánh giá.'))
         except Exception as exc:self._worker_queue.put(('error',str(exc)))
