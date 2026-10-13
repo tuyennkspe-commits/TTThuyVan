@@ -1448,20 +1448,43 @@ class NAMDesktopApp:
         return self._map_crs_wkt
 
     def _build_basin_map(self,parent):
-        row=ttk.Frame(parent,padding=5);row.pack(fill='x')
-        for label,command in [('Nhập lưu vực (.shp)',self._import_basin),('Thêm / sửa trạm mưa',self._station_coordinate_dialog),('Tính trọng số Thiessen',self._calculate_thiessen)]:
-            ttk.Button(row,text=label,command=command).pack(side='left',padx=3)
-        row=ttk.Frame(parent,padding=5);row.pack(fill='x')
-        ttk.Button(row,text='Chuyển tất cả lưu vực sang NAM',command=self._transfer_shape_basins).pack(side='left',padx=3)
-        ttk.Button(row,text='Thêm / sửa trạm bốc hơi',command=lambda:self._station_coordinate_dialog('evap')).pack(side='left',padx=3)
-        ttk.Button(row,text='Quản lý mạng trạm bốc hơi',command=self._manage_evap_stations).pack(side='left',padx=3)
-        row=ttk.Frame(parent,padding=5);row.pack(fill='x')
-        ttk.Label(row,text='Trạm để đặt trên bản đồ:').pack(side='left')
-        self.map_station_choice=ttk.Combobox(row,state='readonly',width=25);self.map_station_choice.pack(side='left',padx=3)
-        ttk.Button(row,text='Chọn vị trí bằng chuột',command=self._enable_map_pick).pack(side='left',padx=3)
-        ttk.Button(row,text='Chọn dữ liệu mưa',command=lambda:self._import_rain_station(self.map_station_choice.get())).pack(side='left',padx=3)
-        ttk.Button(row,text='Xóa vị trí trạm',command=self._remove_station_position).pack(side='left',padx=3)
-        ttk.Checkbutton(parent,text='Hiển thị đa giác Thiessen',variable=self.show_thiessen,command=self._draw_basin_map).pack(anchor='w',padx=8,pady=3)
+        toolbar=ttk.Frame(parent,padding=(8,6));toolbar.pack(fill='x')
+        menu_buttons=[]
+        def menu_button(label,items):
+            button=ttk.Menubutton(toolbar,text=label+' ▾')
+            menu=tk.Menu(button,tearoff=False,font=('Segoe UI',10))
+            for title,command in items:
+                if title is None:menu.add_separator()
+                else:menu.add_command(label=title,command=command)
+            button.configure(menu=menu);button.grid(row=0,column=len(menu_buttons),sticky='w',padx=(0,8));menu_buttons.append(button)
+            return menu
+        self.map_basin_menu=menu_button('Lưu vực',[
+            ('Nhập bản đồ lưu vực (.shp)…',self._import_basin),
+            ('Chuyển tất cả lưu vực sang NAM',self._transfer_shape_basins)])
+        self.map_rain_menu=menu_button('Trạm mưa',[
+            ('Thêm / sửa vị trí trạm…',self._station_coordinate_dialog),
+            ('Quản lý trạm và dữ liệu mưa…',self._manage_rain)])
+        self.map_evap_menu=menu_button('Trạm bốc hơi',[
+            ('Thêm / sửa vị trí trạm…',lambda:self._station_coordinate_dialog('evap')),
+            ('Quản lý trạm và dữ liệu bốc hơi…',self._manage_evap_stations)])
+        calculate=ttk.Button(toolbar,text='Tính trọng số Thiessen',command=self._calculate_thiessen,style='Accent.TButton')
+        display=ttk.Checkbutton(toolbar,text='Hiện đa giác',variable=self.show_thiessen,command=self._draw_basin_map)
+        def arrange_toolbar(event=None):
+            narrow=toolbar.winfo_width()<730
+            calculate.grid(row=1 if narrow else 0,column=0 if narrow else 3,columnspan=2 if narrow else 1,sticky='w',padx=(0,10),pady=(5,0) if narrow else 0)
+            display.grid(row=1 if narrow else 0,column=2 if narrow else 4,sticky='w',pady=(5,0) if narrow else 0)
+        toolbar.bind('<Configure>',arrange_toolbar)
+        arrange_toolbar()
+        row=ttk.Frame(parent,padding=(8,2));row.pack(fill='x')
+        ttk.Label(row,text='Trạm mưa đang chọn:').pack(side='left')
+        self.map_station_choice=ttk.Combobox(row,state='readonly',width=25);self.map_station_choice.pack(side='left',padx=(8,10))
+        action=ttk.Menubutton(row,text='Thao tác với trạm ▾');action.pack(side='left')
+        self.map_station_menu=tk.Menu(action,tearoff=False,font=('Segoe UI',10))
+        self.map_station_menu.add_command(label='Đặt vị trí bằng chuột',command=self._enable_map_pick)
+        self.map_station_menu.add_command(label='Chọn / thay dữ liệu mưa…',command=self._choose_map_rain_data)
+        self.map_station_menu.add_separator()
+        self.map_station_menu.add_command(label='Xóa vị trí trên bản đồ',command=self._remove_station_position)
+        action.configure(menu=self.map_station_menu)
         self.lbl_map_status=ttk.Label(parent,text='Nhập SHP cùng các tệp .shx, .dbf, .prj. Trạm mưa có thể nằm ngoài lưu vực.',wraplength=850)
         self.lbl_map_status.pack(fill='x',padx=8,pady=4)
         self.map_fig=Figure(figsize=(8,5),dpi=100);self.map_ax=self.map_fig.add_subplot(111)
@@ -1473,6 +1496,12 @@ class NAMDesktopApp:
             self.map_tree.heading(key,text=label);self.map_tree.column(key,width=145,stretch=True)
         self.map_tree.pack(fill='x',padx=5,pady=5)
         self._draw_basin_map()
+
+    def _choose_map_rain_data(self):
+        name=self.map_station_choice.get()
+        if not name:
+            messagebox.showinfo('Dữ liệu trạm mưa','Chọn trạm mưa hoặc thêm vị trí trạm trước khi chọn dữ liệu.',parent=self.root);return
+        self._import_rain_station(name)
 
     def _sync_map_stations(self):
         names=list(dict.fromkeys([*self.rain_stations,*self._station_positions]))
