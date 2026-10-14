@@ -250,8 +250,8 @@ def lookup_phi(soil_type,H,F,confirmed_phi=None):
         if not min(reference)-1e-9<=phi<=max(reference)+1e-9:
             raise ValueError(f'φ={phi:.3f} ngoài khoảng {min(reference):.3f}–{max(reference):.3f} của cấp đất/mưa/diện tích trong bảng A.1 được cung cấp.')
         return phi
-    if max(reference)-min(reference)<1e-12:return float(reference[0])
-    raise ValueError(f'Bảng A.1 Word thiếu mốc F cho từng cột trong nhóm này. Hãy nhập φ đã xác minh (khoảng tham khảo {min(reference):.3f}–{max(reference):.3f}), không nội suy theo trục F tự đặt.')
+    # User-selected policy: midpoint of the tabulated range, not interpolation.
+    return float((min(reference)+max(reference))/2)
 
 
 def lookup_ts(vung_id, Fs, confirmed_ts=None):
@@ -462,7 +462,7 @@ class FullTCVNApp:
             ent_cc.insert(0, "1.0")
             ent_cc.pack()
             self.cc_entries[p_label] = ent_cc
-            tk.Label(box,text='φ đã xác minh:',font=('Arial',7)).pack()
+            tk.Label(box,text='φ tự tra / chỉnh tay:',font=('Arial',7)).pack()
             ent_phi=tk.Entry(box,width=7,justify=tk.CENTER);ent_phi.pack();self.phi_entries[p_label]=ent_phi
             hint=tk.Label(box,text='',font=('Arial',7),fg='#155e75',wraplength=125,justify=tk.CENTER)
             hint.pack(pady=(2,3));self.phi_hint_labels[p_label]=hint
@@ -508,7 +508,8 @@ class FullTCVNApp:
         # Chờ người dùng nhập/xác minh hệ số rồi bấm tính.
 
     def refresh_phi_hints(self):
-        """Khoảng tham khảo A.1; không tự chọn hệ số thay người dùng."""
+        """Fill the table-range midpoint; preserve explicitly edited values."""
+        if not hasattr(self,'_phi_auto_values'):self._phi_auto_values={}
         for label,hint in self.phi_hint_labels.items():
             try:
                 soil=self.cbo_soil.get().strip().upper()
@@ -519,12 +520,22 @@ class FullTCVNApp:
                 row=min(int(np.searchsorted(SOIL_H_BOUNDS[soil],H,side='left')),len(SOIL_TABLES[soil])-1)
                 lo,hi,_,_=next(group for group in PHI_AREA_GROUPS if group[0]<=F<group[1])
                 context=f'Đất {soil}; mưa {SOIL_H_LABELS[soil][row]} mm\nF: {lo:g}–{hi:g} km²'
-                if max(values)-min(values)<1e-12:
-                    text=f'φ = {values[0]:.3f} (tự tra)\n'+context
+                minimum,maximum=min(values),max(values)
+                average=(minimum+maximum)/2
+                entry=self.phi_entries[label];current=entry.get().strip()
+                automatic=not current or current==self._phi_auto_values.get(label)
+                if automatic:
+                    value=f'{average:.6f}'.rstrip('0').rstrip('.')
+                    entry.delete(0,'end');entry.insert(0,value);self._phi_auto_values[label]=value
+                if maximum-minimum<1e-12:
+                    text=f'Bảng: φ = {minimum:.3f}\n'+context
                 else:
-                    text=f'Gợi ý φ: {min(values):.3f}–{max(values):.3f}\n'+context+'\nBạn chọn và nhập φ'
+                    text=f'Khoảng φ: {minimum:.3f}–{maximum:.3f}\nTrung bình: {average:.3f}\n'+context
+                if not automatic:text+='\nĐang dùng φ chỉnh tay'
                 hint.configure(text=text,fg='#155e75')
             except (ValueError,KeyError,StopIteration):
+                entry=self.phi_entries[label]
+                if entry.get().strip()==self._phi_auto_values.get(label):entry.delete(0,'end');self._phi_auto_values.pop(label,None)
                 hint.configure(text='Nhập F, cấp đất, Hp\nvà hệ số khí hậu hợp lệ\nđể xem khoảng φ',fg='#8b4513')
 
     def poll_phi_hints(self):
@@ -562,6 +573,7 @@ class FullTCVNApp:
                 "rain_data": {p: self.rain_entries[p].get() for p in self.rain_entries},
                 "ts_data": {p:self.ts_entries[p].get() for p in self.ts_entries},
                 "phi_data": {p:self.phi_entries[p].get() for p in self.phi_entries},
+                "phi_auto_values": getattr(self,"_phi_auto_values",{}),
                 "ap_data": {p:self.ap_entries[p].get() for p in self.ap_entries},
                 "cc_data": {p: self.cc_entries[p].get() for p in self.cc_entries}
             }
@@ -618,6 +630,7 @@ class FullTCVNApp:
             for key,entries in (('ts_data',self.ts_entries),('phi_data',self.phi_entries),('ap_data',self.ap_entries)):
                 for label,entry in entries.items():
                     entry.delete(0,tk.END);entry.insert(0,data.get(key,{}).get(label,''))
+            self._phi_auto_values=data.get('phi_auto_values',{})
             self.calculate_all()
             messagebox.showinfo("Thành công", f"Đã mở lại dự án từ tệp:\n{f_path}")
         except Exception as e:
@@ -932,6 +945,7 @@ class FullTCVNApp:
     # --- TÍNH TOÁN LŨ Qp ---
     def calculate_all(self):
         self.refresh_phi_hints()
+        self.refresh_phi_hints()
         self.tree.delete(*self.tree.get_children())
         self.calc_results=[];self._result_signature=None
         try:
@@ -1002,7 +1016,8 @@ class FullTCVNApp:
                     "Hệ số phi": phi, "bs (m)": bs, "Mẫu số bs": k_bs,
                     "Phi_s": Fs, "ts (phút)": ts, "Phi_l": Fl,
                     "Mô-đun Ap": Ap, "Lưu lượng Qmax (m3/s)": Qmax,
-                    "Nguồn phi": "Người dùng xác minh" if confirmed_phi is not None else "Bảng A.1",
+                    "Nguồn phi": "Bảng A.1 – trung bình khoảng" if phi_input==getattr(self,'_phi_auto_values',{}).get(p_label) or confirmed_phi is None else "Người dùng xác minh",
+                    "Khoảng phi trong bảng": f'{min(phi_reference_values(soil,hp_val,F)):.3f}–{max(phi_reference_values(soil,hp_val,F)):.3f}',
                     "Nguồn ts": "Người dùng xác minh" if confirmed_ts is not None else "Bảng A.2",
                     "Nguồn Ap": "Người dùng xác minh" if confirmed_ap is not None else "Bảng A.3"
                 })
