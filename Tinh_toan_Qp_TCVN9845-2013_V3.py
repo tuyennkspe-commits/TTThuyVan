@@ -303,6 +303,165 @@ def lookup_Ap(vung_id, ts_val, fl_val, confirmed_ap=None):
 # =============================================================================
 # GIAO DIỆN ĐỒ HỌA HOÀN CHỈNH
 # =============================================================================
+
+# Original user-supplied workbook; embedded to keep this a single-file application.
+_QP_REPORT_TEMPLATE = (
+    'UEsDBBQABgAIAAAAIQBi7p1oXgEAAJAEAAATAAgCW0NvbnRlbnRfVHlwZXNdLnhtbCCiBAIooAACAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACslMtOwzAQRfdI/EPkLUrcskAINe2CxxIqUT7AxJPG'
+    'qmNbnmlp/56J+xBCoRVqN7ESz9x7MvHNaLJubbaCiMa7UgyLgcjAVV4bNy/Fx+wlvxcZknJaWe+gFBtAMRlfX41mmwCYcbfDUjRE'
+    '4UFKrBpoFRY+gOOd2sdWEd/GuQyqWqg5yNvB4E5W3hE4yqnTEOPRE9RqaSl7XvPjLUkEiyJ73BZ2XqVQIVhTKWJSuXL6l0u+cyi4'
+    'M9VgYwLeMIaQvQ7dzt8Gu743Hk00GrKpivSqWsaQayu/fFx8er8ojov0UPq6NhVoXy1bnkCBIYLS2ABQa4u0Fq0ybs99xD8Vo0zL'
+    '8MIg3fsl4RMcxN8bZLqej5BkThgibSzgpceeRE85NyqCfqfIybg4wE/tYxx8bqbRB+QERfj/FPYR6brzwEIQycAhJH2H7eDI6Tt7'
+    '7NDlW4Pu8ZbpfzL+BgAA//8DAFBLAwQUAAYACAAAACEAtVUwI/QAAABMAgAACwAIAl9yZWxzLy5yZWxzIKIEAiigAAIAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKySTU/DMAyG70j8h8j31d2QEEJL'
+    'd0FIuyFUfoBJ3A+1jaMkG92/JxwQVBqDA0d/vX78ytvdPI3qyCH24jSsixIUOyO2d62Gl/pxdQcqJnKWRnGs4cQRdtX11faZR0p5'
+    'KHa9jyqruKihS8nfI0bT8USxEM8uVxoJE6UchhY9mYFaxk1Z3mL4rgHVQlPtrYawtzeg6pPPm3/XlqbpDT+IOUzs0pkVyHNiZ9mu'
+    'fMhsIfX5GlVTaDlpsGKecjoieV9kbMDzRJu/E/18LU6cyFIiNBL4Ms9HxyWg9X9atDTxy515xDcJw6vI8MmCix+o3gEAAP//AwBQ'
+    'SwMEFAAGAAgAAAAhAJl7jTRHAwAAJAgAAA8AAAB4bC93b3JrYm9vay54bWykVdtu4zYQfS/QfxAI9FGRqIsvQpSFbVlogCRwvWqy'
+    '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'
+    'AA=='
+)
+
 class FullTCVNApp:
     def __init__(self, root):
         self.root = root
@@ -500,6 +659,7 @@ class FullTCVNApp:
         tk.Button(btn_fr, text="🚀 TÍNH TOÁN LẠI TẤT CẢ", font=("Arial", 10, "bold"), bg="#154360", fg="white", padx=15, pady=5, command=self.calculate_all).pack(side=tk.LEFT)
         tk.Button(btn_fr, text="📋 Sao chép ra Excel", font=("Arial", 9, "bold"), bg="#27ae60", fg="white", padx=10, pady=5, command=self.copy_table).pack(side=tk.LEFT, padx=10)
         tk.Button(btn_fr, text="💾 Xuất file Excel (.xlsx)", font=("Arial", 9, "bold"), bg="#2980b9", fg="white", padx=10, pady=5, command=self.export_excel).pack(side=tk.RIGHT)
+        tk.Button(btn_fr,text="Xuất Word (.docx)",font=("Arial",9,"bold"),bg="#2980b9",fg="white",padx=10,pady=5,command=self.export_word).pack(side=tk.RIGHT,padx=4)
 
         # Cập nhật gợi ý cả khi nhập tay và khi mở dự án/cập nhật Hp.
         self._phi_hint_signature=None
@@ -1051,205 +1211,119 @@ class FullTCVNApp:
         self.root.clipboard_clear(); self.root.clipboard_append(out)
         messagebox.showinfo("Thành công", "Đã sao chép bảng kết quả vào Clipboard!")
 
+    def _report_workbook(self):
+        import base64,io,openpyxl
+        raw=base64.b64decode(_QP_REPORT_TEMPLATE)
+        try:wb=openpyxl.load_workbook(io.BytesIO(raw),rich_text=True)
+        except TypeError:wb=openpyxl.load_workbook(io.BytesIO(raw))
+        master=wb.active;master.title='_Mau'
+        values={cell.coordinate:cell.value for row in master for cell in row if cell.value is not None}
+        for res in self.calc_results:
+            ws=wb.copy_worksheet(master)
+            # Copy immutable template text as well as merges, fonts and dimensions.
+            for address,value in values.items():ws[address]=value
+            frequency=str(res['Tần suất P']).replace('%','').strip()
+            ws.title=f'Thuyết minh P={frequency}%'
+            F=finite_number(self.txt_F.get(),'F');L=finite_number(self.txt_L.get(),'L')
+            H=res['Hp tính toán (mm)'];phi=res['Hệ số phi'];region=self.cbo_vung.get();soil=self.cbo_soil.get()
+            updates={'D2':F,'D3':L,'D4':finite_number(self.txt_Sli.get(),'Σli'),
+                'D5':finite_number(self.txt_Jl.get(),'Il'),'D6':finite_number(self.txt_Js.get(),'Is'),
+                'A7':f'Lượng mưa tính toán với tần suất X{frequency}%', 'B7':f'X{frequency}%', 'D7':H,
+                'D8':soil,'A10':f'φ = f({soil}; {H:.3f}; {F:.3f})','D10':phi,
+                'D11':finite_number(self.txt_ms.get(),'ms'),'D12':finite_number(self.txt_ml.get(),'ml'),
+                'D13':finite_number(self.txt_d.get(),'δ'),'D14':int(region), 'B15':f'Qmax.{frequency}%',
+                'D20':f"{res.get('Mẫu số bs',1.8):g} × (L + Σli)",
+                'F19':res['bs (m)'],'F22':res['Phi_s'],
+                'D25':f"f({res['Phi_s']:.3f}; {region})",'F25':res['ts (phút)'],
+                'F27':res['Phi_l'],'D30':f"f({region}; {res['ts (phút)']:.3f}; {res['Phi_l']:.3f})",
+                'F30':res['Mô-đun Ap'],'B32':f'Qmax.{frequency}%','F32':res['Lưu lượng Qmax (m3/s)']}
+            for address,value in updates.items():ws[address]=value
+            for row in ws:
+                for cell in row:
+                    if isinstance(cell.value,(int,float)) and not isinstance(cell.value,bool):cell.number_format='0.000'
+            ws['F30'].number_format='0.00000';ws['D14'].number_format='0'
+            ws.print_area='A1:G33';ws.sheet_properties.pageSetUpPr.fitToPage=True
+            ws.page_setup.paperSize=ws.PAPERSIZE_A4;ws.page_setup.fitToWidth=1;ws.page_setup.fitToHeight=1
+            ws.sheet_view.showGridLines=False
+        wb.remove(master)
+        return wb
+
     def export_excel(self):
         if not self.require_current_results():return
-        if not self.calc_results:
-            messagebox.showwarning("Cảnh báo", "Không có dữ liệu để xuất!")
-            return
-
-        proj = self.txt_project.get()
-        f_save = filedialog.asksaveasfilename(
-            initialfile=f"Thuyet_Minh_Qp_{proj.replace(' ', '_')}.xlsx",
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx")]
-        )
-        if not f_save:
-            return
-
+        if not self.calc_results:return
+        path=filedialog.asksaveasfilename(initialfile='Thuyet_Minh_Qp_'+self.txt_project.get().replace(' ','_')+'.xlsx',defaultextension='.xlsx',filetypes=[('Excel','*.xlsx')])
+        if not path:return
         try:
-            import openpyxl
-            from openpyxl.styles import Font, Alignment, Border, Side
-            import pandas as pd
+            self._report_workbook().save(path)
+            messagebox.showinfo('Xuất Excel','Đã xuất thuyết minh theo mẫu, mỗi tần suất một sheet.')
+        except Exception as exc:messagebox.showerror('Xuất Excel',str(exc))
 
-            wb = openpyxl.Workbook()
-            wb.remove(wb.active)
+    def _report_document(self):
+        from docx import Document
+        from docx.shared import Cm,Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_TABLE_ALIGNMENT,WD_CELL_VERTICAL_ALIGNMENT
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        doc=Document();section=doc.sections[0]
+        section.page_width=Cm(21);section.page_height=Cm(29.7)
+        section.top_margin=section.bottom_margin=Cm(1.2);section.left_margin=section.right_margin=Cm(1.1)
+        normal=doc.styles['Normal'];normal.font.name='Times New Roman';normal.font.size=Pt(11)
+        normal.paragraph_format.space_before=Pt(0);normal.paragraph_format.space_after=Pt(0)
+        normal.paragraph_format.line_spacing=1
+        workbook=self._report_workbook()
+        for index,ws in enumerate(workbook):
+            if index:doc.add_page_break()
+            table=doc.add_table(rows=33,cols=7);table.autofit=False;table.alignment=WD_TABLE_ALIGNMENT.CENTER
+            # Fit Word labels and units without wrapping Qmax or m³/s.
+            widths=[7.,1.9,.4,5.65,.4,2.1,1.35];total=sum(widths)
+            for column,width in zip(table.columns,widths):
+                column.width=Cm(18.8*width/total)
+                for cell in column.cells:cell.width=Cm(18.8*width/total)
+            # Reproduce the horizontal/vertical cell merges of the workbook.
+            for merged in ws.merged_cells.ranges:
+                table.cell(merged.min_row-1,merged.min_col-1).merge(table.cell(merged.max_row-1,merged.max_col-1))
+            # Excel lets long labels overflow empty cells; merge those empty Word cells.
+            for row in [9,18,21,24,26,29,31]:table.cell(row-1,0).merge(table.cell(row-1,6))
+            for row in table.rows:
+                row.height=Pt(17)
+                cant=OxmlElement('w:cantSplit');row._tr.get_or_add_trPr().append(cant)
+            for row in ws:
+                for source in row:
+                    if source.value is None:continue
+                    cell=table.cell(source.row-1,source.column-1);cell.vertical_alignment=WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                    paragraph=cell.paragraphs[0]
+                    paragraph.alignment=WD_ALIGN_PARAGRAPH.CENTER if source.alignment.horizontal=='center' else WD_ALIGN_PARAGRAPH.LEFT
+                    value=source.value
+                    if isinstance(value,(int,float)):items=[str(value) if source.coordinate=='D14' else f'{value:.5f}' if source.coordinate=='F30' else f'{value:.3f}']
+                    elif isinstance(value,str):items=[value]
+                    else:
+                        try:items=list(value)
+                        except TypeError:items=[str(value)]
+                    for item in items:
+                        run=paragraph.add_run(item if isinstance(item,str) else item.text)
+                        run.font.name='Times New Roman';run.font.size=Pt(11)
+                        run.bold=bool(source.font.bold);run.italic=bool(source.font.italic)
+                        inline=getattr(item,'font',None)
+                        if inline is not None:
+                            run.font.superscript=inline.vertAlign=='superscript'
+                            run.font.subscript=inline.vertAlign=='subscript'
+                    if source.border.bottom.style:
+                        borders=OxmlElement('w:tcBorders');bottom=OxmlElement('w:bottom')
+                        bottom.set(qn('w:val'),'single');bottom.set(qn('w:sz'),'4');bottom.set(qn('w:color'),'000000')
+                        borders.append(bottom);cell._tc.get_or_add_tcPr().append(borders)
+        return doc
 
-            # 1. Sheet Tổng hợp
-            ws_summary = wb.create_sheet(title="Bảng Tổng Hợp")
-            df = pd.DataFrame(self.calc_results)
-
-            for c_idx, col_name in enumerate(df.columns, 1):
-                cell = ws_summary.cell(row=1, column=c_idx, value=col_name)
-                cell.font = Font(bold=True)
-
-            for r_idx, row in enumerate(df.values, 2):
-                for c_idx, value in enumerate(row, 1):
-                    ws_summary.cell(row=r_idx, column=c_idx, value=value)
-
-            # 2. Định dạng
-            font_bold_italic = Font(name='Times New Roman', size=12, bold=True, italic=True)
-            font_normal = Font(name='Times New Roman', size=12)
-            font_bold = Font(name='Times New Roman', size=12, bold=True)
-            align_left = Alignment(horizontal='left', vertical='center')
-            align_center = Alignment(horizontal='center', vertical='center')
-            align_right = Alignment(horizontal='right', vertical='center')
-            border_bottom = Border(bottom=Side(style='thin'))
-
-            F_val = self.txt_F.get()
-            L_val = self.txt_L.get()
-            Sli_val = self.txt_Sli.get()
-            Jl_val = self.txt_Jl.get()
-            Js_val = self.txt_Js.get()
-            soil = self.cbo_soil.get()
-            ms_val = self.txt_ms.get()
-            ml_val = self.txt_ml.get()
-            d_val = self.txt_d.get()
-            vung = self.cbo_vung.get()
-
-            k_bs_str = "1.8" if self.cbo_slope.get().startswith("Hai sườn") else "0.9"
-
-            # 3. Sheet Thuyết minh từng tần suất
-            for res in self.calc_results:
-                p_str = str(res['Tần suất P']).replace("%", "").strip()
-                ws = wb.create_sheet(title=f"Thuyết minh P={p_str}%")
-
-                ws.column_dimensions['A'].width = 45
-                ws.column_dimensions['B'].width = 15
-                ws.column_dimensions['C'].width = 5
-                ws.column_dimensions['D'].width = 35
-                ws.column_dimensions['E'].width = 5
-                ws.column_dimensions['F'].width = 12
-                ws.column_dimensions['G'].width = 10
-
-                hp_val = res['Hp tính toán (mm)']
-                phi_val = res['Hệ số phi']
-                bs_val = res['bs (m)']
-                fs_val = res['Phi_s']
-                ts_val = res['ts (phút)']
-                fl_val = res['Phi_l']
-                ap_val = res['Mô-đun Ap']
-                qmax_val = res['Lưu lượng Qmax (m3/s)']
-
-                ws['A1'] = "I- Số liệu"
-                ws['A1'].font = font_bold_italic
-
-                data_I = [
-                    ("Diện tích lưu vực", "Fl.v.", "=", F_val, "", "km²"),
-                    ("Chiều dài lòng chủ", "Lch", "=", L_val, "", "km"),
-                    ("Tổng chiều dài dòng nhánh", "Σli", "=", Sli_val, "", "km"),
-                    ("Độ dốc lòng chủ", "Il", "=", Jl_val, "", "‰"),
-                    ("Độ dốc sườn dốc", "Is", "=", Js_val, "", "‰"),
-                    (f"Lượng mưa tính toán với tần suất X{p_str}%", f"X{p_str}%", "=", hp_val, "", "mm"),
-                    ("Cấp đất trong lưu vực", "", "", soil, "", ""),
-                    ("Hệ số dòng chảy lũ φ = f(cấp đất; Hp%; F)", "", "", "", "", ""),
-                    (f"φ = f( {soil} ; {hp_val} ; {F_val} )", "", "=", phi_val, "", ""),
-                    ("Độ nhám sườn dốc", "ms", "=", ms_val, "", ""),
-                    ("Độ nhám lòng chính", "ml", "=", ml_val, "", ""),
-                    ("Hệ số triết giảm do ao hồ", "δ", "=", d_val, "", ""),
-                    ("Vùng mưa:", "", "", vung, "", ""),
-                    ("Lưu lượng lũ thiết kế", f"Qmax.{p_str}%", "=", "?", "", "(m³/s)")
-                ]
-
-                r = 2
-                for row_data in data_I:
-                    ws.cell(row=r, column=1, value=row_data[0]).font = font_normal
-                    if row_data[1]:
-                        ws.cell(row=r, column=2, value=row_data[1]).font = font_normal
-                        ws.cell(row=r, column=2).alignment = align_left
-                    if row_data[2]:
-                        ws.cell(row=r, column=3, value=row_data[2]).font = font_normal
-                        ws.cell(row=r, column=3).alignment = align_center
-                    if row_data[3]:
-                        ws.cell(row=r, column=4, value=row_data[3]).font = font_normal
-                        ws.cell(row=r, column=4).alignment = align_center
-                    if row_data[5]:
-                        ws.cell(row=r, column=6, value=row_data[5]).font = font_normal
-                        ws.cell(row=r, column=6).alignment = align_left
-                    r += 1
-
-                r += 1
-                ws.cell(row=r, column=1, value="II- Tính toán").font = font_bold_italic
-                r += 1
-
-                # 1. bs
-                ws.cell(row=r, column=1, value="Chiều dài trung bình sườn dốc:").font = font_normal
-                r += 1
-                ws.cell(row=r, column=2, value="bs").font = font_normal; ws.cell(row=r, column=2).alignment = align_center
-                ws.cell(row=r, column=3, value="=").font = font_normal; ws.cell(row=r, column=3).alignment = align_center
-                ws.cell(row=r, column=4, value="1000.Fl.v.").font = font_normal; ws.cell(row=r, column=4).alignment = align_center
-                ws.cell(row=r, column=4).border = border_bottom
-                ws.cell(row=r+1, column=4, value=f"{k_bs_str} × (L + Σli)").font = font_normal; ws.cell(row=r+1, column=4).alignment = align_center
-                ws.cell(row=r, column=5, value="=").font = font_normal; ws.cell(row=r, column=5).alignment = align_center
-                ws.cell(row=r, column=6, value=bs_val).font = font_normal; ws.cell(row=r, column=6).alignment = align_center
-                r += 2
-
-                # 2. Φs
-                ws.cell(row=r, column=1, value="Đặc trưng địa mạo sườn dốc:").font = font_normal
-                r += 1
-                ws.cell(row=r, column=2, value="Φs").font = font_normal; ws.cell(row=r, column=2).alignment = align_center
-                ws.cell(row=r, column=3, value="=").font = font_normal; ws.cell(row=r, column=3).alignment = align_center
-                ws.cell(row=r, column=4, value="bs^0.6").font = font_normal; ws.cell(row=r, column=4).alignment = align_center
-                ws.cell(row=r, column=4).border = border_bottom
-                ws.cell(row=r+1, column=4, value="ms × Is^0.3 × (φ × Hp%)^0.4").font = font_normal; ws.cell(row=r+1, column=4).alignment = align_center
-                ws.cell(row=r, column=5, value="=").font = font_normal; ws.cell(row=r, column=5).alignment = align_center
-                ws.cell(row=r, column=6, value=fs_val).font = font_normal; ws.cell(row=r, column=6).alignment = align_center
-                r += 2
-
-                # 3. ts
-                ws.cell(row=r, column=1, value="Thời gian chảy trên sườn dốc τs:").font = font_normal
-                r += 1
-                ws.cell(row=r, column=2, value="τs").font = font_normal; ws.cell(row=r, column=2).alignment = align_center
-                ws.cell(row=r, column=3, value="=").font = font_normal; ws.cell(row=r, column=3).alignment = align_center
-                ws.cell(row=r, column=4, value=f"f( {fs_val} ; {vung} )").font = font_normal; ws.cell(row=r, column=4).alignment = align_center
-                ws.cell(row=r, column=5, value="=").font = font_normal; ws.cell(row=r, column=5).alignment = align_center
-                ws.cell(row=r, column=6, value=ts_val).font = font_normal; ws.cell(row=r, column=6).alignment = align_center
-                ws.cell(row=r, column=7, value="phút").font = font_normal; ws.cell(row=r, column=7).alignment = align_left
-                r += 1
-
-                # 4. Φl
-                ws.cell(row=r, column=1, value="Đặc trưng địa mạo lòng sông:").font = font_normal
-                r += 1
-                ws.cell(row=r, column=2, value="Φl").font = font_normal; ws.cell(row=r, column=2).alignment = align_center
-                ws.cell(row=r, column=3, value="=").font = font_normal; ws.cell(row=r, column=3).alignment = align_center
-                ws.cell(row=r, column=4, value="1000 × L").font = font_normal; ws.cell(row=r, column=4).alignment = align_center
-                ws.cell(row=r, column=4).border = border_bottom
-                ws.cell(row=r+1, column=4, value="ml × Il^0.333 × (F × φ × Hp%)^0.25").font = font_normal; ws.cell(row=r+1, column=4).alignment = align_center
-                ws.cell(row=r, column=5, value="=").font = font_normal; ws.cell(row=r, column=5).alignment = align_center
-                ws.cell(row=r, column=6, value=fl_val).font = font_normal; ws.cell(row=r, column=6).alignment = align_center
-                r += 2
-
-                # 5. Ap
-                ws.cell(row=r, column=1, value="Mô đun tương đối của dòng chảy lớn nhất:").font = font_normal
-                r += 1
-                ws.cell(row=r, column=2, value="Ap").font = font_normal; ws.cell(row=r, column=2).alignment = align_center
-                ws.cell(row=r, column=3, value="=").font = font_normal; ws.cell(row=r, column=3).alignment = align_center
-                ws.cell(row=r, column=4, value=f"f( {vung} ; {ts_val} ; {fl_val} )").font = font_normal; ws.cell(row=r, column=4).alignment = align_center
-                ws.cell(row=r, column=5, value="=").font = font_normal; ws.cell(row=r, column=5).alignment = align_center
-                ws.cell(row=r, column=6, value=ap_val).font = font_normal; ws.cell(row=r, column=6).alignment = align_center
-                r += 1
-
-                # 6. Qmax
-                ws.cell(row=r, column=1, value="Lưu lượng lũ lớn nhất theo tần suất thiết kế (m³/s)").font = font_normal
-                r += 1
-                ws.cell(row=r, column=2, value=f"Qmax.{p_str}%").font = font_normal; ws.cell(row=r, column=2).alignment = align_center
-                ws.cell(row=r, column=3, value="=").font = font_normal; ws.cell(row=r, column=3).alignment = align_center
-                ws.cell(row=r, column=4, value="Ap × φ × Hp × F × δ").font = font_normal; ws.cell(row=r, column=4).alignment = align_center
-                ws.cell(row=r, column=5, value="=").font = font_normal; ws.cell(row=r, column=5).alignment = align_center
-                ws.cell(row=r, column=6, value=qmax_val).font = font_bold; ws.cell(row=r, column=6).alignment = align_center
-                ws.cell(row=r, column=7, value="(m³/s)").font = font_normal
-                r += 1
-
-            for sheet in wb.worksheets:
-                for cells in sheet.iter_rows():
-                    for cell in cells:
-                        if isinstance(cell.value,(int,float)) and not isinstance(cell.value,bool):cell.number_format='0.000'
-            wb.save(f_save)
-            messagebox.showinfo("Thành công", f"Đã xuất file báo cáo tính toán:\n{f_save}")
-
-        except ImportError:
-            messagebox.showerror("Thiếu thư viện", "Vui lòng chạy lệnh 'pip install openpyxl' trong Terminal để sử dụng định dạng xuất Excel này.")
-        except Exception as e:
-            messagebox.showerror("Lỗi", f"Có lỗi khi xuất Excel: {e}")
+    def export_word(self):
+        if not self.require_current_results():return
+        if not self.calc_results:return
+        path=filedialog.asksaveasfilename(initialfile='Thuyet_Minh_Qp_'+self.txt_project.get().replace(' ','_')+'.docx',defaultextension='.docx',filetypes=[('Word','*.docx')])
+        if not path:return
+        try:
+            self._report_document().save(path)
+            messagebox.showinfo('Xuất Word','Đã xuất thuyết minh Word theo bố cục file mẫu.')
+        except ImportError:messagebox.showerror('Thiếu thư viện','Cài thư viện bằng lệnh: python -m pip install python-docx openpyxl')
+        except Exception as exc:messagebox.showerror('Xuất Word',str(exc))
 
 
 if __name__ == "__main__":
