@@ -503,13 +503,15 @@ class FullTCVNApp:
 
         # Cập nhật gợi ý cả khi nhập tay và khi mở dự án/cập nhật Hp.
         self._phi_hint_signature=None
+        self.cbo_soil.bind('<<ComboboxSelected>>',lambda event:self.refresh_phi_hints())
         self.refresh_phi_hints()
         self.root.after(250,self.poll_phi_hints)
         # Chờ người dùng nhập/xác minh hệ số rồi bấm tính.
 
     def refresh_phi_hints(self):
-        """Fill the table-range midpoint; preserve explicitly edited values."""
+        """Recalculate on lookup-input changes; retain edits only for the same inputs."""
         if not hasattr(self,'_phi_auto_values'):self._phi_auto_values={}
+        if not hasattr(self,'_phi_contexts'):self._phi_contexts={}
         for label,hint in self.phi_hint_labels.items():
             try:
                 soil=self.cbo_soil.get().strip().upper()
@@ -523,7 +525,10 @@ class FullTCVNApp:
                 minimum,maximum=min(values),max(values)
                 average=(minimum+maximum)/2
                 entry=self.phi_entries[label];current=entry.get().strip()
-                automatic=not current or current==self._phi_auto_values.get(label)
+                lookup_context=(soil,F,H)
+                changed=label in self._phi_contexts and self._phi_contexts[label]!=lookup_context
+                automatic=changed or not current or current==self._phi_auto_values.get(label)
+                self._phi_contexts[label]=lookup_context
                 if automatic:
                     value=f'{average:.6f}'.rstrip('0').rstrip('.')
                     entry.delete(0,'end');entry.insert(0,value);self._phi_auto_values[label]=value
@@ -531,7 +536,7 @@ class FullTCVNApp:
                     text=f'Bảng: φ = {minimum:.3f}\n'+context
                 else:
                     text=f'Khoảng φ: {minimum:.3f}–{maximum:.3f}\nTrung bình: {average:.3f}\n'+context
-                if not automatic:text+='\nĐang dùng φ chỉnh tay'
+                if not automatic:text+='\nφ chỉnh tay; đổi dữ liệu sẽ tra lại'
                 hint.configure(text=text,fg='#155e75')
             except (ValueError,KeyError,StopIteration):
                 entry=self.phi_entries[label]
@@ -631,6 +636,7 @@ class FullTCVNApp:
                 for label,entry in entries.items():
                     entry.delete(0,tk.END);entry.insert(0,data.get(key,{}).get(label,''))
             self._phi_auto_values=data.get('phi_auto_values',{})
+            self._phi_contexts={}
             self.calculate_all()
             messagebox.showinfo("Thành công", f"Đã mở lại dự án từ tệp:\n{f_path}")
         except Exception as e:
