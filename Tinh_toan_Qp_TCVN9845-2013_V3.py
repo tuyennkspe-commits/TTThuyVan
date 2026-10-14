@@ -265,6 +265,8 @@ def lookup_ts(vung_id, Fs, confirmed_ts=None):
         value=finite_number(confirmed_ts,"ts đã xác minh")
         if value<=0:raise ValueError("ts đã xác minh phải dương.")
         return value
+    if not FS_AXIS[0]<=Fs<=FS_AXIS[-1]:
+        raise ValueError(f'Φs={Fs:.3f} ngoài bảng A.2 [{FS_AXIS[0]}, {FS_AXIS[-1]}]. Nhập ts đã xác minh; không tự lấy biên hoặc ngoại suy.')
     if vung_id==18 and Fs>FS_AXIS[-2]:
         raise ValueError("Ô A.2 vùng 18, Φs=40 bị bỏ trống trong bản Word. Hãy nhập ts đã xác minh khi Φs > 35.")
     col_idx = vung_id - 1
@@ -285,6 +287,8 @@ def lookup_Ap(vung_id, ts_val, fl_val, confirmed_ap=None):
         value=finite_number(confirmed_ap,'Ap đã xác minh')
         if value<=0:raise ValueError('Ap đã xác minh phải dương.')
         return value
+    if not TS_LEVELS[0]<=ts_val<=TS_LEVELS[-1] or not FL_COLS[0]<=fl_val<=FL_COLS[-1]:
+        raise ValueError(f'ts={ts_val:.3f}, Φl={fl_val:.3f} ngoài bảng A.3 (ts: {TS_LEVELS[0]}–{TS_LEVELS[-1]} phút; Φl: {FL_COLS[0]}–{FL_COLS[-1]}). Nhập Ap đã xác minh; không tự lấy biên hoặc ngoại suy.')
     def active_indices(axis,value):
         clamped=float(np.clip(value,axis[0],axis[-1]))
         exact=np.flatnonzero(np.isclose(axis,clamped,rtol=0,atol=1e-12))
@@ -463,6 +467,61 @@ _QP_REPORT_TEMPLATE = (
     'SwUGAAAAAAoACgCAAgAAnSoAAAAA'
 )
 
+
+# Tables 1–6 supplied by the user; keep selection of table values explicit.
+REFERENCE_TABLES = [
+    ('Bảng 1. Phân cấp đất theo hàm lượng cát',('Hàm lượng cát (%)','Cấp đất'),
+     [('0,0–2','I'),('2,1–12','II'),('12,1–30','III'),('31–62','IV'),('63–83','V'),('84–100','VI')]),
+    ('Bảng 2. Phân cấp đất, đá theo cường độ thấm và hàm lượng cát',
+     ('TT','Tên đất','Hàm lượng cát (%)','Cường độ thấm (mm/min)','Cấp đất'),[
+     ('1','Nhựa đường, đất không thấm, các loại đá','—','0–0,1','I'),
+     ('2','Đất sét, sét màu, đất muối, đất sét cát (khi ẩm có thể vê thành sợi, uốn cong không đứt)','2; 10','0,1; 0,3','I; II'),
+     ('3','Đất hóa tro, hóa tro mạnh','10','0,3','II'),
+     ('4','Đất tro chất sét (khi ẩm có thể vê thành sợi, uốn cong có vết rạn)','14; 15','0,50; 0,60','III; III'),
+     ('5','Sét cát đất đen, đất rừng màu tro nguyên thổ rừng có cỏ, đất hóa tro vừa (khi ẩm có thể vê thành sợi, uốn cong có vết rạn)','12; 15; 30','0,40; 0,60; 0,85','II; III; III'),
+     ('6','Đất đen màu mỡ tầng dầy','14; 30','0,50; 0,85','III; III'),
+     ('7','Đất đen thường','15; 30','0,60; 0,85','III; III'),
+     ('8','Đất màu lê, màu lê nhạt','17; 30','0,70; 0,90','III; III'),
+     ('9','Đất canxium đen ở những cánh đồng có màu tro đen chứa nhiều chất mục thực vật. Nếu lớp thực vật trên mặt mỏng thì liệt vào loại IV, nếu dày thuộc loại III','17; 40; 60','0,70; 0,90; 1,20','III; IV; IV'),
+     ('10','Đất cát sét, đất đen cát sét, đất rừng, đất đồng cỏ (khi ướt có thể vê thành sợi)','45; 60; 70','1,00; 1,25; 1,50','IV; IV; V'),
+     ('11','Đất cát không bay được (không vê thành sợi được)','80; 90','2,00; 2,50','V; VI'),
+     ('12','Cát thô và cát có thể bay được (khi sờ tay vào có cảm giác nhắm mắt có thể phân biệt được hạt cát, không vê thành sợi được)','95; 100','3,00; 5,00','VI; VI')]),
+    ('Bảng 3. Phân vùng mưa rào Việt Nam',('Vùng mưa','Ranh giới phân vùng mưa rào'),[
+     ('I','Lưu vực thượng nguồn sông Mã, sông Chu, sông Cả.'),
+     ('II','Vùng thượng nguồn sông Đà từ biên giới đến Nghĩa Lộ.'),
+     ('III','Tâm mưa Hoàng Liên Sơn hữu ngạn sông Thao, từ biên giới đến Ngòi Bút.'),
+     ('IV','Vùng lưu vực sông Kỳ Cùng, sông Bằng Giang, thượng nguồn sông Hồng.'),
+     ('V','Lưu vực sông Gâm, tả ngạn sông Lô.'),
+     ('VI','Thung lũng sông Thao, sông Chảy, hạ lưu sông Lô Gâm.'),
+     ('VII','Các lưu vực bắt nguồn từ dãy Yên Tử đổ ra biển.'),
+     ('VIII','Vùng biển từ Hải Phòng đến Thanh Hóa.'),
+     ('IX','Các lưu vực phần trung du sông Mã, sông Chu ra đến biển.'),
+     ('X','Vùng ven biển từ Thanh Hóa đến Đồng Hới.'),
+     ('XI','Vùng ven biển từ Đồng Hới đến Đà Nẵng'),
+     ('XII','Vùng ven biển từ Đà Nẵng đến Quảng Ngãi'),
+     ('XIII','Vùng ven biển từ Quảng Ngãi đến Phan Rang'),
+     ('XIV','Các lưu vực sông phía bắc Tây Nguyên.'),
+     ('XV','Các lưu vực sông phía nam Tây Nguyên.'),
+     ('XVI','Các lưu vực sông từ Ban Mê Thuột tới Bảo Lộc.'),
+     ('XVII','Vùng ven biển từ Phan Rang đến Vũng Tàu.'),
+     ('XVIII','Vùng đồng bằng Nam Bộ.')]),
+    ('Bảng 4. Thông số đặc trưng nhám trên sườn dốc msd',('Tình hình sườn dốc lưu vực','Cỏ thưa','Trung bình','Cỏ dày'),[
+     ('Bề mặt nhẵn (át phan, bê tông, …)','0,50','—','—'),
+     ('Đất đồng bằng loại hay nứt nẻ, đất san phẳng đầm chặt.','0,40','0,30','0,25'),
+     ('Mặt đất thu dọn sạch, không có gốc cây, không bị cày xới, vùng dân cư nhà cửa không quá 20%, mặt đá xếp.','0,30','0,25','0,20'),
+     ('Mặt đất bị cày xới, nhiều gốc bụi, vùng dân cư có nhà cửa trên 20%.','0,20','0,15','0,10')]),
+    ('Bảng 5. Thông số đặc trưng nhám lòng sông mls',('Tình hình lòng sông từ thượng nguồn tới mặt cắt tính toán','Hệ số mls'),[
+     ('Sông đồng bằng ổn định, lòng sông khá sạch, suối không có nước thường xuyên chảy trong điều kiện tương đối thuận lợi.','11'),
+     ('Sông lớn và trung bình, quanh co, bị tắc nghẽn, lòng sông có cỏ mọc, có đá, chảy không lặng, suối không có nước thường xuyên, mùa lũ dòng nước cuốn theo nhiều sỏi cuội, bùn cát','9'),
+     ('Sông vùng núi, lòng sông nhiều đá, mặt nước không phẳng, suối chảy không thường xuyên, quanh co, lòng sông tắc nghẽn.','7')]),
+    ('Bảng 6. Hệ số triết giảm dòng chảy δ',('Vị trí hồ ao, đầm lầy','2%','4%','6%','8%','10%','15%','20%','30%','40%','50%'),[
+     ('Ở hạ lưu','0,85','0,75','0,65','0,55','0,50','0,40','0,35','0,20','0,15','0,10'),
+     ('Ở thượng lưu','0,95','0,90','0,85','0,80','0,75','0,65','0,55','0,45','0,35','0,25')])]
+REFERENCE_SOIL_NOTES = (
+    '1) Khi đất phủ nhiều cỏ, nghĩa là chiều dày lớp thực vật (lớp thổ nhưỡng có rong rêu) lớn hơn 20 cm, cấp đất I và III tăng 1 bậc còn V và VI giảm 1 bậc.\n'
+    '2) Nếu trên lưu vực có nhiều loại đất, cần phải tính riêng cho từng loại đất.\n'
+    '3) Lưu lượng sẽ lấy theo trị số bình quân tỷ lệ của phần trăm diện tích các loại đất có trong lưu vực.')
+
 class FullTCVNApp:
     def __init__(self, root):
         self.root = root
@@ -520,6 +579,7 @@ class FullTCVNApp:
         btn_tables_fr = tk.Frame(self.root, padx=15, pady=2)
         btn_tables_fr.pack(fill=tk.X)
         tk.Label(btn_tables_fr, text="Tra cứu bảng chuẩn:", font=("Arial", 8, "italic")).pack(side=tk.LEFT)
+        tk.Button(btn_tables_fr,text="Bảng 1–6: Đất, vùng mưa, nhám, δ",font=("Arial",8,"bold"),command=self.show_reference_tables).pack(side=tk.LEFT,padx=4)
         tk.Button(btn_tables_fr, text="📑 Bảng tra hệ số φ", font=("Arial", 8, "bold"), bg="#e8f5e9", fg="#2e7d32", command=self.show_phi_table_window).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_tables_fr, text="📑 Bảng II-2: Tra ts", font=("Arial", 8, "bold"), bg="#e1f5fe", fg="#0277bd", command=self.show_ts_table_window).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_tables_fr, text="📑 Bảng tra mô-đun Ap", font=("Arial", 8, "bold"), bg="#f3e5f5", fg="#6a1b9a", command=self.show_ap_table_window).pack(side=tk.LEFT, padx=6)
@@ -697,6 +757,7 @@ class FullTCVNApp:
                     text=f'Bảng: φ = {minimum:.3f}\n'+context
                 else:
                     text=f'Khoảng φ: {minimum:.3f}–{maximum:.3f}\nTrung bình: {average:.3f}\n'+context
+                if maximum-minimum>=1e-12:text+='\nLấy trung bình theo lựa chọn người dùng'
                 if not automatic:text+='\nφ chỉnh tay; đổi dữ liệu sẽ tra lại'
                 hint.configure(text=text,fg='#155e75')
             except (ValueError,KeyError,StopIteration):
@@ -1056,6 +1117,70 @@ class FullTCVNApp:
 
         render_plot()
 
+    def _apply_reference_value(self,index,row,column):
+        if index in (0,1):
+            value=row[-1].split(';')[column].strip()
+            if value not in self.cbo_soil['values']:
+                messagebox.showinfo('Cấp đất I','Bảng phân cấp có cấp I, nhưng phần mềm hiện chưa có dữ liệu φ cấp I trong bảng A.1. Không tự chuyển cấp I sang cấp II.');return
+            self.cbo_soil.set(value);self.refresh_phi_hints()
+        elif index==2:self.cbo_vung.set(str(column+1))
+        else:
+            target={3:self.txt_ms,4:self.txt_ml,5:self.txt_d}[index]
+            value=row[column+1] if index in (3,5) else row[-1]
+            if value=='—':messagebox.showinfo('Bảng tra','Ô này không có giá trị trong bảng. Chọn trường hợp khác.');return
+            target.delete(0,'end');target.insert(0,value.replace(',','.'))
+
+    def show_reference_tables(self):
+        existing=getattr(self,'reference_win',None)
+        if existing is not None and existing.winfo_exists():existing.lift();return
+        window=tk.Toplevel(self.root);self.reference_win=window
+        window.title('Tra cứu Bảng 1–6 – TCVN 9845:2013');window.geometry('1150x710');window.minsize(850,600)
+        tabs=ttk.Notebook(window);tabs.pack(fill='both',expand=True,padx=8,pady=8)
+        self.reference_views=[]
+        for index,(title,headers,rows) in enumerate(REFERENCE_TABLES):
+            page=ttk.Frame(tabs,padding=8);tabs.add(page,text=f'Bảng {index+1}')
+            ttk.Label(page,text=title,font=('Arial',11,'bold'),wraplength=1000).pack(anchor='w',pady=(0,8))
+            frame=ttk.Frame(page);frame.pack(fill='both',expand=True)
+            columns=[str(i) for i in range(len(headers))]
+            tree=ttk.Treeview(frame,columns=columns,show='headings',selectmode='browse')
+            for column,label in zip(columns,headers):
+                tree.heading(column,text=label)
+                width=520 if ('Tên đất'==label or 'Tình hình' in label or 'Ranh giới' in label) else 145 if index<3 else 85
+                tree.column(column,width=width,minwidth=75,stretch=True)
+            for number,row in enumerate(rows):tree.insert('', 'end',iid=str(number),values=row)
+            vertical=ttk.Scrollbar(frame,orient='vertical',command=tree.yview);vertical.pack(side='right',fill='y')
+            horizontal=ttk.Scrollbar(frame,orient='horizontal',command=tree.xview);horizontal.pack(side='bottom',fill='x')
+            tree.configure(yscrollcommand=vertical.set,xscrollcommand=horizontal.set);tree.pack(fill='both',expand=True)
+            ttk.Label(page,text='Nội dung đầy đủ của dòng đang chọn:').pack(anchor='w',pady=(8,2))
+            detail=tk.Text(page,height=5,wrap='word',font=('Arial',10),state='disabled');detail.pack(fill='x')
+            actions=ttk.Frame(page);actions.pack(fill='x',pady=8)
+            ttk.Label(actions,text='Giá trị cần dùng:').pack(side='left')
+            choice=ttk.Combobox(actions,state='readonly',width=36);choice.pack(side='left',padx=8)
+            def selected(event=None,i=index,t=tree,c=choice,d=detail,data=rows,names=headers):
+                if not t.selection():return
+                position=int(t.selection()[0]);row=data[position]
+                d.configure(state='normal');d.delete('1.0','end');d.insert('1.0','\n'.join(f'{name}: {value}' for name,value in zip(names,row)));d.configure(state='disabled')
+                if i==0:options=[row[-1]]
+                elif i==1:
+                    sands=row[2].split(';');permeability=row[3].split(';');soils=row[4].split(';')
+                    options=[f'{soil.strip()} — cát {sand.strip()}%, thấm {rate.strip()} mm/min' for soil,sand,rate in zip(soils,sands,permeability)]
+                elif i==2:options=[f'Vùng {row[0]} (số {position+1})']
+                elif i==4:options=[row[-1]]
+                else:options=[f'{name}: {value}' for name,value in zip(names[1:],row[1:])]
+                c.configure(values=options);c.current(0)
+            def apply(i=index,t=tree,c=choice,data=rows):
+                if not t.selection():return
+                position=int(t.selection()[0])
+                self._apply_reference_value(i,data[position],position if i==2 else c.current())
+            ttk.Button(actions,text='Điền vào phần tính toán',command=apply).pack(side='left')
+            tree.bind('<<TreeviewSelect>>',selected)
+            tree.selection_set('0');selected()
+            self.reference_views.append((tree,choice,detail,apply))
+            if index in (0,1):
+                ttk.Label(page,text=REFERENCE_SOIL_NOTES,wraplength=1000,justify='left').pack(fill='x',pady=(0,4))
+                ttk.Label(page,text='Các giá trị cùng vị trí trong một dòng Bảng 2 tương ứng với nhau. Chọn đúng trường hợp trước khi áp dụng. Chú thích về lớp thực vật cần được người dùng xem xét trước khi chọn cấp đất.',wraplength=1000).pack(fill='x')
+            if index==5:ttk.Label(page,text='Tỷ lệ diện tích hồ/đầm lầy so với diện tích lưu vực. Chỉ chọn giá trị có trong bảng; chức năng này không tự nội suy.',wraplength=1000).pack(fill='x')
+
     def show_phi_table_window(self):
         if self.phi_win and self.phi_win.winfo_exists():self.phi_win.destroy()
         self.phi_win=tk.Toplevel(self.root);self.phi_win.title('Bảng A.1 — hệ số dòng chảy từ tài liệu cung cấp')
@@ -1111,7 +1236,6 @@ class FullTCVNApp:
 
     # --- TÍNH TOÁN LŨ Qp ---
     def calculate_all(self):
-        self.refresh_phi_hints()
         self.refresh_phi_hints()
         self.tree.delete(*self.tree.get_children())
         self.calc_results=[];self._result_signature=None
@@ -1169,7 +1293,7 @@ class FullTCVNApp:
                 phi,bs,Fs,ts,Fl,Ap,Qmax=(computed[k] for k in ('phi','bs','Fs','ts','Fl','Ap','Qmax'))
                 for value,axis,name in ((Fs,FS_AXIS,'Φs'),(ts,TS_LEVELS,'ts'),(Fl,FL_COLS,'Φl')):
                     if not axis[0]<=value<=axis[-1]:
-                        warnings.append(f'{p_label}: {name}={value:.3f} ngoài miền [{axis[0]}, {axis[-1]}]; tra giá trị biên, cần kiểm tra phạm vi bảng.')
+                        warnings.append(f'{p_label}: {name}={value:.3f} ngoài miền [{axis[0]}, {axis[-1]}]; dùng giá trị người dùng xác minh, cần ghi rõ căn cứ.')
 
                 result_rows.append((
                     idx, p_label.replace("P=", "") + " %", f"{hp_goc:.2f}", f"{cc_val:.2f}",
