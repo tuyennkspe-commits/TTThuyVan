@@ -1,7 +1,5 @@
-"""Bản đồ hành chính với DEM toàn cầu và giao thông/sông ngòi OpenStreetMap.
-Cài thư viện: python -m pip install geopandas rasterio matplotlib numpy pandas pillow scipy
-Lần đầu tải cần Internet; dữ liệu DEM/OSM được lưu đệm ngoài thư mục mã nguồn.
-DEM nền phục vụ thể hiện bản đồ, không thay thế DEM khảo sát cho tính toán thủy văn.
+"""Bản người dùng gửi: thêm chọn vùng DEM nước ngoài, giữ nguyên DEM Việt Nam.
+Thư viện bổ sung: python -m pip install rasterio scipy pillow
 """
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser
@@ -24,9 +22,8 @@ import io
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
+from matplotlib.widgets import RectangleSelector
 import urllib.request
-import urllib.parse
-import hashlib
 import json
 import threading
 import os
@@ -164,6 +161,28 @@ def shaded_terrain(data,transform,source_crs,bounds,target_crs,max_side=1100):
     reproject(source=shade,destination=display,src_transform=grid,src_crs=metric,src_nodata=np.nan,dst_transform=display_grid,dst_crs=target_crs,dst_nodata=np.nan,resampling=Resampling.bilinear)
     return display,display_grid
 
+def foreign_dem_area(bounds,target_crs,vietnam,regions,whole_frame):
+    frame=box(*bounds)
+    if whole_frame:chosen=frame
+    else:
+        if not regions:raise ValueError('Chưa chọn vùng địa hình nước ngoài.')
+        polygons=[]
+        for values in regions:
+            west,south,east,north=map(float,values)
+            if not np.isfinite(values).all() or not -180<=west<east<=180 or not -85<=south<north<=85:
+                raise ValueError('Vùng chọn cần Tây < Đông, Nam < Bắc; tọa độ WGS84 theo độ.')
+            polygons.append(box(west,south,east,north))
+        chosen=gpd.GeoSeries(polygons,crs='EPSG:4326').to_crs(target_crs).union_all().intersection(frame)
+    result=chosen.difference(vietnam)
+    if result.is_empty:raise ValueError('Vùng chọn không có phần ngoài Việt Nam trong khung bản đồ. Hãy chọn lại vùng hoặc tăng lề khung bản đồ.')
+    return result
+
+class DemArtistGroup:
+    def __init__(self,artists):self.artists=[artist for artist in artists if artist is not None]
+    def set_visible(self,value):
+        for artist in self.artists:artist.set_visible(value)
+    def get_visible(self):return any(artist.get_visible() for artist in self.artists)
+
 CRS_DICT = {
     "WGS84 - Độ thập phân (EPSG:4326)": "EPSG:4326",
     "VN-2000 / UTM Múi 48N (EPSG:3405)": "EPSG:3405",
@@ -279,12 +298,12 @@ def find_province_column(gdf, target_prov_name):
     clean_target = remove_accents(target_prov_name)
     core_target = re.sub(r'^(tinh|thanh pho|tp)\s+', '', clean_target).strip()
     all_cols = [c for c in gdf.columns if c.lower() != 'geometry']
-    
+
     prov_keywords = ['ten_tinh', 'tentinh', 'tinh_tp', 'tinh', 'province', 'adm1', 'name_1', 'city', 'pro_name']
     forbidden = ['xa', 'phuong', 'comm', 'adm3', 'name_3', 'huyen', 'quan', 'dist', 'adm2', 'name_2', 'ma_', 'code', 'id', 'stt']
-    
+
     cand_cols = [c for c in all_cols if any(k in c.lower() for k in prov_keywords) and not any(fb in c.lower() for fb in forbidden)]
-    
+
     for c in cand_cols:
         vals = gdf[c].dropna().astype(str).tolist()
         cleaned = [re.sub(r'^(tinh|thanh pho|tp)\s+', '', remove_accents(v)).strip() for v in vals]
@@ -303,7 +322,7 @@ def find_commune_column(gdf):
     all_cols = [c for c in gdf.columns if c.lower() != 'geometry']
     comm_keywords = ['ten_xa', 'tenxa', 'xa', 'phuong', 'comm', 'adm3', 'name_3', 'com_name']
     forbidden = ['ma_', 'code', 'id', 'stt', 'tinh', 'prov', 'huyen', 'dist']
-    
+
     cand_cols = [c for c in all_cols if any(k in c.lower() for k in comm_keywords) and not any(fb in c.lower() for fb in forbidden)]
     for c in cand_cols:
         sample = gdf[c].dropna().astype(str).head(60).tolist()
@@ -334,17 +353,17 @@ def get_line_label_pt_and_angle(line, is_projected=True):
     delta = min(line.length * 0.05, 1000.0 if is_projected else 0.01)
     if delta <= 0:
         return pt.x, pt.y, 0.0
-        
+
     pt_before = line.interpolate(max(0.0, mid_dist - delta))
     pt_after = line.interpolate(min(line.length, mid_dist + delta))
-    
+
     dx = pt_after.x - pt_before.x
     dy = pt_after.y - pt_before.y
-    
+
     if not is_projected:
         lat_rad = math.radians(pt.y)
         dx *= math.cos(lat_rad)
-        
+
     if dx == 0 and dy == 0:
         angle = 0.0
     else:
@@ -353,7 +372,7 @@ def get_line_label_pt_and_angle(line, is_projected=True):
             angle -= 180
         elif angle < -90:
             angle += 180
-            
+
     return pt.x, pt.y, angle
 
 def load_feature_layer_safe(shp_path, target_crs, canvas_box):
@@ -390,90 +409,41 @@ def load_feature_layer_safe(shp_path, target_crs, canvas_box):
 
         search_box = canvas_box.buffer(50.0 if is_meters else 0.005)
         gdf_filtered = gdf[gdf.geometry.intersects(search_box)].copy()
-        
+
         return gdf_filtered if not gdf_filtered.empty else None
     except Exception as e:
         print(f"Lỗi nạp file {shp_path}: {e}")
         return None
 
-VECTOR_ONLINE='Online: OpenStreetMap + lưu đệm'
-VECTOR_LOCAL='Offline: dùng Shapefile'
-ROAD_MAIN='Đường chính'
-ROAD_DETAIL='Thêm đường dân sinh'
-OSM_ENDPOINTS=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter']
-
-def osm_frame(elements):
-    records=[];seen=set()
-    for el in elements:
-        key=(el.get('type'),el.get('id'))
-        if key in seen:continue
-        seen.add(key);geometry=el.get('geometry',[])
-        if len(geometry)<2:continue
+def fetch_osm_online(south, west, north, east, query_tag):
+    query = f"""
+    [out:json][timeout:35];
+    (
+      way{query_tag}({south},{west},{north},{east});
+    );
+    out geom;
+    """
+    servers = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    ]
+    headers = {'User-Agent': 'Vietnam_Atlas_Pro_GIS/41.0 (contact: hydro@project.vn)'}
+    for srv in servers:
         try:
-            coordinates=[(float(pt['lon']),float(pt['lat'])) for pt in geometry]
-            if not np.isfinite(coordinates).all():continue
-            line=LineString(coordinates)
-            if line.is_empty or line.length==0:continue
-        except (KeyError,ValueError,TypeError):continue
-        tags=el.get('tags',{})
-        records.append(dict(osm_id=el.get('id'),name=tags.get('name:vi') or tags.get('name') or tags.get('ref'),ref=tags.get('ref'),highway=tags.get('highway'),waterway=tags.get('waterway'),geometry=line))
-    if not records:return gpd.GeoDataFrame({'geometry':[]},geometry='geometry',crs='EPSG:4326')
-    return gpd.GeoDataFrame(records,geometry='geometry',crs='EPSG:4326')
-
-def osm_query_tile(bounds,kind,detail,cache_dir):
-    west,south,east,north=bounds
-    roads='motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link'
-    if detail==ROAD_DETAIL:roads+='|unclassified|residential|living_street|service|track'
-    query_tag=f'["highway"~"^({roads})$"]' if kind=='roads' else '["waterway"~"^(river|stream|canal|drain|ditch)$"]'
-    key=hashlib.sha256(json.dumps([bounds,query_tag,1],sort_keys=True).encode()).hexdigest()
-    path=os.path.join(cache_dir,'osm',key+'.json')
-    if os.path.isfile(path):
-        try:
-            with open(path,encoding='utf-8') as stream:cached=json.load(stream)
-            if isinstance(cached.get('elements'),list) and not cached.get('remark'):return cached['elements']
-        except (OSError,ValueError,AttributeError):pass
-    query=f'[out:json][timeout:30];way{query_tag}({south},{west},{north},{east});out geom;'
-    failure=''
-    for endpoint in OSM_ENDPOINTS:
-        try:
-            request=urllib.request.Request(endpoint,data=urllib.parse.urlencode({'data':query}).encode(),headers={'User-Agent':'TTThuyVan-AdministrativeMap/1.0','Content-Type':'application/x-www-form-urlencoded'})
-            with urllib.request.urlopen(request,timeout=40) as response:
-                data=response.read(32_000_001)
-            if len(data)>32_000_000:raise ValueError('Dữ liệu OSM quá lớn; hãy chọn Đường chính hoặc thu nhỏ khung bản đồ.')
-            result=json.loads(data.decode('utf-8'))
-            if result.get('remark') or not isinstance(result.get('elements'),list):raise ValueError(result.get('remark','Phản hồi OSM không hợp lệ.'))
-            os.makedirs(os.path.dirname(path),exist_ok=True)
-            temporary=None
-            try:
-                with tempfile.NamedTemporaryFile(dir=os.path.dirname(path),suffix='.tmp',delete=False,mode='w',encoding='utf-8') as stream:
-                    temporary=stream.name;json.dump(result,stream,ensure_ascii=False)
-                os.replace(temporary,path);temporary=None
-            finally:
-                if temporary and os.path.exists(temporary):os.remove(temporary)
-            return result['elements']
-        except Exception as exc:failure=str(exc)
-    raise ValueError('Không lấy được '+('đường giao thông' if kind=='roads' else 'sông ngòi')+' từ OSM: '+failure)
-
-def online_vector_layer(bounds,kind,cache_dir,detail=ROAD_MAIN,progress=None):
-    west,south,east,north=map(float,bounds)
-    if not -180<=west<east<=180 or not -85<=south<north<=85:raise ValueError('Khung OSM ngoài phạm vi hỗ trợ.')
-    nx=min(4,max(1,int(math.ceil((east-west)/.75))));ny=min(4,max(1,int(math.ceil((north-south)/.75))))
-    elements=[];success=0;failed=0;streak=0
-    for iy in range(ny):
-        for ix in range(nx):
-            tile=(west+(east-west)*ix/nx,south+(north-south)*iy/ny,west+(east-west)*(ix+1)/nx,south+(north-south)*(iy+1)/ny)
-            try:elements.extend(osm_query_tile(tile,kind,detail,cache_dir));success+=1;streak=0
-            except Exception:
-                failed+=1;streak+=1
-                if streak>=2:break
-            if progress:progress(f'OSM {"giao thông" if kind=="roads" else "sông ngòi"}: {success+failed}/{nx*ny} ô')
-        if streak>=2:break
-    if not success:raise ValueError('OSM chưa tải được và chưa có dữ liệu lưu đệm cho khung này. Kiểm tra kết nối Internet hoặc dùng Shapefile offline.')
-    missing=nx*ny-success
-    note=f'OSM {kind}: thiếu {missing}/{nx*ny} ô; có thể thiếu đối tượng trên bản đồ.' if missing else ''
-    frame=osm_frame(elements)
-    if not frame.empty:frame=gpd.clip(frame,box(*bounds))
-    return frame,note
+            req = urllib.request.Request(srv, data=query.encode('utf-8'), headers=headers)
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                lines = []
+                for el in data.get('elements', []):
+                    if 'geometry' in el and len(el['geometry']) >= 2:
+                        coords = [(pt['lon'], pt['lat']) for pt in el['geometry']]
+                        lines.append(LineString(coords))
+                if lines:
+                    return gpd.GeoDataFrame({'geometry': lines}, crs="EPSG:4326")
+        except Exception:
+            continue
+    return None
 
 # =========================================================================
 # HOA GIÓ LA BÀN NHỎ GỌN, MÀU ĐEN (COMPASS ROSE COMPACT BLACK)
@@ -487,18 +457,18 @@ class DraggableNorthArrow:
         self.dy = dy
         self.scale = 1.0
         self.angle = 0.0
-        
+
         self.r = 0.015 * max(dx, dy)
-        
+
         self.n_dark = Polygon([[self.x, self.y + self.r * 1.3], [self.x, self.y], [self.x - self.r * 0.2, self.y]], closed=True, facecolor='#0f172a', edgecolor='#0f172a', zorder=12)
         self.n_light = Polygon([[self.x, self.y + self.r * 1.3], [self.x, self.y], [self.x + self.r * 0.2, self.y]], closed=True, facecolor='#cbd5e1', edgecolor='#0f172a', zorder=12)
-        
+
         self.s_dark = Polygon([[self.x, self.y - self.r * 1.3], [self.x, self.y], [self.x + self.r * 0.2, self.y]], closed=True, facecolor='#0f172a', edgecolor='#0f172a', zorder=12)
         self.s_light = Polygon([[self.x, self.y - self.r * 1.3], [self.x, self.y], [self.x - self.r * 0.2, self.y]], closed=True, facecolor='#cbd5e1', edgecolor='#0f172a', zorder=12)
-        
+
         self.e_dark = Polygon([[self.x + self.r * 1.3, self.y], [self.x, self.y], [self.x, self.y + self.r * 0.2]], closed=True, facecolor='#cbd5e1', edgecolor='#0f172a', zorder=12)
         self.e_light = Polygon([[self.x + self.r * 1.3, self.y], [self.x, self.y], [self.x, self.y - self.r * 0.2]], closed=True, facecolor='#0f172a', edgecolor='#0f172a', zorder=12)
-        
+
         self.w_dark = Polygon([[self.x - self.r * 1.3, self.y], [self.x, self.y], [self.x, self.y - self.r * 0.2]], closed=True, facecolor='#cbd5e1', edgecolor='#0f172a', zorder=12)
         self.w_light = Polygon([[self.x - self.r * 1.3, self.y], [self.x, self.y], [self.x, self.y + self.r * 0.2]], closed=True, facecolor='#0f172a', edgecolor='#0f172a', zorder=12)
 
@@ -601,12 +571,12 @@ class DraggableScaleBar:
         self.half_km = half_km
         self.bar_total_km = bar_total_km
         self.bar_h = 0.009 * dy
-        
+
         self.rect1 = mpatches.Rectangle((self.x, self.y), half_len, self.bar_h, facecolor='#0f172a', edgecolor='#0f172a', zorder=10)
         self.rect2 = mpatches.Rectangle((self.x + half_len, self.y), half_len, self.bar_h, facecolor='white', edgecolor='#0f172a', zorder=10)
         ax.add_patch(self.rect1)
         ax.add_patch(self.rect2)
-        
+
         lbl_y = self.y + self.bar_h * 1.5
         self.t0 = ax.text(self.x, lbl_y, '0', ha='center', va='bottom', fontsize=8, fontfamily='serif', fontweight='bold', color='#0f172a', zorder=10)
         self.t1 = ax.text(self.x + half_len, lbl_y, f'{int(half_km)}', ha='center', va='bottom', fontsize=8, fontfamily='serif', fontweight='bold', color='#0f172a', zorder=10)
@@ -717,7 +687,7 @@ class MapEditorWindow(tk.Toplevel):
         # 1. BẬT TẮT LỚP
         toggle_box = ttk.LabelFrame(panel, text="1. Bật / Tắt Lớp Hiển Thị", padding=5)
         toggle_box.pack(fill=tk.X, pady=(0, 4))
-        
+
         ttk.Checkbutton(toggle_box, text="Hiển thị bóng đổ địa hình DEM", variable=self.show_dem_var, command=self.toggle_dem).pack(anchor="w")
         ttk.Checkbutton(toggle_box, text="Hiển thị tên Xã / Phường", variable=self.show_commune_labels_var, command=self.toggle_commune_labels).pack(anchor="w", pady=(1, 0))
         ttk.Checkbutton(toggle_box, text="Hiển thị tên Sông ngòi & Hồ", variable=self.show_river_labels_var, command=self.toggle_river_labels).pack(anchor="w", pady=(1, 0))
@@ -756,7 +726,7 @@ class MapEditorWindow(tk.Toplevel):
         ttk.Label(rot_row, text="Góc xoay:").pack(side=tk.LEFT)
         self.lbl_angle = ttk.Label(rot_row, text="0.0°", foreground="blue")
         self.lbl_angle.pack(side=tk.LEFT, padx=(5, 0))
-        
+
         self.scale_angle = ttk.Scale(text_box, from_=-90, to=90, orient=tk.HORIZONTAL, command=self.on_angle_change)
         self.scale_angle.pack(fill=tk.X, pady=(1, 3))
 
@@ -1080,25 +1050,27 @@ class MainMapApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Phần Mềm Lập Bản Đồ Hành Chính")
-        self.root.geometry(f"860x{min(940,max(680,self.root.winfo_screenheight()-90))}")
-        self.root.resizable(True, True)
+        self.root.geometry("820x810")
+        self.root.resizable(False, False)
 
-        base_dir = r"D:\Phanmem_TTthuyvan\XDungBando"
-        
+        base_dir = r"D:\TTthuyvan\XDungBando"
+
         self.shp_communes = tk.StringVar(value=os.path.join(base_dir, "VietNam_phuong-xa.shp"))
         self.shp_provinces = tk.StringVar(value=os.path.join(base_dir, "VietNam-34Tinh.shp"))
         self.shp_roads = tk.StringVar(value=os.path.join(base_dir, "GIAOTHONG.shp"))
         self.shp_rivers = tk.StringVar(value=os.path.join(base_dir, "Song_VN.shp"))
         self.shp_lakes = tk.StringVar(value="")
-        self.dem_path = tk.StringVar(value=os.path.join(base_dir, "VietNam_DEM_SRTMGL1_30m_v3_USGS.tiff"))
+        self.dem_path = tk.StringVar(value=os.path.join(base_dir, "VietNam_DEM_SRTMGL1_30m_v3_USGS.tif"))
 
         self.province_name = tk.StringVar(value="Hồ Chí Minh")
-        
-        self.vector_source = tk.StringVar(value=VECTOR_ONLINE)
-        self.road_detail = tk.StringVar(value=ROAD_MAIN)
+
+        self.foreign_dem_enabled=tk.BooleanVar(value=False)
+        self.foreign_dem_whole=True
+        self.foreign_dem_regions=[]
+        self.foreign_dem_source=DEM_GLOBAL
+        self.foreign_dem_path=''
+        self.foreign_dem_cache=terrain_cache_dir()
         self.use_dem = tk.BooleanVar(value=True)
-        self.dem_source = tk.StringVar(value=DEM_GLOBAL)
-        self.dem_cache = tk.StringVar(value=terrain_cache_dir())
         self.crs_choice = tk.StringVar(value="WGS84 - Độ thập phân (EPSG:4326)")
         self.show_grid = tk.BooleanVar(value=True)
         self.grid_style = tk.StringVar(value="Nét chấm (:)")
@@ -1117,11 +1089,8 @@ class MainMapApp:
         tab_main = ttk.Frame(notebook, padding="15")
         notebook.add(tab_main, text="1. Nguồn Dữ Liệu & Hệ Tọa Độ (CRS)")
 
-        sources=ttk.Frame(tab_main);sources.grid(row=0,column=0,columnspan=3,sticky='w',pady=(0,7))
-        ttk.Label(sources,text='Đường giao thông, sông:').pack(side='left')
-        ttk.Combobox(sources,textvariable=self.vector_source,values=[VECTOR_ONLINE,VECTOR_LOCAL],state='readonly',width=32).pack(side='left',padx=5)
-        ttk.Combobox(sources,textvariable=self.road_detail,values=[ROAD_MAIN,ROAD_DETAIL],state='readonly',width=22).pack(side='left')
-        
+        ttk.Label(tab_main, text="Đường dẫn các lớp dữ liệu Shapefile (Ưu tiên nạp Offline):", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 5), columnspan=3)
+
         ttk.Label(tab_main, text="Ranh giới Xã / Phường (VietNam_phuong-xa.shp):").grid(row=1, column=0, sticky="w")
         ttk.Entry(tab_main, textvariable=self.shp_communes, width=50).grid(row=1, column=1, sticky="w", padx=5, pady=2)
         ttk.Button(tab_main, text="Duyệt Xã...", command=lambda: self.browse_file(self.shp_communes, "*.shp")).grid(row=1, column=2)
@@ -1142,22 +1111,21 @@ class MainMapApp:
         ttk.Entry(tab_main, textvariable=self.shp_lakes, width=50).grid(row=5, column=1, sticky="w", padx=5, pady=2)
         ttk.Button(tab_main, text="Duyệt Hồ...", command=lambda: self.browse_file(self.shp_lakes, "*.shp")).grid(row=5, column=2)
 
-        ttk.Label(tab_main,text='Nguồn địa hình DEM:').grid(row=6,column=0,sticky='nw',pady=4)
-        dem_box=ttk.Frame(tab_main);dem_box.grid(row=6,column=1,sticky='w',padx=5,pady=3)
-        ttk.Combobox(dem_box,textvariable=self.dem_source,values=[DEM_GLOBAL,DEM_LOCAL],state='readonly',width=48).pack(anchor='w')
-        ttk.Entry(dem_box,textvariable=self.dem_path,width=50).pack(anchor='w',pady=3)
-        ttk.Label(dem_box,text='Toàn cầu: phủ cả nước lân cận, tự lưu để dùng lại.\nOffline: chọn GeoTIFF có phạm vi phủ mong muốn.',font=('Arial',8)).pack(anchor='w')
-        dem_buttons=ttk.Frame(tab_main);dem_buttons.grid(row=6,column=2,sticky='n')
-        ttk.Button(dem_buttons,text='Duyệt DEM…',command=lambda:self.browse_file(self.dem_path,'*.tif;*.tiff')).pack(fill='x')
-        ttk.Button(dem_buttons,text='Thư mục lưu DEM…',command=self.choose_dem_cache).pack(fill='x',pady=3)
+        ttk.Label(tab_main, text="Mô hình địa hình số DEM (.tif):").grid(row=6, column=0, sticky="w")
+        ttk.Entry(tab_main, textvariable=self.dem_path, width=50).grid(row=6, column=1, sticky="w", padx=5, pady=2)
+        ttk.Button(tab_main, text="Duyệt DEM...", command=lambda: self.browse_file(self.dem_path, "*.tif;*.tiff")).grid(row=6, column=2)
 
-        ttk.Checkbutton(tab_main, text="Kích hoạt đổ bóng DEM", variable=self.use_dem).grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 10))
+        dem_options=ttk.Frame(tab_main);dem_options.grid(row=7,column=0,columnspan=3,sticky='w',pady=(4,10))
+        ttk.Checkbutton(dem_options,text='Kích hoạt đổ bóng DEM',variable=self.use_dem).pack(side='left')
+        ttk.Button(dem_options,text='Chọn vùng địa hình nước ngoài…',command=self.choose_foreign_dem).pack(side='left',padx=12)
+        self.foreign_dem_status=ttk.Label(dem_options,text='Chưa bật địa hình nước ngoài')
+        self.foreign_dem_status.pack(side='left')
 
         ttk.Separator(tab_main, orient=tk.HORIZONTAL).grid(row=8, column=0, columnspan=3, sticky="ew", pady=8)
 
         ttk.Label(tab_main, text="Cấu hình Tỉnh thành (34 Đơn vị Hành chính Mới):", font=("Arial", 10, "bold")).grid(row=9, column=0, sticky="w", pady=(0, 5), columnspan=3)
         ttk.Label(tab_main, text="Tên Tỉnh / Thành phố:").grid(row=10, column=0, sticky="w")
-        
+
         sorted_34_names = [v['name'] for v in sorted(PROVINCES_META_34.values(), key=lambda x: remove_accents(x['name']))]
         self.cbo_province = ttk.Combobox(tab_main, textvariable=self.province_name, width=32, font=("Arial", 10))
         self.cbo_province['values'] = sorted_34_names
@@ -1215,9 +1183,112 @@ class MainMapApp:
         f = filedialog.asksaveasfilename(title="Lưu bản đồ", defaultextension=".png", filetypes=[("Ảnh PNG nét cao 300 DPI", "*.png")])
         if f: self.output_image.set(os.path.normpath(f))
 
-    def choose_dem_cache(self):
-        folder=filedialog.askdirectory(title='Thư mục lưu đệm DEM toàn cầu',initialdir=self.dem_cache.get() if os.path.isdir(self.dem_cache.get()) else os.path.expanduser('~'))
-        if folder:self.dem_cache.set(folder)
+    def choose_foreign_dem(self):
+        existing=getattr(self,'foreign_dem_window',None)
+        if existing is not None and existing.winfo_exists():existing.lift();return
+        window=tk.Toplevel(self.root);self.foreign_dem_window=window
+        window.title('Chọn vùng địa hình ngoài Việt Nam');window.geometry('1060x820');window.minsize(850,680)
+        enabled=tk.BooleanVar(window,value=self.foreign_dem_enabled.get())
+        whole=tk.BooleanVar(window,value=self.foreign_dem_whole)
+        source=tk.StringVar(window,value=self.foreign_dem_source)
+        path=tk.StringVar(window,value=self.foreign_dem_path)
+        cache=tk.StringVar(window,value=self.foreign_dem_cache)
+        regions=[list(values) for values in self.foreign_dem_regions]
+        top=ttk.Frame(window,padding=8);top.pack(fill='x')
+        ttk.Checkbutton(top,text='Bổ sung địa hình ngoài Việt Nam',variable=enabled).grid(row=0,column=0,sticky='w')
+        ttk.Checkbutton(top,text='Toàn bộ phần ngoài Việt Nam trong khung bản đồ',variable=whole).grid(row=0,column=1,sticky='w')
+        ttk.Label(top,text='Nguồn DEM:').grid(row=1,column=0,sticky='w')
+        ttk.Combobox(top,textvariable=source,values=[DEM_GLOBAL,DEM_LOCAL],state='readonly',width=36).grid(row=1,column=1,sticky='w')
+        ttk.Entry(top,textvariable=path,width=50).grid(row=2,column=0,columnspan=2,sticky='ew',pady=3)
+        def browse():
+            value=filedialog.askopenfilename(parent=window,title='Chọn DEM phủ vùng nước ngoài',filetypes=[('GeoTIFF','*.tif *.tiff')])
+            if value:path.set(value);source.set(DEM_LOCAL)
+        ttk.Button(top,text='Chọn GeoTIFF…',command=browse).grid(row=2,column=2,padx=5)
+        def cache_folder():
+            value=filedialog.askdirectory(parent=window,title='Thư mục lưu DEM đã tải')
+            if value:cache.set(value)
+        ttk.Button(top,text='Thư mục lưu DEM…',command=cache_folder).grid(row=1,column=2,padx=5)
+        fig=Figure(figsize=(9,3.5),dpi=100);ax=fig.add_subplot(111)
+        canvas=FigureCanvasTkAgg(fig,master=window);canvas.get_tk_widget().pack(fill='both',expand=True,padx=8)
+        tools=ttk.Frame(window);tools.pack(fill='x',padx=8)
+        NavigationToolbar2Tk(canvas,tools).update()
+        ax.set(xlim=(97,112),ylim=(8,25),xlabel='Kinh độ WGS84 (°)',ylabel='Vĩ độ WGS84 (°)')
+        ax.set_title('Kéo khung để chọn vùng; có thể nhập tọa độ bên dưới',fontsize=10);ax.grid(alpha=.3)
+        controls=ttk.Frame(window,padding=8);controls.pack(fill='x')
+        fields=[]
+        for column,(label,value) in enumerate([('Tây (kinh độ)',''),('Nam (vĩ độ)',''),('Đông (kinh độ)',''),('Bắc (vĩ độ)','')]):
+            ttk.Label(controls,text=label).grid(row=0,column=column,padx=4)
+            entry=ttk.Entry(controls,width=14);entry.grid(row=1,column=column,padx=4);fields.append(entry)
+        def drawn(start,end):
+            if any(value is None for value in [start.xdata,start.ydata,end.xdata,end.ydata]):return
+            values=[min(start.xdata,end.xdata),min(start.ydata,end.ydata),max(start.xdata,end.xdata),max(start.ydata,end.ydata)]
+            for entry,value in zip(fields,values):entry.delete(0,'end');entry.insert(0,f'{value:.6f}')
+            whole.set(False)
+        selector=RectangleSelector(ax,drawn,useblit=True,button=[1],minspanx=.00001,minspany=.00001,spancoords='data',interactive=True)
+        window._foreign_selector=selector
+        drawing=tk.BooleanVar(window,value=True)
+        ttk.Checkbutton(controls,text='Vẽ vùng chọn bằng chuột',variable=drawing,command=lambda:selector.set_active(drawing.get())).grid(row=0,column=4,padx=5)
+        table=ttk.Treeview(window,columns=('west','south','east','north'),show='headings',height=3)
+        for key,label in zip(table['columns'],['Tây','Nam','Đông','Bắc']):table.heading(key,text=label);table.column(key,width=160)
+        table.pack(fill='x',padx=8)
+        patches=[]
+        def refresh():
+            table.delete(*table.get_children())
+            for artist in patches:artist.remove()
+            patches.clear()
+            for index,values in enumerate(regions):
+                table.insert('', 'end',iid=str(index),values=[f'{value:.6f}' for value in values])
+                west,south,east,north=values
+                rectangle=mpatches.Rectangle((west,south),east-west,north-south,fill=False,color='#d97706',linewidth=1.5)
+                ax.add_patch(rectangle);patches.append(rectangle)
+            canvas.draw_idle()
+        def add():
+            try:
+                values=[float(entry.get().strip().replace(',','.')) for entry in fields]
+                foreign_dem_area(values,'EPSG:4326',ShapelyPolygon(),[values],False)
+                regions.append(values);whole.set(False);refresh()
+            except Exception as error:messagebox.showerror('Vùng chọn',str(error),parent=window)
+        def remove():
+            for index in sorted([int(item) for item in table.selection()],reverse=True):regions.pop(index)
+            refresh()
+        ttk.Button(controls,text='Thêm vùng',command=add).grid(row=1,column=4,padx=5)
+        ttk.Button(controls,text='Xóa vùng đang chọn',command=remove).grid(row=1,column=5,padx=5)
+        def province_frame():
+            try:
+                name=self.province_name.get().strip();key=find_best_province_key(name)
+                file=self.shp_provinces.get().strip()
+                if not os.path.isfile(file):raise ValueError('Chọn file ranh giới tỉnh để nạp bản đồ nền; hoặc nhập tọa độ vùng trực tiếp.')
+                provinces=gpd.read_file(file)
+                if provinces.crs is None:raise ValueError('SHP tỉnh thiếu CRS. Cần có tệp .prj hoặc nhập tọa độ vùng trực tiếp.')
+                provinces=provinces.to_crs('EPSG:4326');column=find_province_column(provinces,key)
+                if column is None:raise ValueError('Không tìm thấy cột tên tỉnh.')
+                selected=provinces[provinces[column].fillna('').astype(str).map(lambda value:key in remove_accents(value))]
+                if selected.empty:raise ValueError('Không tìm thấy tỉnh đang chọn trong SHP.')
+                west,south,east,north=selected.total_bounds;pad=max(east-west,north-south)*max(.1,self.zoom_margin.get()/100)
+                area=box(west-pad,south-pad,east+pad,north+pad)
+                gpd.clip(provinces,area).plot(ax=ax,facecolor='#e2e8f0',edgecolor='#64748b',linewidth=.6,zorder=1)
+                selected.boundary.plot(ax=ax,color='#dc2626',linewidth=1.2,zorder=2)
+                ax.set_xlim(west-pad,east+pad);ax.set_ylim(south-pad,north+pad)
+                ax.set_aspect(1/math.cos(math.radians((south+north)/2)))
+                selector.update_background(None);canvas.draw_idle()
+            except Exception as error:messagebox.showwarning('Bản đồ nền',str(error),parent=window)
+        ttk.Button(controls,text='Nạp khung tỉnh đang chọn',command=province_frame).grid(row=0,column=5,padx=5)
+        ttk.Label(window,text='Đỏ: ranh giới tỉnh; cam: các vùng đã thêm. Mỗi vùng được cắt bỏ phần Việt Nam khi vẽ DEM. Vùng chọn không làm thay đổi khung xuất bản đồ; tăng lề khung nếu cần thấy xa hơn. Lần đầu tải DEM toàn cầu cần Internet.',wraplength=1000).pack(fill='x',padx=10,pady=5)
+        def save():
+            if enabled.get() and not whole.get() and not regions:
+                messagebox.showwarning('Vùng chọn','Bấm Thêm vùng sau khi kéo khung hoặc nhập tọa độ.',parent=window);return
+            if enabled.get() and source.get()==DEM_LOCAL and not os.path.isfile(path.get()):
+                messagebox.showwarning('Nguồn DEM','Chọn GeoTIFF có địa hình nước ngoài.',parent=window);return
+            self.foreign_dem_enabled.set(enabled.get());self.foreign_dem_whole=whole.get();self.foreign_dem_regions=regions
+            self.foreign_dem_source=source.get();self.foreign_dem_path=path.get();self.foreign_dem_cache=cache.get()
+            if enabled.get():self.use_dem.set(True)
+            self.foreign_dem_status.configure(text=('Ngoài VN: toàn khung' if whole.get() else f'Ngoài VN: {len(regions)} vùng') if enabled.get() else 'Chưa bật địa hình nước ngoài')
+            window.destroy()
+        footer=ttk.Frame(window,padding=8);footer.pack(fill='x')
+        ttk.Button(footer,text='Áp dụng',command=save).pack(side='right',padx=5)
+        ttk.Button(footer,text='Hủy',command=window.destroy).pack(side='right')
+        window._foreign_controls=dict(entries=fields,add=add,save=save,regions=regions,whole=whole,enabled=enabled,source=source,path=path,tree=table,province_frame=province_frame)
+        refresh()
 
     def update_status(self, text, color="blue"):
         self.root.after(0, lambda: self.lbl_status.config(text=f"Trạng thái: {text}", foreground=color))
@@ -1233,8 +1304,7 @@ class MainMapApp:
             messagebox.showerror("Thiếu file", "Không tìm thấy file ranh giới hành chính!")
             return
 
-        self._dem_request=dict(mode=self.dem_source.get(),path=self.dem_path.get().strip(),cache=self.dem_cache.get())
-        self._vector_request=dict(mode=self.vector_source.get(),detail=self.road_detail.get())
+        self._foreign_dem_request=dict(enabled=self.foreign_dem_enabled.get(),whole=self.foreign_dem_whole,regions=[list(region) for region in self.foreign_dem_regions],source=self.foreign_dem_source,path=self.foreign_dem_path,cache=self.foreign_dem_cache)
         self.btn_run.config(state=tk.DISABLED)
         threading.Thread(target=self.run_generation, args=(prov, out_f)).start()
 
@@ -1329,7 +1399,7 @@ class MainMapApp:
 
             center_geom = core_geom.centroid
             center_x, center_y = center_geom.x, center_geom.y
-            
+
             minx, miny, maxx, maxy = core_geom.bounds
             span_x = maxx - minx
             span_y = maxy - miny
@@ -1392,28 +1462,27 @@ class MainMapApp:
 
             # NẠP SÔNG NGÒI, HỒ NƯỚC & GIAO THÔNG
             self.update_status("Đang kết xuất mạng lưới Sông ngòi, Hồ nước và Giao thông...", "orange")
-            vector_notices=[]
-            vector_request=getattr(self,'_vector_request',dict(mode=VECTOR_ONLINE,detail=ROAD_MAIN))
-            cache=getattr(self,'_dem_request',dict(cache=terrain_cache_dir()))['cache']
-            osm_used=False
-            def network_layer(kind,path):
-                nonlocal osm_used
-                if vector_request['mode']==VECTOR_LOCAL:return load_feature_layer_safe(path,target_crs,canvas_box)
-                try:
-                    layer,note=online_vector_layer(canvas_box_w,kind,cache,vector_request['detail'],lambda text:self.update_status(text,'orange'))
-                    osm_used=True
-                    if note:vector_notices.append(note)
-                    return gpd.clip(layer.to_crs(target_crs),canvas_box) if not layer.empty else layer.to_crs(target_crs)
-                except Exception as error:
-                    layer=load_feature_layer_safe(path,target_crs,canvas_box)
-                    vector_notices.append(str(error)+(' Đang dùng lớp offline, có thể thiếu phần nước ngoài.' if layer is not None and not layer.empty else ' Chưa có lớp thay thế.'))
-                    return layer
-            gdf_roads=network_layer('roads',self.shp_roads.get().strip())
-            gdf_rivers=network_layer('rivers',self.shp_rivers.get().strip())
-            gdf_lakes=load_feature_layer_safe(self.shp_lakes.get().strip(),target_crs,canvas_box)
+            gdf_rivers = load_feature_layer_safe(self.shp_rivers.get().strip(), target_crs, canvas_box)
+            gdf_lakes = load_feature_layer_safe(self.shp_lakes.get().strip(), target_crs, canvas_box)
+            gdf_roads = load_feature_layer_safe(self.shp_roads.get().strip(), target_crs, canvas_box)
+
             if gdf_lakes is not None and not gdf_lakes.empty:
-                if gdf_rivers is not None and not gdf_rivers.empty:gdf_rivers=gpd.GeoDataFrame(pd.concat([gdf_rivers,gdf_lakes],ignore_index=True),crs=target_crs)
-                else:gdf_rivers=gdf_lakes
+                if gdf_rivers is not None and not gdf_rivers.empty:
+                    gdf_rivers = gpd.GeoDataFrame(pd.concat([gdf_rivers, gdf_lakes], ignore_index=True), crs=target_crs)
+                else:
+                    gdf_rivers = gdf_lakes
+
+            if gdf_rivers is None or gdf_rivers.empty:
+                gdf_rivers = fetch_osm_online(c_miny_w, c_minx_w, c_maxy_w, c_maxx_w, '["waterway"~"^(river|canal)$"]')
+                if gdf_rivers is not None and not gdf_rivers.empty:
+                    gdf_rivers = gdf_rivers.to_crs(target_crs)
+                    gdf_rivers = gdf_rivers[gdf_rivers.geometry.intersects(canvas_box)].copy()
+
+            if gdf_roads is None or gdf_roads.empty:
+                gdf_roads = fetch_osm_online(c_miny_w, c_minx_w, c_maxy_w, c_maxx_w, '["highway"~"^(motorway|trunk|primary)$"]')
+                if gdf_roads is not None and not gdf_roads.empty:
+                    gdf_roads = gdf_roads.to_crs(target_crs)
+                    gdf_roads = gdf_roads[gdf_roads.geometry.intersects(canvas_box)].copy()
 
             # KHỞI TẠO ĐỒ HỌA (DÙNG DPI=100 ĐỂ XEM TRƯỚC VỪA VẶN MÀN HÌNH)
             fig = Figure(figsize=(plot_w, plot_h), dpi=100)
@@ -1466,33 +1535,108 @@ class MainMapApp:
                 for _, row in gdf_neighbors.iterrows():
                     gpd.GeoSeries([row.geometry]).plot(ax=ax, color='#f8fafc', edgecolor='none', zorder=2)
 
-            # 4. Elevation covers the map frame, including neighbouring countries.
-            dem_artist=None;dem_notice='';dem_credit=''
-            if self.use_dem.get():
-                if not HAS_RASTERIO:
-                    dem_notice='Chưa có rasterio nên chưa vẽ được DEM. Cài: python -m pip install rasterio scipy pillow'
-                else:
-                    request=getattr(self,'_dem_request',dict(mode=DEM_GLOBAL,path='',cache=terrain_cache_dir()))
-                    try:
-                        if request['mode']==DEM_GLOBAL:
+            # 4. KẾT XUẤT DEM
+            dem_artist = None
+            if self.use_dem.get() and HAS_RASTERIO and os.path.exists(self.dem_path.get()):
+                self.update_status("Đang trích xuất địa hình DEM...", "orange")
+                try:
+                    with rasterio.open(self.dem_path.get()) as dem_src:
+                        dem_crs = dem_src.crs if dem_src.crs else "EPSG:4326"
+                        canvas_box_dem = gpd.GeoSeries([canvas_box], crs=target_crs).to_crs(dem_crs).iloc[0]
+                        b_dem = canvas_box_dem.bounds
+
+                        win = from_bounds(b_dem[0], b_dem[1], b_dem[2], b_dem[3], transform=dem_src.transform)
+                        c_off = max(0, int(math.floor(win.col_off)))
+                        r_off = max(0, int(math.floor(win.row_off)))
+                        c_max = min(dem_src.width, int(math.ceil(win.col_off + win.width)))
+                        r_max = min(dem_src.height, int(math.ceil(win.row_off + win.height)))
+                        w_win = c_max - c_off
+                        h_win = r_max - r_off
+
+                        if w_win > 0 and h_win > 0:
+                            safe_win = rasterio.windows.Window(c_off, r_off, w_win, h_win)
+                            scale_down = max(1.0, max(w_win, h_win) / 900.0)
+                            out_w = max(10, int(round(w_win / scale_down)))
+                            out_h = max(10, int(round(h_win / scale_down)))
+
+                            dem_chip = dem_src.read(
+                                1, window=safe_win, out_shape=(out_h, out_w),
+                                resampling=Resampling.bilinear, boundless=True, fill_value=dem_src.nodata or -9999.0
+                            ).astype(np.float32)
+
+                            win_bounds = rasterio.windows.bounds(safe_win, dem_src.transform)
+                            chip_transform = rasterio.transform.from_bounds(
+                                win_bounds[0], win_bounds[1], win_bounds[2], win_bounds[3], out_w, out_h
+                            )
+
+                            valid_mask = (dem_chip > -9000.0)
+                            filled_dem = dem_chip.copy()
+                            filled_dem[~valid_mask] = 0.0
+
+                            ls = LightSource(azdeg=315, altdeg=45)
+                            shaded = ls.hillshade(filled_dem, vert_exag=1.8).astype(np.float32)
+                            shaded[~valid_mask] = np.nan
+
+                            if str(target_crs).lower() != str(dem_crs).lower():
+                                dest_transform, dest_width, dest_height = calculate_default_transform(
+                                    dem_crs, target_crs, out_w, out_h,
+                                    *rasterio.transform.array_bounds(out_h, out_w, chip_transform)
+                                )
+                                reprojected_shade = np.full((dest_height, dest_width), np.nan, dtype=np.float32)
+                                reproject(
+                                    source=shaded, destination=reprojected_shade,
+                                    src_transform=chip_transform, src_crs=dem_crs,
+                                    dst_transform=dest_transform, dst_crs=target_crs,
+                                    resampling=Resampling.bilinear
+                                )
+                                r_bounds = rasterio.transform.array_bounds(dest_height, dest_width, dest_transform)
+                                final_shade = reprojected_shade
+                                final_transform = dest_transform
+                            else:
+                                r_bounds = rasterio.transform.array_bounds(out_h, out_w, chip_transform)
+                                final_shade = shaded
+                                final_transform = chip_transform
+
                             try:
-                                data,tr,src_crs,dem_credit,dem_notice=global_terrain(canvas_box_w,request['cache'],lambda text:self.update_status(text,'orange'))
-                            except Exception as online_error:
-                                if not os.path.isfile(request['path']):raise online_error
-                                data,tr,src_crs,dem_credit,_=local_terrain(request['path'],canvas_box.bounds,target_crs)
-                                dem_notice='DEM toàn cầu không tải được; đang dùng DEM offline, có thể thiếu địa hình ngoài Việt Nam. '+str(online_error)
-                        else:
-                            data,tr,src_crs,dem_credit,dem_notice=local_terrain(request['path'],canvas_box.bounds,target_crs)
-                        final_shade,final_transform=shaded_terrain(data,tr,src_crs,canvas_box.bounds,target_crs)
-                        # Do not use the original heuristic foreign/sea polygons to clip
-                        # terrain: an outside-Vietnam polygon may contain foreign land.
-                        dem_artist=ax.imshow(final_shade,extent=[c_minx,c_maxx,c_miny,c_maxy],origin='upper',cmap='gray',alpha=.28,zorder=3)
-                    except Exception as error:
-                        dem_notice='Chưa vẽ được địa hình DEM: '+str(error)
-            credits=[]
-            if dem_artist is not None and 'Terrain Tiles' in dem_credit:credits.append('Địa hình: '+dem_credit)
-            if osm_used:credits.append('Giao thông, sông: © OpenStreetMap contributors (ODbL)')
-            if credits:fig.text(.01,.005,' | '.join(credits),fontsize=5.5,color='#64748b')
+                                from rasterio.features import geometry_mask
+                                vn_clipped = all_vn_land.intersection(canvas_box)
+                                poly_geom = [vn_clipped] if vn_clipped.geom_type in ['Polygon', 'MultiPolygon'] else [
+                                    g for g in getattr(vn_clipped, 'geoms', []) if g.geom_type in ['Polygon', 'MultiPolygon']
+                                ]
+                                if poly_geom:
+                                    in_vn_mask = geometry_mask(poly_geom, out_shape=final_shade.shape, transform=final_transform, invert=True)
+                                    final_shade[~in_vn_mask] = np.nan
+                            except Exception:
+                                pass
+
+                            dem_artist = ax.imshow(
+                                final_shade, extent=[r_bounds[0], r_bounds[2], r_bounds[1], r_bounds[3]],
+                                origin='upper', cmap='gray', alpha=0.28, zorder=3
+                            )
+                except Exception as e_dem:
+                    print(f"Bỏ qua DEM: {e_dem}")
+
+            # Additional foreign terrain is independent from the original Vietnamese DEM.
+            foreign_notice=''
+            settings=getattr(self,'_foreign_dem_request',dict(enabled=False))
+            if self.use_dem.get() and settings['enabled']:
+                try:
+                    if not HAS_RASTERIO:raise ValueError('Cần cài rasterio để xử lý DEM.')
+                    area=foreign_dem_area(canvas_box.bounds,target_crs,all_vn_land,settings['regions'],settings['whole'])
+                    if settings['source']==DEM_GLOBAL:
+                        geographic=gpd.GeoSeries([area],crs=target_crs).to_crs('EPSG:4326').total_bounds
+                        data,transform,source_crs,credit,foreign_notice=global_terrain(geographic,settings['cache'],lambda text:self.update_status(text,'orange'))
+                    else:
+                        data,transform,source_crs,credit,foreign_notice=local_terrain(settings['path'],area.bounds,target_crs)
+                    shade,grid=shaded_terrain(data,transform,source_crs,canvas_box.bounds,target_crs)
+                    from rasterio.features import geometry_mask
+                    selected=geometry_mask([area.__geo_interface__],out_shape=shade.shape,transform=grid,invert=True)
+                    shade[~selected]=np.nan
+                    if not np.isfinite(shade).any():raise ValueError('DEM không phủ vùng nước ngoài đã chọn.')
+                    foreign_artist=ax.imshow(shade,extent=[c_minx,c_maxx,c_miny,c_maxy],origin='upper',cmap='gray',alpha=.28,zorder=3)
+                    dem_artist=DemArtistGroup([dem_artist,foreign_artist])
+                    if settings['source']==DEM_GLOBAL:fig.text(.01,.005,'Địa hình ngoài VN: '+credit,fontsize=5.5,color='#64748b')
+                except Exception as error:foreign_notice='Không bổ sung được DEM nước ngoài: '+str(error)
 
             # 5. VẼ CÁC XÃ / PHƯỜNG TRONG TỈNH
             self.update_status("Đang vẽ ranh giới từng xã / phường...", "orange")
@@ -1587,7 +1731,7 @@ class MainMapApp:
                     if not visible_geom.is_empty:
                         pt = safe_polylabel(visible_geom)
                         nb_name = str(row[nb_col]).replace("Tỉnh ", "").replace("Thành phố ", "TP. ").upper()
-                        
+
                         vis_ratio = visible_geom.area / (dx * dy)
                         if vis_ratio < 0.02: nb_fsize = 7.5
                         elif vis_ratio < 0.05: nb_fsize = 8.5
@@ -1595,7 +1739,7 @@ class MainMapApp:
                         else: nb_fsize = 10.5
 
                         t_nb = ax.annotate(
-                            text=f"TỈNH {nb_name}" if "TP." not in nb_name else nb_name, 
+                            text=f"TỈNH {nb_name}" if "TP." not in nb_name else nb_name,
                             xy=(pt.x, pt.y), ha='center', va='center', rotation=0.0,
                             fontsize=nb_fsize, fontweight='bold', fontfamily='serif', color='#334155',
                             zorder=9, clip_on=True, path_effects=[pe.withStroke(linewidth=2.4, foreground="white")]
@@ -1710,7 +1854,7 @@ class MainMapApp:
                 f_size = 5.8 if rel_area < 0.005 else (6.5 if rel_area < 0.02 else (7.5 if rel_area > 0.08 else 6.8))
 
                 txt = ax.text(
-                    center_pt.x, center_pt.y, clean_name, ha='center', va='center', 
+                    center_pt.x, center_pt.y, clean_name, ha='center', va='center',
                     rotation=0.0,
                     fontsize=f_size, fontweight='bold', fontfamily='serif', color='#0f172a',
                     zorder=10, clip_on=True, path_effects=[pe.withStroke(linewidth=1.8, foreground="white")]
@@ -1758,13 +1902,13 @@ class MainMapApp:
             legend_elements.append(mlines.Line2D([], [], color='#1e1b4b', linewidth=2.0, linestyle=(0, (6, 2, 1.5, 2)), label='Đường địa giới tỉnh/TP'))
             if total_communes > 1:
                 legend_elements.append(mlines.Line2D([], [], color='#475569', linewidth=0.65, linestyle='-', label=f'Ranh giới {total_communes} xã / phường'))
-            
+
             if has_coast:
                 legend_elements.append(mlines.Line2D([], [], color='#0284c7', linewidth=0.85, linestyle='-', label='Đường bờ biển'))
 
-            legend_elements.append(mlines.Line2D([], [], color='#dc2626', linewidth=1.2, label='Đường giao thông'))
-            legend_elements.append(mlines.Line2D([], [], color='#0284c7', linewidth=0.75, label='Sông, suối và kênh'))
-            
+            legend_elements.append(mlines.Line2D([], [], color='#dc2626', linewidth=1.2, label='Tuyến Quốc lộ'))
+            legend_elements.append(mlines.Line2D([], [], color='#0284c7', linewidth=0.75, label='Hệ thống sông chính'))
+
             if has_coast:
                 legend_elements.append(mpatches.Patch(facecolor='#bae6fd', edgecolor='#38bdf8', label=f"Vùng biển ({prov_meta['sea']})"))
 
@@ -1799,7 +1943,7 @@ class MainMapApp:
                 ax.set_ylabel(f"Tọa độ Y - Mét ({self.crs_choice.get()})", fontsize=9, fontfamily='serif', labelpad=12)
                 ax.xaxis.set_major_formatter(FuncFormatter(lambda val, pos: f"{int(val):,}"))
                 ax.yaxis.set_major_formatter(FuncFormatter(lambda val, pos: f"{int(val):,}"))
-                
+
                 if "Dày" in int_choice: step = max(5000.0, round(dx / 10 / 5000) * 5000)
                 elif "Thưa" in int_choice: step = max(20000.0, round(dx / 4 / 10000) * 10000)
                 else:
@@ -1830,9 +1974,8 @@ class MainMapApp:
 
             fig.tight_layout()
 
-            dem_notice='\n'.join([note for note in [dem_notice,*vector_notices] if note])
-            self.update_status(f"Hoàn thành bản đồ {prov_meta['name']}!"+(' '+dem_notice if dem_notice else ' Đang mở cửa sổ xem trước...'),'orange' if dem_notice else 'green')
-            if dem_notice:self.root.after(0,lambda note=dem_notice:messagebox.showwarning('Thông tin địa hình DEM',note))
+            self.update_status(f"Hoàn thành bản đồ {prov_meta['name']}! "+foreign_notice,'orange' if foreign_notice else 'green')
+            if foreign_notice:self.root.after(0,lambda note=foreign_notice:messagebox.showwarning('Địa hình nước ngoài',note))
             self.root.after(0, lambda: MapEditorWindow(
                 self.root, fig, ax, out_f, editable_texts, dem_artist, leg
             ))
