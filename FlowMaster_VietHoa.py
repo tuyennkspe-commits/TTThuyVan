@@ -159,9 +159,23 @@ class WindowsBackend:
         buffer=ctypes.create_unicode_buffer(value);info=self.MenuInfo();info.cbSize=ctypes.sizeof(info);info.fMask=0x40
         info.dwTypeData=ctypes.cast(buffer,self.w.LPWSTR);info.cch=len(value)
         return bool(self.user.SetMenuItemInfoW(menu,index,True,ctypes.byref(info)))
+    def structure(self,pid):
+        """Detect new windows/controls without repainting or reading their text."""
+        items=[]
+        def visit(window,param):
+            if self.cancel.is_set():return False
+            if self.pid(window)==pid:items.append((int(window),self.classname(window)))
+            return True
+        callback=self.callback_type(visit)
+        for window,owner,caption in self.windows():
+            if owner==pid:
+                visit(window,0);self.user.EnumChildWindows(window,callback,0)
+                items.append((int(window),'menu:'+str(self.user.GetMenu(window))))
+        return tuple(sorted(items))
+
     def apply(self,pid):
         if self.target_pid is not None and self.target_pid!=pid:self.restore()
-        self.target_pid=pid;changed=0;failed=0;seen=set()
+        self.target_pid=pid;changed=0;failed=0;menu_updates=0;seen=set()
         roots=[window for window,p,caption in self.windows() if p==pid]
         if not roots:raise ValueError('Không còn cửa sổ FlowMaster được chọn. Mở FlowMaster rồi quét lại.')
         def visit(window,param):
@@ -176,7 +190,7 @@ class WindowsBackend:
             return True
         callback=self.callback_type(visit)
         def menus(menu,depth=0):
-            nonlocal changed,failed
+            nonlocal changed,failed,menu_updates
             if not menu or menu in seen or depth>8 or self.cancel.is_set():return
             seen.add(menu)
             for index in range(min(max(0,self.user.GetMenuItemCount(menu)),500)):
@@ -184,14 +198,15 @@ class WindowsBackend:
                 original=self.menu_text(menu,index);translated=translate_text(original)
                 sub=self.user.GetSubMenu(menu,index);command=self.user.GetMenuItemID(menu,index)
                 if translated and translated!=original:
-                    if self.set_menu_text(menu,index,translated):self.menus[(int(menu),index)]=(command,sub,original,translated);changed+=1
+                    if self.set_menu_text(menu,index,translated):self.menus[(int(menu),index)]=(command,sub,original,translated);changed+=1;menu_updates+=1
                     else:failed+=1
                 menus(sub,depth+1)
         for window in roots:
             if self.cancel.is_set():break
             if self.user.IsHungAppWindow(window):failed+=1;continue
             visit(window,0);self.user.EnumChildWindows(window,callback,0)
-            menus(self.user.GetMenu(window));self.user.DrawMenuBar(window)
+            before=menu_updates;menus(self.user.GetMenu(window))
+            if menu_updates>before:self.user.DrawMenuBar(window)
         return f'Đã đổi thêm {changed} nhãn/menu; đang theo dõi {len(self.texts)+len(self.menus)} mục.'+(f' {failed} mục chưa đổi được; kiểm tra quyền chạy hoặc kiểu giao diện.' if failed else '')
     def restore(self):
         restored=0;owned=set()
@@ -213,7 +228,7 @@ class WindowsBackend:
 
 class TranslatorApp:
     def __init__(self,root,backend=None):
-        self.root=root;self.backend=backend;self.busy=False;self.pending_restore=False;self.closing=False;self.results=queue.Queue();self.targets=[]
+        self.root=root;self.backend=backend;self.busy=False;self.pending_restore=False;self.closing=False;self.results=queue.Queue();self.targets=[];self.last_structure=None
         root.title('FlowMaster — Việt hóa thuật ngữ thủy lực');root.geometry('1020x700');root.minsize(800,560)
         style=ttk.Style();style.theme_use('clam');style.configure('Treeview',rowheight=27);style.configure('TButton',padding=7)
         ttk.Label(root,text='FLOWMASTER · TIẾNG VIỆT CHUYÊN NGÀNH',font=('Segoe UI',15,'bold'),foreground='#174d7d').pack(anchor='w',padx=14,pady=(12,5))
@@ -265,14 +280,22 @@ class TranslatorApp:
     def start(self):
         if not self.backend:return
         if self.choice.current()<0:messagebox.showinfo('Chọn FlowMaster','Mở FlowMaster và chọn cửa sổ trước.');return
-        self.auto.set(True);self.launch('apply')
-    def launch(self,action):
+        self.launch('apply')
+    def launch(self,action,automatic=False):
         if self.busy or not self.backend:return
         if action=='apply' and self.choice.current()<0:return
         pid=self.targets[self.choice.current()][1] if action=='apply' else None
-        self.busy=True;self.backend.cancel.clear();self.status.configure(text='Đang Việt hóa…' if action=='apply' else 'Đang khôi phục…')
+        self.busy=True;self.backend.cancel.clear()
+        if not automatic:self.status.configure(text='Đang Việt hóa…' if action=='apply' else 'Đang khôi phục…')
         def work():
-            try:self.results.put((True,self.backend.apply(pid) if action=='apply' else self.backend.restore(),action))
+            try:
+                if action=='apply':
+                    structure=(pid,self.backend.structure(pid))
+                    if automatic and structure==self.last_structure:
+                        self.results.put((True,None,action));return
+                    text=self.backend.apply(pid);self.last_structure=structure
+                else:text=self.backend.restore();self.last_structure=None
+                self.results.put((True,text,action))
             except Exception as error:self.results.put((False,str(error),action))
         threading.Thread(target=work,daemon=True).start()
     def restore(self):
@@ -284,15 +307,16 @@ class TranslatorApp:
         else:self.launch('restore')
     def poll(self):
         try:
-            ok,text,action=self.results.get_nowait();self.busy=False;self.status.configure(text=text)
+            ok,text,action=self.results.get_nowait();self.busy=False
+            if text is not None and text!=self.status.cget('text'):self.status.configure(text=text)
             if self.pending_restore:self.pending_restore=False;self.launch('restore')
             elif self.closing and action=='restore':self.root.destroy();return
             elif not ok:self.auto.set(False)
         except queue.Empty:pass
         self.root.after(150,self.poll)
     def tick(self):
-        if self.auto.get() and not self.busy and not self.closing:self.launch('apply')
-        self.root.after(1500,self.tick)
+        if self.auto.get() and not self.busy and not self.closing:self.launch('apply',automatic=True)
+        self.root.after(3000,self.tick)
     def close(self):
         self.closing=True;self.restore()
 
